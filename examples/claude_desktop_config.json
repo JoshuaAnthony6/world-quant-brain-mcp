@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "worldquant-brain": {
+      "command": "python",
+      "args": ["-m", "worldquant_brain_mcp.server"],
+      "env": {
+        "WORLDQUANT_EMAIL": "your-email@example.com",
+        "WORLDQUANT_PASSWORD": "your-password"
+      }
+    }
+  }
+}
