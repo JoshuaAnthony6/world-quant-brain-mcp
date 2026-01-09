@@ -4,12 +4,12 @@ import os
 import json
 import logging
 from typing import Any, Optional
-from datetime import datetime
 
 from mcp.server import Server
-from mcp.types import Tool, TextContent, ImageContent, EmbeddedResource
+from mcp.types import Tool, TextContent
 import mcp.server.stdio
-from worldquant import API
+
+from worldquant_brain_mcp.client import BrainClient, BrainError
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -19,10 +19,10 @@ logger = logging.getLogger("worldquant-brain-mcp")
 app = Server("worldquant-brain-mcp")
 
 # Global API client
-_api_client: Optional[API] = None
+_api_client: Optional[BrainClient] = None
 
 
-def get_api_client() -> API:
+def get_api_client() -> BrainClient:
     """Get or create WorldQuant Brain API client."""
     global _api_client
     if _api_client is None:
@@ -34,7 +34,7 @@ def get_api_client() -> API:
                 "WORLDQUANT_EMAIL and WORLDQUANT_PASSWORD environment variables must be set"
             )
         
-        _api_client = API(email=email, password=password)
+        _api_client = BrainClient(email=email, password=password)
         logger.info("WorldQuant Brain API client initialized")
     
     return _api_client
@@ -137,7 +137,7 @@ async def list_tools() -> list[Tool]:
 async def call_tool(name: str, arguments: Any) -> list[TextContent]:
     """Handle tool calls."""
     try:
-        api = get_api_client()
+        client = get_api_client()
         
         if name == "submit_alpha":
             alpha_expression = arguments["alpha_expression"]
@@ -147,31 +147,32 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             
             logger.info(f"Submitting alpha: {alpha_expression}")
             
-            # Submit alpha and wait for simulation
-            alpha = api.submit_alpha(
-                alpha=alpha_expression,
+            # Submit simulation
+            simulation_id = client.submit_simulation(
+                expression=alpha_expression,
                 region=region,
                 universe=universe,
                 delay=delay,
             )
             
-            # Get simulation results
-            simulation = api.get_simulation(alpha.id)
+            logger.info(f"Simulation submitted: {simulation_id}")
+            
+            # Wait for simulation to complete
+            simulation_result = client.wait_for_simulation(simulation_id)
+            
+            # Get alpha details
+            alpha_id = simulation_result.get("alpha")
+            alpha_details = client.get_alpha(alpha_id) if alpha_id else {}
             
             result = {
-                "alpha_id": alpha.id,
-                "status": alpha.status,
+                "simulation_id": simulation_id,
+                "alpha_id": alpha_id,
+                "status": simulation_result.get("status"),
                 "expression": alpha_expression,
                 "region": region,
                 "universe": universe,
                 "delay": delay,
-                "simulation": {
-                    "sharpe": simulation.sharpe if hasattr(simulation, "sharpe") else None,
-                    "returns": simulation.returns if hasattr(simulation, "returns") else None,
-                    "turnover": simulation.turnover if hasattr(simulation, "turnover") else None,
-                    "fitness": simulation.fitness if hasattr(simulation, "fitness") else None,
-                },
-                "created_at": datetime.now().isoformat(),
+                "alpha_details": alpha_details,
             }
             
             return [
@@ -185,19 +186,12 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             alpha_id = arguments["alpha_id"]
             logger.info(f"Getting alpha: {alpha_id}")
             
-            alpha = api.get_alpha(alpha_id)
-            
-            result = {
-                "alpha_id": alpha.id,
-                "status": alpha.status,
-                "expression": alpha.expression if hasattr(alpha, "expression") else None,
-                "created_at": alpha.created_at if hasattr(alpha, "created_at") else None,
-            }
+            alpha = client.get_alpha(alpha_id)
             
             return [
                 TextContent(
                     type="text",
-                    text=json.dumps(result, indent=2),
+                    text=json.dumps(alpha, indent=2),
                 )
             ]
         
@@ -205,19 +199,11 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             limit = arguments.get("limit", 10)
             logger.info(f"Listing alphas (limit: {limit})")
             
-            alphas = api.list_alphas(limit=limit)
+            alphas = client.list_alphas(limit=limit)
             
             result = {
                 "count": len(alphas),
-                "alphas": [
-                    {
-                        "alpha_id": alpha.id,
-                        "status": alpha.status,
-                        "expression": alpha.expression if hasattr(alpha, "expression") else None,
-                        "created_at": alpha.created_at if hasattr(alpha, "created_at") else None,
-                    }
-                    for alpha in alphas
-                ],
+                "alphas": alphas,
             }
             
             return [
@@ -229,18 +215,14 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
         
         elif name == "get_simulation":
             alpha_id = arguments["alpha_id"]
-            logger.info(f"Getting simulation for alpha: {alpha_id}")
+            logger.info(f"Getting details for alpha: {alpha_id}")
             
-            simulation = api.get_simulation(alpha_id)
+            alpha = client.get_alpha(alpha_id)
             
+            # Extract simulation metrics from alpha details
             result = {
                 "alpha_id": alpha_id,
-                "sharpe": simulation.sharpe if hasattr(simulation, "sharpe") else None,
-                "returns": simulation.returns if hasattr(simulation, "returns") else None,
-                "turnover": simulation.turnover if hasattr(simulation, "turnover") else None,
-                "fitness": simulation.fitness if hasattr(simulation, "fitness") else None,
-                "long_count": simulation.long_count if hasattr(simulation, "long_count") else None,
-                "short_count": simulation.short_count if hasattr(simulation, "short_count") else None,
+                "details": alpha,
             }
             
             return [
@@ -254,12 +236,13 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             expression = arguments["expression"]
             logger.info(f"Checking expression: {expression}")
             
-            # Note: The worldquant library may not have a direct check method
-            # This would need to be implemented based on the actual API
+            # The API doesn't have a dedicated check endpoint
+            # We could submit a simulation and immediately check status
+            # For now, provide guidance
             result = {
                 "expression": expression,
-                "status": "Expression syntax check not directly available",
-                "suggestion": "Try submitting the alpha to validate it",
+                "note": "Expression validation requires submitting a simulation. "
+                       "Use submit_alpha to test the expression.",
             }
             
             return [
@@ -277,6 +260,14 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 )
             ]
     
+    except BrainError as e:
+        logger.error(f"Brain API error in {name}: {str(e)}")
+        return [
+            TextContent(
+                type="text",
+                text=f"Brain API Error: {str(e)}",
+            )
+        ]
     except Exception as e:
         logger.error(f"Error in {name}: {str(e)}")
         return [
