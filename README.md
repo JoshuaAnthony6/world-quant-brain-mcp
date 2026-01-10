@@ -59,6 +59,41 @@ pip install playwright
 python -m playwright install chromium
 ```
 
+System packages for Playwright (Linux)
+
+If you plan to use the forum/playwright tools on a Linux host, Playwright's Chromium requires several OS libraries. On Ubuntu/Debian systems install the runtime dependencies before running `python -m playwright install chromium`:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends \
+	libnspr4 libnss3 libgbm1 libgtk-3-0 libx11-xcb1 libxss1 \
+	libatk1.0-0 libatk-bridge2.0-0 libpango-1.0-0 libxrandr2 \
+	libxcomposite1 libxdamage1 libxkbcommon0 libcups2 ca-certificates \
+	fonts-liberation xz-utils unzip wget
+# On some Ubuntu releases the ALSA package is provided under a different name
+# (e.g. `libasound2t64`). If `libasound2` has no candidate, install the
+# distribution-provided package that provides `libasound.so.2`.
+sudo apt-get install -y libasound2 || sudo apt-get install -y libasound2t64 || true
+```
+
+After installing the OS packages, run the Playwright install and verify Chromium can launch:
+
+```bash
+pip install -U playwright
+python -m playwright install chromium
+
+# Quick verification (headless):
+./.venv/bin/python - <<'PY'
+from playwright.sync_api import sync_playwright
+with sync_playwright() as pw:
+		browser = pw.chromium.launch()
+		page = browser.new_page()
+		page.goto('https://example.com')
+		print(page.title())
+		browser.close()
+PY
+```
+
 4. Start the SSE MCP server:
 
 ```bash
