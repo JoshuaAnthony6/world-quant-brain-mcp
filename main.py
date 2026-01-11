@@ -119,9 +119,15 @@ class BrainApiClient:
         
         # Initialize Redis connection
         try:
+            redis_host = os.environ.get('REDIS_HOST', 'localhost')
+            try:
+                redis_port = int(os.environ.get('REDIS_PORT', str(6379)))
+            except Exception:
+                redis_port = 6379
+
             self.redis_client = redis.Redis(
-                host='localhost',
-                port=6379,
+                host=redis_host,
+                port=redis_port,
                 db=0,
                 decode_responses=True,
                 socket_connect_timeout=5
@@ -210,49 +216,75 @@ class BrainApiClient:
         """Run blocking requests I/O in a worker thread to avoid blocking the asyncio event loop."""
         absolute_url = self._to_absolute_url(url)
         timeout = kwargs.pop("timeout", self._default_timeout_seconds)
+        # Add extra buffer for asyncio timeout to catch stuck threads
+        asyncio_timeout = timeout + 10
+        
         async with self._request_semaphore:
             async with self._session_lock:
-                return await asyncio.to_thread(
-                    self.session.request,
-                    method,
-                    absolute_url,
-                    timeout=timeout,
-                    **kwargs,
-                )
+                try:
+                    # Wrap asyncio.to_thread with wait_for to prevent infinite hangs
+                    return await asyncio.wait_for(
+                        asyncio.to_thread(
+                            self.session.request,
+                            method,
+                            absolute_url,
+                            timeout=timeout,
+                            **kwargs,
+                        ),
+                        timeout=asyncio_timeout
+                    )
+                except asyncio.TimeoutError:
+                    self.log(f"Request asyncio timeout for {method} {absolute_url} after {asyncio_timeout}s", "ERROR")
+                    raise TimeoutError(f"Request timed out after {asyncio_timeout}s")
+                except requests.Timeout as e:
+                    self.log(f"Request timeout for {method} {absolute_url}: {str(e)}", "ERROR")
+                    raise TimeoutError(f"Request timed out after {timeout}s") from e
+                except requests.ConnectionError as e:
+                    self.log(f"Connection error for {method} {absolute_url}: {str(e)}", "ERROR")
+                    raise ConnectionError(f"Failed to connect to {absolute_url}") from e
+                except requests.HTTPError as e:
+                    self.log(f"HTTP error for {method} {absolute_url}: {str(e)}", "ERROR")
+                    raise
     
     async def authenticate(self, email: str, password: str) -> Dict[str, Any]:
         """Authenticate with WorldQuant BRAIN platform with biometric support."""
         self.log("🔐 Starting Authentication process...", "INFO")
+        auth_timeout = self._default_timeout_seconds + 10  # Extra buffer for asyncio timeout
         
         try:
             async with self._auth_lock:
-                # Block other session users while we mutate cookies and perform auth.
-                async with self._request_semaphore:
-                    async with self._session_lock:
-                        # Store credentials for potential re-authentication
-                        self.auth_credentials = {'email': email, 'password': password}
-                        
-                        # Clear any existing session data
-                        self.session.cookies.clear()
-                        self.session.auth = None
-                        
-                        # Create Basic Authentication header (base64 encoded credentials)
-                        import base64
-                        credentials = f"{email}:{password}"
-                        encoded_credentials = base64.b64encode(credentials.encode()).decode()
-                        
-                        # Send POST request with Basic Authentication header
-                        headers = {
-                            'Authorization': f'Basic {encoded_credentials}'
-                        }
-                        
-                        response = await asyncio.to_thread(
+                # Store credentials for potential re-authentication
+                self.auth_credentials = {'email': email, 'password': password}
+                
+                # Clear any existing session data (quick operation, no lock needed for this)
+                self.session.cookies.clear()
+                self.session.auth = None
+                
+                # Create Basic Authentication header (base64 encoded credentials)
+                import base64
+                credentials = f"{email}:{password}"
+                encoded_credentials = base64.b64encode(credentials.encode()).decode()
+                
+                # Send POST request with Basic Authentication header
+                headers = {
+                    'Authorization': f'Basic {encoded_credentials}'
+                }
+                
+                # Use a direct thread call with timeout, no nested locks
+                try:
+                    response = await asyncio.wait_for(
+                        asyncio.to_thread(
                             self.session.request,
                             'POST',
                             'https://api.worldquantbrain.com/authentication',
                             headers=headers,
                             timeout=self._default_timeout_seconds,
-                        )
+                        ),
+                        timeout=auth_timeout
+                    )
+                except asyncio.TimeoutError:
+                    self.log(f"❌ Authentication request timed out after {auth_timeout}s", "ERROR")
+                    raise TimeoutError(f"Authentication timed out after {auth_timeout}s")
 
                 # Check for successful authentication (status code 201)
                 if response.status_code == 201:
@@ -285,12 +317,17 @@ class BrainApiClient:
                         from urllib.parse import urljoin
                         biometric_url = urljoin(response.url, location)
                         
+                        # Release auth_lock before calling biometric auth to avoid deadlock
+                        # Biometric auth will acquire its own locks as needed
                         return await self._handle_biometric_auth(biometric_url, email)
                     else:
                         raise Exception("Incorrect email or password")
                 else:
                     raise Exception(f"Authentication failed with status code: {response.status_code}")
                     
+        except asyncio.TimeoutError:
+            self.log(f"❌ Authentication timed out", "ERROR")
+            raise TimeoutError("Authentication request timed out")
         except requests.HTTPError as e:
             self.log(f"❌ HTTP error during authentication: {e}", "ERROR")
             raise
@@ -408,8 +445,11 @@ class BrainApiClient:
             else:
                 self.log(f"⚠️ Unexpected status code during auth check: {response.status_code}", "WARNING")
                 return False
+        except (TimeoutError, ConnectionError) as e:
+            self.log(f"❌ Network error checking authentication: {str(e)}", "ERROR")
+            return False
         except Exception as e:
-            self.log(f"❌ Error checking authentication: {str(e)}", "ERROR")
+            self.log(f"❌ Unexpected error checking authentication: {str(e)}", "ERROR")
             return False
     
     async def ensure_authenticated(self):
@@ -1965,7 +2005,22 @@ mcp = FastMCP(
     host=_MCP_HOST,
     port=_MCP_PORT,
     sse_path=_MCP_SSE_PATH,
+    message_path=f"{_MCP_SSE_PATH}/messages/",  # Messages endpoint under SSE path for MCP client compatibility
 )
+
+# Add health check endpoint for container monitoring
+from mcp.server.fastmcp import Context
+from starlette.responses import JSONResponse
+
+@mcp.custom_route('/health', methods=['GET'])
+async def health_check(context: Context):
+    """Health check endpoint for Docker container monitoring."""
+    return JSONResponse({
+        "status": "healthy",
+        "service": "brain-platform-mcp",
+        "timestamp": datetime.utcnow().isoformat(),
+        "redis_connected": brain_client.redis_client is not None
+    })
 
 @mcp.tool()
 async def authenticate() -> Dict[str, Any]:
@@ -2969,4 +3024,24 @@ async def lookINTO_SimError_message(locations: Sequence[str]) -> dict:
 # --- Main entry point ---
 if __name__ == "__main__":
     print("running the server", file=sys.stderr)
-    mcp.run()
+    
+    # Validate critical environment setup
+    config = load_config()
+    creds = config.get("credentials", {})
+    if not creds.get("email") or not creds.get("password"):
+        print("[WARNING] No BRAIN credentials found in config. Authentication will fail until credentials are provided.", file=sys.stderr)
+    
+    # Verify Redis connectivity
+    if brain_client.redis_client:
+        print("[INFO] Redis connection established successfully", file=sys.stderr)
+    else:
+        print("[WARNING] Redis connection failed - caching disabled", file=sys.stderr)
+    
+    # Run using SSE transport in container environment so the server remains
+    # running and accessible over HTTP (not stdio which exits in non-interactive containers).
+    # Note: sse_path is already configured in FastMCP constructor, no need to pass mount_path
+    try:
+        mcp.run(transport='sse')
+    except TypeError:
+        # Fallback if signature differs
+        mcp.run('sse')

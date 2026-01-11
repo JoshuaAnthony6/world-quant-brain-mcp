@@ -1,0 +1,39 @@
+services:
+  mcp:
+    build: .
+    image: worldquant/mcp:latest
+    container_name: mcp
+    restart: unless-stopped
+    shm_size: '1gb'
+    volumes:
+      - ./:/app:rw
+      - mcp_config:/app/config:rw
+      - playwright_data:/root/.cache/ms-playwright:rw
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - MCP_CONFIG_FILE=/app/config/user_config.json
+    depends_on:
+      - redis
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health', timeout=5).raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      start_period: 40s
+      retries: 3
+
+  redis:
+    image: redis:7.0-alpine
+    container_name: mcp-redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    # No host port mapping to avoid conflicts; service is reachable by other containers as 'redis:6379'
+
+volumes:
+  redis_data:
+  mcp_config:
+  playwright_data:
