@@ -2590,8 +2590,6 @@ async def check_correlation(alpha_id: str) -> Dict[str, Any]:
         return await brain_client.check_correlation(alpha_id, correlation_type, threshold)
     except Exception as e:
         return {"error": str(e)}
-#     except Exception as e:
-#         return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
 async def set_alpha_properties(alpha_id: str, name: Optional[str] = None, 
