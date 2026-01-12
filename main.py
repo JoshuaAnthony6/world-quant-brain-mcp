@@ -538,7 +538,7 @@ class BrainApiClient:
             self.log(f"Simulation created with ID: {simulation_id}", "SUCCESS")
 
             start_time = time.time()
-            timeout_seconds = 600  # 10 minutes
+            timeout_seconds = 1800  # 10 minutes
             max_poll_retries = 5  # Max retries for transient connection errors during polling
             poll_retry_delay = 3  # Initial delay between poll retries
 
