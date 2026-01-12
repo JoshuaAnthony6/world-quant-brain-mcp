@@ -236,6 +236,9 @@ class BrainApiClient:
                 except asyncio.TimeoutError:
                     self.log(f"Request asyncio timeout for {method} {absolute_url} after {asyncio_timeout}s", "ERROR")
                     raise TimeoutError(f"Request timed out after {asyncio_timeout}s")
+                except asyncio.CancelledError:
+                    self.log(f"Request cancelled for {method} {absolute_url}", "WARNING")
+                    raise
                 except requests.Timeout as e:
                     self.log(f"Request timeout for {method} {absolute_url}: {str(e)}", "ERROR")
                     raise TimeoutError(f"Request timed out after {timeout}s") from e
@@ -244,6 +247,13 @@ class BrainApiClient:
                     raise ConnectionError(f"Failed to connect to {absolute_url}") from e
                 except requests.HTTPError as e:
                     self.log(f"HTTP error for {method} {absolute_url}: {str(e)}", "ERROR")
+                    raise
+                except Exception as e:
+                    # Catch other unexpected errors (e.g., RemoteDisconnected wrapped in other exceptions)
+                    error_str = str(e)
+                    if "RemoteDisconnected" in error_str or "Connection aborted" in error_str:
+                        self.log(f"Remote disconnected for {method} {absolute_url}: {error_str}", "ERROR")
+                        raise ConnectionError(f"Remote server disconnected: {absolute_url}") from e
                     raise
     
     async def authenticate(self, email: str, password: str) -> Dict[str, Any]:
@@ -529,13 +539,33 @@ class BrainApiClient:
 
             start_time = time.time()
             timeout_seconds = 600  # 10 minutes
+            max_poll_retries = 5  # Max retries for transient connection errors during polling
+            poll_retry_delay = 3  # Initial delay between poll retries
 
+            simulation_progress = None
             while True:
                 # Check for timeout
                 if time.time() - start_time > timeout_seconds:
                     raise TimeoutError(f"Simulation {simulation_id} timed out after {timeout_seconds} seconds")
 
-                simulation_progress = await self._request('GET', location_url)
+                # Poll with retry logic for transient network errors
+                poll_error = None
+                for poll_attempt in range(max_poll_retries):
+                    try:
+                        simulation_progress = await self._request('GET', location_url)
+                        poll_error = None
+                        break  # Success, exit retry loop
+                    except (ConnectionError, TimeoutError) as e:
+                        poll_error = e
+                        if poll_attempt < max_poll_retries - 1:
+                            retry_wait = poll_retry_delay * (1.5 ** poll_attempt)
+                            self.log(f"⚠️ Polling connection error for {simulation_id} (attempt {poll_attempt + 1}/{max_poll_retries}), retrying in {retry_wait:.1f}s: {str(e)}", "WARNING")
+                            await asyncio.sleep(retry_wait)
+                        else:
+                            self.log(f"❌ Polling failed after {max_poll_retries} attempts for {simulation_id}: {str(e)}", "ERROR")
+                
+                if poll_error:
+                    raise poll_error
                 
                 # Check if we need to wait
                 retry_after = simulation_progress.headers.get("Retry-After")
@@ -556,8 +586,23 @@ class BrainApiClient:
                 raise Exception(f"Simulation failed or returned no alpha ID. Details: {error_message}")
                 
             alpha_id = progress_data["alpha"]
-            alpha = await self._request('GET', f"https://api.worldquantbrain.com/alphas/{alpha_id}")
-            return alpha.json()
+            
+            # Fetch alpha details with retry logic
+            alpha_response = None
+            for alpha_attempt in range(max_poll_retries):
+                try:
+                    alpha_response = await self._request('GET', f"https://api.worldquantbrain.com/alphas/{alpha_id}")
+                    break
+                except (ConnectionError, TimeoutError) as e:
+                    if alpha_attempt < max_poll_retries - 1:
+                        retry_wait = poll_retry_delay * (1.5 ** alpha_attempt)
+                        self.log(f"⚠️ Failed to fetch alpha details (attempt {alpha_attempt + 1}/{max_poll_retries}), retrying in {retry_wait:.1f}s: {str(e)}", "WARNING")
+                        await asyncio.sleep(retry_wait)
+                    else:
+                        self.log(f"❌ Failed to fetch alpha details after {max_poll_retries} attempts: {str(e)}", "ERROR")
+                        raise
+            
+            return alpha_response.json()
             
         except Exception as e:
             self.log(f"❌ Failed to create simulation: {str(e)}", "ERROR")
@@ -686,48 +731,76 @@ class BrainApiClient:
         """
         await self.ensure_authenticated()
         
-        def fuzzy_search_filter(item: Dict[str, Any], search_term: str) -> bool:
-            """Enhanced fuzzy search across key fields with multi-keyword support."""
-            if not search_term:
-                return True
+        # Redis-based distributed lock for concurrency control (limit to 1)
+        lock_key = "lock:get_datafields"
+        lock_acquired = False
+        lock_timeout = 300  # Lock expires after 5 minutes to prevent deadlock
+        max_wait_time = 600  # Maximum wait time for acquiring lock (10 minutes)
+        wait_interval = 2  # Check every 2 seconds
+        
+        if self.redis_client:
+            start_wait = time.time()
+            while time.time() - start_wait < max_wait_time:
+                try:
+                    # Try to acquire lock with NX (only set if not exists) and EX (expiration)
+                    lock_acquired = self.redis_client.set(lock_key, "locked", ex=lock_timeout, nx=True)
+                    if lock_acquired:
+                        self.log(f"Acquired Redis lock for get_datafields", "INFO")
+                        break
+                    else:
+                        # Lock is held by another process, wait and retry
+                        ttl = self.redis_client.ttl(lock_key)
+                        self.log(f"Waiting for get_datafields lock (TTL: {ttl}s)...", "INFO")
+                        await asyncio.sleep(wait_interval)
+                except Exception as e:
+                    self.log(f"Redis lock acquisition failed: {str(e)}, proceeding without lock", "WARNING")
+                    break
             
-            # Split search term into keywords (space-separated) for AND logic
-            keywords = [kw.strip().lower() for kw in search_term.split() if kw.strip()]
-            if not keywords:
-                return True
-            
-            # Extract searchable fields
-            searchable_text_parts = []
-            
-            # Add field name
-            if item.get('name'):
-                searchable_text_parts.append(str(item['name']))
-            
-            # Add field description
-            if item.get('description'):
-                searchable_text_parts.append(str(item['description']))
-            
-            # Add field ID
-            if item.get('id'):
-                searchable_text_parts.append(str(item['id']))
-            
-            # Add dataset information
-            dataset = item.get('dataset', {})
-            if isinstance(dataset, dict):
-                if dataset.get('name'):
-                    searchable_text_parts.append(str(dataset['name']))
-                if dataset.get('vendor'):
-                    searchable_text_parts.append(str(dataset['vendor']))
-                if dataset.get('id'):
-                    searchable_text_parts.append(str(dataset['id']))
-            
-            # Combine all searchable text
-            combined_text = ' '.join(searchable_text_parts).lower()
-            
-            # Check if ALL keywords match (AND logic)
-            return all(keyword in combined_text for keyword in keywords)
+            if not lock_acquired and self.redis_client:
+                self.log(f"Could not acquire get_datafields lock after {max_wait_time}s, proceeding anyway", "WARNING")
         
         try:
+            def fuzzy_search_filter(item: Dict[str, Any], search_term: str) -> bool:
+                """Enhanced fuzzy search across key fields with multi-keyword support."""
+                if not search_term:
+                    return True
+                
+                # Split search term into keywords (space-separated) for AND logic
+                keywords = [kw.strip().lower() for kw in search_term.split() if kw.strip()]
+                if not keywords:
+                    return True
+                
+                # Extract searchable fields
+                searchable_text_parts = []
+                
+                # Add field name
+                if item.get('name'):
+                    searchable_text_parts.append(str(item['name']))
+                
+                # Add field description
+                if item.get('description'):
+                    searchable_text_parts.append(str(item['description']))
+                
+                # Add field ID
+                if item.get('id'):
+                    searchable_text_parts.append(str(item['id']))
+                
+                # Add dataset information
+                dataset = item.get('dataset', {})
+                if isinstance(dataset, dict):
+                    if dataset.get('name'):
+                        searchable_text_parts.append(str(dataset['name']))
+                    if dataset.get('vendor'):
+                        searchable_text_parts.append(str(dataset['vendor']))
+                    if dataset.get('id'):
+                        searchable_text_parts.append(str(dataset['id']))
+                
+                # Combine all searchable text
+                combined_text = ' '.join(searchable_text_parts).lower()
+                
+                # Check if ALL keywords match (AND logic)
+                return all(keyword in combined_text for keyword in keywords)
+            
             # Generate cache key from parameters (excluding search for cache key)
             cache_params = {
                 'instrumentType': instrument_type,
@@ -784,6 +857,8 @@ class BrainApiClient:
                 data = response.json()
                 
                 results = data.get('results', [])
+                # 等待2秒
+                await asyncio.sleep(2)
                 all_results.extend(results)
                 
                 if total_count is None:
@@ -820,6 +895,14 @@ class BrainApiClient:
         except Exception as e:
             self.log(f"Failed to get datafields: {str(e)}", "ERROR")
             raise
+        finally:
+            # Release Redis lock if acquired
+            if lock_acquired and self.redis_client:
+                try:
+                    self.redis_client.delete(lock_key)
+                    self.log(f"Released Redis lock for get_datafields", "INFO")
+                except Exception as e:
+                    self.log(f"Failed to release Redis lock: {str(e)}", "WARNING")
     
     async def get_alpha_pnl(self, alpha_id: str) -> Dict[str, Any]:
         """Get PnL data for an alpha with retry logic."""
