@@ -1,5 +1,5 @@
 [Unit]
-Description=WorldQuant BRAIN MCP (containerized)
+Description=WorldQuant BRAIN MCP Streamable HTTP (containerized)
 After=network.target docker.service
 
 [Service]

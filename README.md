@@ -18,23 +18,23 @@ python 配置前运行我_安装必要依赖包.py
 	- `FORUM_SETTINGS_BASE_URL` (default https://support.worldquantbrain.com)
 	- `FORUM_SETTINGS_HEADLESS` (true/false, default true)
 	- `FORUM_SETTINGS_TIMEOUT` (seconds, default 15)
-	- `MCP_HOST` (default 0.0.0.0 for remote SSE)
+	- `MCP_HOST` (default 0.0.0.0 for remote HTTP)
 	- `MCP_PORT` (default 8000)
-	- `MCP_SSE_PATH` (default /sse)
+	- `MCP_STREAMABLE_HTTP_PATH` (default /mcp)
 
 The server still supports `user_config.json`, but `.env` values take precedence for overlapping keys.
 
 3. Run the MCP server as described below.
 
-## Run (SSE)
+## Run (Streamable HTTP)
 
 From the project root with the virtual environment activated:
 
 ```bash
-./.venv/bin/mcp run --transport sse main.py:mcp
+./.venv/bin/mcp run --transport streamable-http main.py:mcp
 ```
 
-The SSE endpoint will listen on `http://$MCP_HOST:$MCP_PORT$MCP_SSE_PATH` (defaults: 0.0.0.0:8000/sse). Use a reverse proxy with HTTPS for production.
+The Streamable HTTP endpoint will listen on `http://$MCP_HOST:$MCP_PORT$MCP_STREAMABLE_HTTP_PATH` (defaults: 0.0.0.0:8000/mcp). Use a reverse proxy with HTTPS for production.
 
 ## Detailed Install (recommended)
 
@@ -94,30 +94,30 @@ with sync_playwright() as pw:
 PY
 ```
 
-4. Start the SSE MCP server:
+4. Start the Streamable HTTP MCP server:
 
 ```bash
-./.venv/bin/mcp run --transport sse main.py:mcp
+./.venv/bin/mcp run --transport streamable-http main.py:mcp
 ```
 
 Notes:
 - If your environment restricts installing system packages, ask your admin to preinstall `python3-venv` and `python3-pip`.
-- For production, place nginx/caddy (HTTPS) in front of the MCP SSE endpoint and run the MCP process under `systemd` for reliability.
+- For production, place nginx/caddy (HTTPS) in front of the MCP Streamable HTTP endpoint and run the MCP process under `systemd` for reliability.
 
 ## Nginx reverse-proxy example
 
-Place the example config at `/etc/nginx/sites-available/mcp_sse` and symlink to `sites-enabled`.
-Example file in this repo: `deploy/nginx/mcp_sse.conf`.
+Place the example config at `/etc/nginx/sites-available/mcp_http` and symlink to `sites-enabled`.
+Example file in this repo: `deploy/nginx/mcp_http.conf`.
 
 Key points:
-- Use `proxy_http_version 1.1` and `proxy_set_header Connection ""` to allow long-lived SSE connections.
-- Disable buffering with `proxy_buffering off` so events flow immediately.
+- Use `proxy_http_version 1.1` and `proxy_set_header Connection ""` to allow long-lived streaming connections.
+- Disable buffering with `proxy_buffering off` so responses flow immediately.
 - Put TLS (Let's Encrypt / certbot) in front of nginx or configure nginx with your certificates.
 
 Reload nginx after enabling the site:
 
 ```bash
-sudo ln -s /etc/nginx/sites-available/mcp_sse /etc/nginx/sites-enabled/
+sudo ln -s /etc/nginx/sites-available/mcp_http /etc/nginx/sites-enabled/
 sudo nginx -t
 sudo systemctl reload nginx
 ```
@@ -127,10 +127,10 @@ sudo systemctl reload nginx
 A unit file is included at `deploy/systemd/mcp-sse.service` — copy it to `/etc/systemd/system/` and enable:
 
 ```bash
-sudo cp deploy/systemd/mcp-sse.service /etc/systemd/system/mcp-sse.service
+sudo cp deploy/systemd/mcp-sse.service /etc/systemd/system/mcp-http.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now mcp-sse.service
-sudo journalctl -u mcp-sse -f
+sudo systemctl enable --now mcp-http.service
+sudo journalctl -u mcp-http -f
 ```
 
 The unit uses `/opt/project/world-quant-brain-mcp/.env` as `EnvironmentFile` and runs the `mcp` CLI from the virtualenv. Adjust paths, `User`, and permissions to suit your environment.

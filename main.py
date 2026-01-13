@@ -2080,15 +2080,14 @@ try:
     _MCP_PORT = int(os.getenv("MCP_PORT", "8000"))
 except Exception:
     _MCP_PORT = 8000
-_MCP_SSE_PATH = os.getenv("MCP_SSE_PATH", "/sse")
+_MCP_STREAMABLE_HTTP_PATH = os.getenv("MCP_STREAMABLE_HTTP_PATH", "/mcp")
 
 mcp = FastMCP(
     "brain-platform-mcp",
     "A server for interacting with the WorldQuant BRAIN platform",
     host=_MCP_HOST,
     port=_MCP_PORT,
-    sse_path=_MCP_SSE_PATH,
-    message_path=f"{_MCP_SSE_PATH}/messages/",  # Messages endpoint under SSE path for MCP client compatibility
+    streamable_http_path=_MCP_STREAMABLE_HTTP_PATH,
 )
 
 # Add health check endpoint for container monitoring
@@ -3118,11 +3117,10 @@ if __name__ == "__main__":
     else:
         print("[WARNING] Redis connection failed - caching disabled", file=sys.stderr)
     
-    # Run using SSE transport in container environment so the server remains
+    # Run using Streamable HTTP transport in container environment so the server remains
     # running and accessible over HTTP (not stdio which exits in non-interactive containers).
-    # Note: sse_path is already configured in FastMCP constructor, no need to pass mount_path
     try:
-        mcp.run(transport='sse')
+        mcp.run(transport='streamable-http')
     except TypeError:
         # Fallback if signature differs
-        mcp.run('sse')
+        mcp.run('streamable-http')
