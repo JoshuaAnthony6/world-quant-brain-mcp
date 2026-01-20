@@ -2172,16 +2172,16 @@ async def create_simulation(
     region: str = "USA",
     universe: str = "TOP3000",
     delay: int = 1,
-    decay: float = 0.0,
+    decay: int = 4,
     neutralization: str = "SUBINDUSTRY",
-    truncation: float = 0.0,
+    truncation: float = 0.08,
     test_period: str = "P0Y0M",
     nan_handling: str = "ON",
     regular: Optional[str] = None,
     combo: Optional[str] = None,
     selection: Optional[str] = None,
     pasteurization: str = "ON",
-    max_trade: str = "ON",
+    max_trade: str = "OFF",
     selection_handling: str = "POSITIVE",
     selection_limit: int = 1000,
     component_activation: str = "IS",
@@ -2190,7 +2190,7 @@ async def create_simulation(
     Create a new simulation on BRAIN platform.
     
     This tool creates and starts a simulation with your alpha code. Use this after you have your alpha formula ready.
-    if field type=VECTOR should deal with vec_sum(FIELD) or vec_avg(FIELD)
+    if field type=VECTOR should deal with vec_ suffer vec_*(FIELD)
     Args:
         type: Simulation type ("REGULAR" or "SUPER")
         region: Market region (e.g., "USA")
@@ -2246,7 +2246,7 @@ async def create_simulation(
         extra_info = ""
         error_msg = str(e)
         if error_msg and "does not support event inputs" in error_msg:
-            extra_info = "If fields is vector type  should use vec_sum or vec_avg with event input"
+            extra_info = "If fields is vector type  should use vec_* operator with event input"
             return {"error": f"An unexpected error occurred: {str(e)}. {extra_info}"}
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
@@ -2795,101 +2795,101 @@ async def get_documentation_page(page_id: str) -> Dict[str, Any]:
 
 # --- Advanced Simulation Tools ---
 
-# @mcp.tool()
-# async def create_multi_simulation(
-#     alpha_expressions: List[str],
-#     instrument_type: str = "EQUITY",
-#     region: str = "USA",
-#     universe: str = "TOP3000",
-#     delay: int = 1,
-#     decay: float = 0.0,
-#     neutralization: str = "NONE",
-#     truncation: float = 0.0,
-#     test_period: str = "P0Y0M",
-#     unit_handling: str = "VERIFY",
-#     nan_handling: str = "OFF",
-#     language: str = "FASTEXPR",
-#     visualization: bool = True,
-#     pasteurization: str = "ON",
-#     max_trade: str = "OFF"
-# ) -> Dict[str, Any]:
-#     """
-#     🚀 Create multiple regular alpha simulations on BRAIN platform in a single request.
+@mcp.tool()
+async def create_multi_simulation(
+    alpha_expressions: List[str],
+    instrument_type: str = "EQUITY",
+    region: str = "USA",
+    universe: str = "TOP3000",
+    delay: int = 1,
+    decay: int = 4,
+    neutralization: str = "INDUSTRY",
+    truncation: float = 0.0,
+    test_period: str = "P0Y0M",
+    unit_handling: str = "VERIFY",
+    nan_handling: str = "OFF",
+    language: str = "FASTEXPR",
+    visualization: bool = False,
+    pasteurization: str = "ON",
+    max_trade: str = "OFF"
+) -> Dict[str, Any]:
+    """
+    🚀 Create multiple regular alpha simulations on BRAIN platform in a single request.
     
-#     This tool creates a multisimulation with multiple regular alpha expressions,
-#     waits for all simulations to complete, and returns detailed results for each alpha.
+    This tool creates a multisimulation with multiple regular alpha expressions,
+    waits for all simulations to complete, and returns detailed results for each alpha.
     
-#     ⏰ NOTE: Multisimulations can take 8+ minutes to complete. This tool will wait
-#     for the entire process and return comprehensive results.
-#     Call get_platform_setting_options to get the valid options for the simulation.
-#     Args:
-#         alpha_expressions: List of alpha expressions (2-8 expressions required)
-#         instrument_type: Type of instruments (default: "EQUITY")
-#         region: Market region (default: "USA")
-#         universe: Universe of stocks (default: "TOP3000")
-#         delay: Data delay (default: 1)
-#         decay: Decay value (default: 0.0)
-#         neutralization: Neutralization method (default: "NONE")
-#         truncation: Truncation value (default: 0.0)
-#         test_period: Test period (default: "P0Y0M")
-#         unit_handling: Unit handling method (default: "VERIFY")
-#         nan_handling: NaN handling method (default: "OFF")
-#         language: Expression language (default: "FASTEXPR")
-#         visualization: Enable visualization (default: True)
-#         pasteurization: Pasteurization setting (default: "ON")
-#         max_trade: Max trade setting (default: "OFF")
+    ⏰ NOTE: Multisimulations can take 8+ minutes to complete. This tool will wait
+    for the entire process and return comprehensive results.
+    Call get_platform_setting_options to get the valid options for the simulation.
+    Args:
+        alpha_expressions: List of alpha expressions (2-8 expressions required)
+        instrument_type: Type of instruments (default: "EQUITY")
+        region: Market region (default: "USA")
+        universe: Universe of stocks (default: "TOP3000")
+        delay: Data delay (default: 1)
+        decay: Decay value (default: 4)
+        neutralization: Neutralization method (default: "NONE")
+        truncation: Truncation value (default: 0.0)
+        test_period: Test period (default: "P0Y0M")
+        unit_handling: Unit handling method (default: "VERIFY")
+        nan_handling: NaN handling method (default: "OFF")
+        language: Expression language (default: "FASTEXPR")
+        visualization: Enable visualization (default: False)
+        pasteurization: Pasteurization setting (default: "ON")
+        max_trade: Max trade setting (default: "OFF")
     
-#     Returns:
-#         Dictionary containing multisimulation results and individual alpha details
-#     """
-#     try:
-#         # Validate input
-#         if len(alpha_expressions) < 2:
-#             return {"error": "At least 2 alpha expressions are required"}
-#         if len(alpha_expressions) > 8:
-#             return {"error": "Maximum 8 alpha expressions allowed per request"}
+    Returns:
+        Dictionary containing multisimulation results and individual alpha details
+    """
+    try:
+        # Validate input
+        if len(alpha_expressions) < 2:
+            return {"error": "At least 2 alpha expressions are required"}
+        if len(alpha_expressions) > 8:
+            return {"error": "Maximum 8 alpha expressions allowed per request"}
         
-#         # Create multisimulation data
-#         multisimulation_data = []
-#         for alpha_expr in alpha_expressions:
-#             simulation_item = {
-#                 'type': 'REGULAR',
-#                 'settings': {
-#                     'instrumentType': instrument_type,
-#                     'region': region,
-#                     'universe': universe,
-#                     'delay': delay,
-#                     'decay': decay,
-#                     'neutralization': neutralization,
-#                     'truncation': truncation,
-#                     'pasteurization': pasteurization,
-#                     'unitHandling': unit_handling,
-#                     'nanHandling': nan_handling,
-#                     'language': language,
-#                     'visualization': visualization,
-#                     'testPeriod': test_period,
-#                     'maxTrade': max_trade if region != "ASI" else "ON"  # ASI区maxTrade必须设置为ON
-#                 },
-#                 'regular': alpha_expr
-#             }
-#             multisimulation_data.append(simulation_item)
+        # Create multisimulation data
+        multisimulation_data = []
+        for alpha_expr in alpha_expressions:
+            simulation_item = {
+                'type': 'REGULAR',
+                'settings': {
+                    'instrumentType': instrument_type,
+                    'region': region,
+                    'universe': universe,
+                    'delay': delay,
+                    'decay': decay,
+                    'neutralization': neutralization,
+                    'truncation': truncation,
+                    'pasteurization': pasteurization,
+                    'unitHandling': unit_handling,
+                    'nanHandling': nan_handling,
+                    'language': language,
+                    'visualization': visualization,
+                    'testPeriod': test_period,
+                    'maxTrade': max_trade if region != "ASI" else "ON"  # ASI区maxTrade必须设置为ON
+                },
+                'regular': alpha_expr
+            }
+            multisimulation_data.append(simulation_item)
         
-#         # Send multisimulation request
-#         response = brain_client.session.post(f"{brain_client.base_url}/simulations", json=multisimulation_data)
+        # Send multisimulation request
+        response = brain_client.session.post(f"{brain_client.base_url}/simulations", json=multisimulation_data)
         
-#         if response.status_code != 201:
-#             return {"error": f"Failed to create multisimulation. Status: {response.status_code}"}
+        if response.status_code != 201:
+            return {"error": f"Failed to create multisimulation. Status: {response.status_code}"}
         
-#         # Get multisimulation location
-#         location = response.headers.get('Location', '')
-#         if not location:
-#             return {"error": "No location header in multisimulation response"}
+        # Get multisimulation location
+        location = response.headers.get('Location', '')
+        if not location:
+            return {"error": "No location header in multisimulation response"}
         
-#         # Wait for children to appear and get results
-#         return await _wait_for_multisimulation_completion(location, len(alpha_expressions))
+        # Wait for children to appear and get results
+        return await _wait_for_multisimulation_completion(location, len(alpha_expressions))
         
-#     except Exception as e:
-#         return {"error": f"Error creating multisimulation: {str(e)}"}
+    except Exception as e:
+        return {"error": f"Error creating multisimulation: {str(e)}"}
 
 async def _wait_for_multisimulation_completion(location: str, expected_children: int) -> Dict[str, Any]:
     """Wait for multisimulation to complete and return results"""
@@ -3086,7 +3086,7 @@ async def lookINTO_SimError_message(locations: Sequence[str]) -> dict:
                 error_msg = error_msg or "Simulation did not get through, if you are running a multisimulation, check the other children location in your request"
             extra_info = ""
             if error_msg and "does not support event inputs" in error_msg:
-                extra_info = "Operator xxx does not support event inputs : If fields is vector type  should use vec_sum or vec_avg with event input"
+                extra_info = "Operator xxx does not support event inputs : If fields is vector type  should use vec_* operator with event input"
             results.append({
                 "location": loc,
                 "error": error_msg,
