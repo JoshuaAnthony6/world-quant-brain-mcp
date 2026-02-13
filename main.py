@@ -1027,6 +1027,88 @@ class BrainApiClient:
             self.log(f"Failed to get user alphas: {str(e)}", "ERROR")
             raise
     
+    def pre_submit_check(self, alpha_details: Dict[str, Any]) -> Dict[str, Any]:
+        """Check IS metrics against submission thresholds before submitting.
+
+        Criteria:
+        - Sharpe > 1.58 and Fitness > 1 and Margin > 0.15%
+        - Turnover between 5% and 20%
+        - Returns > 5% and Returns > drawdown
+        - Margin > 0.15% (at least > 0.10%)
+        - All other IS checks must PASS (no FAIL)
+        """
+        is_data = alpha_details.get('is')
+        if not is_data:
+            return {'passed': False, 'reason': 'No IS data available for this alpha. Simulation may not be complete.', 'details': []}
+
+        failures = []
+        warnings = []
+
+        sharpe = is_data.get('sharpe', 0)
+        fitness = is_data.get('fitness', 0)
+        margin = is_data.get('margin', 0)
+        turnover = is_data.get('turnover', 0)
+        returns = is_data.get('returns', 0)
+        drawdown = is_data.get('drawdown', 0)
+
+        # Sharpe > 1.58
+        if sharpe <= 1.58:
+            failures.append(f'Sharpe {sharpe} <= 1.58 (required > 1.58)')
+
+        # Fitness > 1
+        if fitness <= 1:
+            failures.append(f'Fitness {fitness} <= 1 (required > 1)')
+
+        # Margin > 0.15% (0.0015). Hard floor at 0.10% (0.001).
+        if margin <= 0.001:
+            failures.append(f'Margin {margin*100:.4f}% <= 10bp (hard floor, required > 15bp)')
+        elif margin <= 0.0015:
+            warnings.append(f'Margin {margin*100:.4f}% <= 15bp (recommended > 15bp, current above 10bp hard floor)')
+
+        # Turnover between 5% and 20%
+        if turnover < 0.05:
+            failures.append(f'Turnover {turnover*100:.2f}% < 5% (required 5%-20%)')
+        elif turnover > 0.20:
+            failures.append(f'Turnover {turnover*100:.2f}% > 20% (required 5%-20%)')
+
+        # Returns > 5%
+        if returns <= 0.05:
+            failures.append(f'Returns {returns*100:.2f}% <= 5% (required > 5%)')
+
+        # Returns > drawdown
+        if returns <= drawdown:
+            failures.append(f'Returns {returns*100:.2f}% <= Drawdown {drawdown*100:.2f}% (required Returns > Drawdown)')
+
+        # All other IS checks must not be FAIL
+        checks = is_data.get('checks', [])
+        for chk in checks:
+            result = chk.get('result', '')
+            name = chk.get('name', 'UNKNOWN')
+            if result == 'FAIL':
+                value = chk.get('value', 'N/A')
+                limit = chk.get('limit', 'N/A')
+                failures.append(f'IS check {name} FAILED (value={value}, limit={limit})')
+
+        passed = len(failures) == 0
+        return {
+            'passed': passed,
+            'failures': failures,
+            'warnings': warnings,
+            'metrics': {
+                'sharpe': sharpe,
+                'fitness': fitness,
+                'margin': margin,
+                'margin_bp': round(margin * 10000, 2),
+                'turnover': turnover,
+                'returns': returns,
+                'drawdown': drawdown,
+            },
+            'is_checks_summary': [
+                {'name': c.get('name'), 'result': c.get('result'), 'value': c.get('value'), 'limit': c.get('limit')}
+                for c in checks
+            ],
+        }
+
     async def submit_alpha(self, alpha_id: str) -> bool:
         """Submit an alpha for production."""
         await self.ensure_authenticated()
@@ -1619,7 +1701,7 @@ class BrainApiClient:
             else:
                 check_types = [correlation_type]
             
-            all_passed = False
+            all_passed = True
             
             for check_type in check_types:
                 if check_type == "production":
@@ -2405,21 +2487,51 @@ async def get_user_alphas(
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def submit_alpha(alpha_id: str) -> Dict[str, Any]:
+async def submit_alpha(alpha_id: str, force: bool = False) -> Dict[str, Any]:
     """
-    Submit an alpha for production.
+    Submit an alpha for production with pre-submission IS metrics check.
     
-    Use this when your alpha is ready for production deployment.
+    Before submitting, this tool automatically checks the alpha's IS metrics against
+    the following thresholds:
+    - Sharpe > 1.58, Fitness > 1, Margin > 15bp (hard floor 10bp)
+    - Turnover between 5% and 20%
+    - Returns > 5% and Returns > Drawdown
+    - All IS checks must PASS (no FAIL)
+    
+    If the check fails, submission is blocked and failure details are returned.
+    Use force=True to bypass the check and submit anyway (not recommended).
     
     Args:
         alpha_id: The ID of the alpha to submit
+        force: If True, skip the pre-submission check and submit directly (not recommended)
     
     Returns:
-        Submission result
+        Submission result including pre-check details
     """
     try:
-        success = await brain_client.submit_alpha(alpha_id)
-        return {"success": success}
+        if not force:
+            # Fetch alpha details for IS metrics check
+            alpha_details = await brain_client.get_alpha_details(alpha_id)
+            check_result = brain_client.pre_submit_check(alpha_details)
+            
+            if not check_result['passed']:
+                return {
+                    "success": False,
+                    "blocked": True,
+                    "reason": "Pre-submission IS metrics check failed. Alpha does not meet submission thresholds.",
+                    "check_result": check_result,
+                }
+            
+            # Passed check — proceed to submit
+            success = await brain_client.submit_alpha(alpha_id)
+            return {
+                "success": success,
+                "blocked": False,
+                "check_result": check_result,
+            }
+        else:
+            success = await brain_client.submit_alpha(alpha_id)
+            return {"success": success, "forced": True}
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
