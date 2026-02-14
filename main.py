@@ -2487,7 +2487,7 @@ async def get_user_alphas(
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def submit_alpha(alpha_id: str, force: bool = False) -> Dict[str, Any]:
+async def submit_alpha(alpha_id: str) -> Dict[str, Any]:
     """
     Submit an alpha for production with pre-submission IS metrics check.
     
@@ -2499,15 +2499,13 @@ async def submit_alpha(alpha_id: str, force: bool = False) -> Dict[str, Any]:
     - All IS checks must PASS (no FAIL)
     
     If the check fails, submission is blocked and failure details are returned.
-    Use force=True to bypass the check and submit anyway (not recommended).
     
     Args:
-        alpha_id: The ID of the alpha to submit
-        force: If True, skip the pre-submission check and submit directly (not recommended)
-    
+        alpha_id: The ID of the alpha to submit    
     Returns:
         Submission result including pre-check details
     """
+    force = False
     try:
         if not force:
             # Fetch alpha details for IS metrics check
@@ -2787,7 +2785,16 @@ async def check_correlation(alpha_id: str) -> Dict[str, Any]:
 async def set_alpha_properties(alpha_id: str, name: Optional[str] = None, 
                                color: Optional[str] = None, tags: Optional[List[str]] = None,
                                descriptions: str = "None") -> Dict[str, Any]:
-    """Update alpha properties (name, color, tags, descriptions). color may be one of `RED` `GREEN` `YELLOW` `BLUE` `PURPLE`"""
+    """
+      Note: Update alpha properties (name, color, tags, descriptions). 
+      Args:
+        color: may be one of `RED` `GREEN` `YELLOW` `BLUE` `PURPLE`；
+        name: 不能带空格；tags 至少包含 `PowerPoolSelected`；
+        description: 用英文且 <=100 词，格式包含下面三个关键词：
+            Idea:
+            Rationale for data used:
+            Rationale for operators used:
+    """
     try:
         return await brain_client.set_alpha_properties(alpha_id, name, color, tags, descriptions)
     except Exception as e:
