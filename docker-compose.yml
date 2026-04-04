@@ -29,6 +29,7 @@ services:
     image: redis:6-alpine
     container_name: mcp-redis
     restart: unless-stopped
+    command: redis-server --appendonly yes --appendfsync everysec
     volumes:
       - redis_data:/data
     ports:
