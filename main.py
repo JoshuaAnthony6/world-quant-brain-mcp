@@ -2040,7 +2040,7 @@ class BrainApiClient:
         if self.redis_client:
             try:
                 lock_key = "rate_limit:check_correlation"
-                if not self.redis_client.set(lock_key, "locked", ex=3660, nx=True):
+                if not self.redis_client.set(lock_key, "locked", ex=180, nx=True):
                     ttl = self.redis_client.ttl(lock_key)
                     return {
                         'alpha_id': alpha_id,
