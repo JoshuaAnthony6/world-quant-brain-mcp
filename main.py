@@ -1893,6 +1893,10 @@ class BrainApiClient:
         """Get production correlation data for an alpha.
         
         Polls every 30 seconds for up to 1 hour to handle platform rate-limiting.
+        For super alphas, the platform may return an empty body (HTTP 200) for a few
+        minutes after simulation completes while it computes the correlation data.
+        The polling loop handles this by retrying until data is available.
+        Returns {'status': 'pending', ...} after max_wait_seconds if data never arrives.
         """
         await self.ensure_authenticated()
         
@@ -1900,12 +1904,22 @@ class BrainApiClient:
         poll_interval = 30       # 30 seconds per attempt (matches reference implementation)
         start_time = time.time()
         attempt = 0
+        consecutive_empty = 0    # track consecutive empty-body responses
         
         while True:
             elapsed = time.time() - start_time
             if elapsed >= max_wait_seconds:
                 self.log(f"Production correlation timeout after {int(elapsed)}s for {alpha_id}", "WARNING")
-                return {}
+                return {
+                    'status': 'pending',
+                    'message': (
+                        f"Production correlation data for alpha {alpha_id} was not available "
+                        f"after {int(elapsed)}s of polling. The platform may still be computing "
+                        "it. Please retry check_correlation in a few minutes."
+                    ),
+                    'max': None,
+                    'records': [],
+                }
             
             attempt += 1
             try:
@@ -1917,12 +1931,23 @@ class BrainApiClient:
                 
                 text = (response.text or "").strip()
                 if not text:
+                    consecutive_empty += 1
+                    if consecutive_empty == 3:
+                        # Platform is still computing — log once so users understand the wait
+                        self.log(
+                            f"[PC计算中] Alpha {alpha_id} 的生产相关性数据尚未就绪 "
+                            f"(已收到 {consecutive_empty} 次空响应). "
+                            "平台正在计算中，通常需要 1-5 分钟，请耐心等待...",
+                            "INFO"
+                        )
                     await asyncio.sleep(poll_interval)
                     continue
                 
+                # Got a non-empty response — reset empty counter
+                consecutive_empty = 0
                 try:
                     corr_data = response.json()
-                    if corr_data and 'max' in corr_data:
+                    if corr_data and corr_data.get('max') is not None:
                         self.log(f"[PC成功] Alpha {alpha_id} PC={corr_data['max']} (第 {attempt} 次查询, 耗时 {int(elapsed)}s)", "INFO")
                         return corr_data
                 except json.JSONDecodeError:
@@ -2074,11 +2099,25 @@ class BrainApiClient:
                 if check_type == "production":
                     correlation_data = await self.get_production_correlation(alpha_id)
                     
+                    # Handle pending/data-not-yet-available case (super alphas, fresh simulations)
+                    if correlation_data and correlation_data.get('status') == 'pending':
+                        results['checks'][check_type] = {
+                            'max_correlation': None,
+                            'passes_check': None,
+                            'status': 'pending',
+                            'message': correlation_data.get('message', ''),
+                            'correlation_data': correlation_data,
+                        }
+                        results['all_passed'] = None
+                        results['status'] = 'pending'
+                        results['message'] = correlation_data.get('message', '')
+                        return results
+
                     if (
                         correlation_data
                         and isinstance(correlation_data.get('records'), list)
                         and len(correlation_data['records']) > 0
-                        and 'max' in correlation_data
+                        and correlation_data.get('max') is not None
                     ):
                         max_correlation = correlation_data['max']
                         passes_check = max_correlation < threshold
@@ -2092,26 +2131,33 @@ class BrainApiClient:
                             results["all_passed"] = all_passed
                             return results
                     else:
-                        max_correlation = 0
-                        passes_check = False
+                        # Data returned but has no usable records/max (empty or malformed).
+                        # Return None to signal "data unavailable" rather than faking max=0.
                         results['checks'][check_type] = {
-                            'max_correlation': max_correlation,
-                            'passes_check': passes_check,
-                            'correlation_data': correlation_data
+                            'max_correlation': None,
+                            'passes_check': None,
+                            'status': 'data_unavailable',
+                            'message': (
+                                'Production correlation data is unavailable for this alpha. '
+                                'This may be a newly-created super alpha where the platform '
+                                'has not yet computed the correlation. Please retry in a few minutes.'
+                            ),
+                            'correlation_data': correlation_data,
                         }
-                        results['all_passed'] = passes_check
+                        results['all_passed'] = None
+                        results['status'] = 'data_unavailable'
                         return results
                 elif check_type == "self":
                     correlation_data = await self.get_self_correlation(alpha_id)
                 else:
                     continue
                 
-                # Analyze correlation data
+                # Analyze correlation data (self-correlation path)
                 if (
                     correlation_data
                     and isinstance(correlation_data.get('records'), list)
                     and len(correlation_data['records']) > 0
-                    and 'max' in correlation_data
+                    and correlation_data.get('max') is not None
                 ):
                     max_correlation = correlation_data['max']
                     passes_check = max_correlation < threshold
