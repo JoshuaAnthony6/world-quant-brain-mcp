@@ -1040,6 +1040,22 @@ class BrainApiClient:
         
         return {}
     
+    def _match_alpha_filters(self, alpha: Dict[str, Any], region: Optional[str],
+                             status: Optional[str], alpha_type: Optional[str],
+                             is_super: Optional[bool]) -> bool:
+        """Check if an alpha matches the client-side filters."""
+        if region and alpha.get('settings', {}).get('region', '').upper() != region.upper():
+            return False
+        if status and alpha.get('status', '').upper() != status.upper():
+            return False
+        if alpha_type and alpha.get('type', '').upper() != alpha_type.upper():
+            return False
+        if is_super is not None:
+            actual_is_super = alpha.get('type', '').upper() == 'SUPER'
+            if actual_is_super != is_super:
+                return False
+        return True
+
     async def get_user_alphas(
         self,
         stage: str = "OS",
@@ -1051,42 +1067,107 @@ class BrainApiClient:
         submission_end_date: Optional[str] = None,
         order: Optional[str] = None,
         hidden: Optional[bool] = None,
+        region: Optional[str] = None,
+        status: Optional[str] = None,
+        alpha_type: Optional[str] = None,
+        is_super: Optional[bool] = None,
     ) -> Dict[str, Any]:
-        """Get user's alphas with advanced filtering and Redis caching (1 day TTL)."""
+        """Get user's alphas with advanced filtering and Redis caching (1 day TTL).
+        
+        Note: The BRAIN API does not support region/status/type/is_super as query
+        parameters. These are applied as client-side filters after fetching.
+        """
         await self.ensure_authenticated()
         
+        need_client_filter = any([region, status, is_super is not None])
+        
         try:
-            # Build params for both API call and cache key
-            params = {
+            # Build API params (only params the API actually supports)
+            api_params = {
                 "stage": stage,
-                "limit": limit,
-                "offset": offset,
             }
             if start_date:
-                params["dateCreated>"] = start_date
+                api_params["dateCreated>"] = start_date
             if end_date:
-                params["dateCreated<"] = end_date
+                api_params["dateCreated<"] = end_date
             if submission_start_date:
-                params["dateSubmitted>"] = submission_start_date
+                api_params["dateSubmitted>"] = submission_start_date
             if submission_end_date:
-                params["dateSubmitted<"] = submission_end_date
+                api_params["dateSubmitted<"] = submission_end_date
             if order:
-                params["order"] = order
+                api_params["order"] = order
             if hidden is not None:
-                params["hidden"] = str(hidden).lower()
+                api_params["hidden"] = str(hidden).lower()
+            # 'type' is supported server-side (REGULAR, SUPER, etc.)
+            if alpha_type:
+                api_params["type"] = alpha_type
             
-            # Generate cache key from all parameters
-            cache_key = self._generate_cache_key('user_alphas', params)
+            # Build full cache key including client-side filter params
+            cache_params = {**api_params, "limit": limit, "offset": offset}
+            if region:
+                cache_params["_region"] = region
+            if status:
+                cache_params["_status"] = status
+            if alpha_type:
+                cache_params["_type"] = alpha_type
+            if is_super is not None:
+                cache_params["_is_super"] = str(is_super).lower()
+            
+            cache_key = self._generate_cache_key('user_alphas', cache_params)
             
             # Try to get from cache
             cached_data = self._get_cached_data(cache_key)
             if cached_data:
                 return {**cached_data, 'from_cache': True}
             
-            # Fetch from API
-            response = await self._request('GET', f"{self.base_url}/users/self/alphas", params=params)
-            response.raise_for_status()
-            data = response.json()
+            if not need_client_filter:
+                # No client-side filtering needed — use simple server-side pagination
+                api_params["limit"] = limit
+                api_params["offset"] = offset
+                response = await self._request('GET', f"{self.base_url}/users/self/alphas", params=api_params)
+                response.raise_for_status()
+                data = response.json()
+            else:
+                # Client-side filtering: fetch all matching alphas, then filter
+                # Note: The API caps results at 100 per request regardless of limit param
+                BATCH_SIZE = 100
+                filtered_results = []
+                api_offset = 0
+                total_server_count = None
+                
+                while True:
+                    api_params_batch = {**api_params, "limit": BATCH_SIZE, "offset": api_offset}
+                    response = await self._request('GET', f"{self.base_url}/users/self/alphas", params=api_params_batch)
+                    response.raise_for_status()
+                    batch_data = response.json()
+                    
+                    if total_server_count is None:
+                        total_server_count = batch_data.get('count', 0)
+                    
+                    batch_results = batch_data.get('results', [])
+                    if not batch_results:
+                        break
+                    
+                    for alpha in batch_results:
+                        if self._match_alpha_filters(alpha, region, status, alpha_type, is_super):
+                            filtered_results.append(alpha)
+                    
+                    api_offset += len(batch_results)
+                    # Stop if we've exhausted all server-side results
+                    if api_offset >= total_server_count:
+                        break
+                
+                # Apply user's offset/limit to the filtered results
+                total_filtered = len(filtered_results)
+                page_results = filtered_results[offset:offset + limit]
+                
+                next_offset = offset + limit
+                data = {
+                    'count': total_filtered,
+                    'next': f"offset={next_offset}&limit={limit}" if next_offset < total_filtered else None,
+                    'previous': f"offset={max(0, offset - limit)}&limit={limit}" if offset > 0 else None,
+                    'results': page_results,
+                }
             
             # Add metadata
             data['from_cache'] = False
@@ -2205,7 +2286,9 @@ class BrainApiClient:
 
     async def set_alpha_properties(self, alpha_id: str, name: Optional[str] = None, 
                                    color: Optional[str] = None, tags: Optional[List[str]] = None,
-                                   descriptions: str = "None"
+                                   descriptions: str = "None",
+                                   selection_description: Optional[str] = None,
+                                   combo_description: Optional[str] = None
                                    ) -> Dict[str, Any]:
         """Update alpha properties (name, color, tags, descriptions)."""
         await self.ensure_authenticated()
@@ -2217,6 +2300,10 @@ class BrainApiClient:
                 "tags": tags if tags is not None else [],
                 "regular": {"description": descriptions}
             }
+            if selection_description is not None:
+                payload["selection"] = {"description": selection_description}
+            if combo_description is not None:
+                payload["combo"] = {"description": combo_description}
             
             response = await self._request('PATCH', f"{self.base_url}/alphas/{alpha_id}", json=payload)
             response.raise_for_status()
@@ -2867,12 +2954,17 @@ async def get_user_alphas(
     submission_end_date: Optional[str] = None,
     order: Optional[str] = None,
     hidden: Optional[bool] = None,
+    region: Optional[str] = None,
+    status: Optional[str] = None,
+    type: Optional[str] = None,
+    is_super: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Get user's alphas with advanced filtering, pagination, and sorting.
 
     This tool retrieves a list of your alphas, allowing for detailed filtering based on stage,
-    creation date, submission date, and visibility. It also supports pagination and custom sorting.
+    creation date, submission date, visibility, region, status, type, and super alpha flag.
+    It also supports pagination and custom sorting.
 
     Args:
         stage (str): The stage of the alphas to retrieve.
@@ -2903,6 +2995,17 @@ async def get_user_alphas(
             - `True`: Only return hidden alphas.
             - `False`: Only return non-hidden alphas.
             If not provided, both hidden and non-hidden alphas are returned.
+        region (Optional[str]): Filter alphas by region.
+            Common values: "USA", "EUR", "ASI", "GLB", etc.
+            If not provided, alphas from all regions are returned.
+        status (Optional[str]): Filter alphas by their OS status.
+            Common values: "ACTIVE", "SUPERSEDED", "UNSUBMITTED", etc.
+            If not provided, alphas with any status are returned.
+        type (Optional[str]): Filter alphas by their expression type.
+            Common values: "REGULAR", "SUPER", etc.
+            If not provided, alphas of all types are returned.
+        is_super (Optional[bool]): Filter to only super alphas (True) or non-super alphas (False).
+            If not provided, both super and non-super alphas are returned.
 
     Returns:
         Dict[str, Any]: A dictionary containing a list of alpha details under the 'results' key,
@@ -2912,7 +3015,8 @@ async def get_user_alphas(
         return await brain_client.get_user_alphas(
             stage=stage, limit=limit, offset=offset, start_date=start_date,
             end_date=end_date, submission_start_date=submission_start_date,
-            submission_end_date=submission_end_date, order=order, hidden=hidden
+            submission_end_date=submission_end_date, order=order, hidden=hidden,
+            region=region, status=status, alpha_type=type, is_super=is_super,
         )
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
@@ -3216,9 +3320,13 @@ async def check_correlation(alpha_id: str) -> Dict[str, Any]:
 @mcp.tool()
 async def set_alpha_properties(alpha_id: str, name: Optional[str] = None, 
                                color: Optional[str] = None, tags: Optional[List[str]] = None,
-                               descriptions: str = "None") -> Dict[str, Any]:
+                               descriptions: str = "None",
+                               selection_description: Optional[str] = None,
+                               combo_description: Optional[str] = None) -> Dict[str, Any]:
     """
-      Note: Update alpha properties (name, color, tags, descriptions). 
+      Note: Update alpha properties (name, color, tags, descriptions).
+      For SUPER alphas, selection_description and combo_description are also required and must
+      each be at least 100 English characters.
       Args:
         color: may be one of `RED` `GREEN` `YELLOW` `BLUE` `PURPLE`；
         name: 不能带空格；tags 至少包含 `PowerPoolSelected`；
@@ -3230,13 +3338,18 @@ async def set_alpha_properties(alpha_id: str, name: Optional[str] = None,
         - Idea:
         - Rationale for data used:
         - Rationale for operators used:
+        selection_description: (SUPER alpha only) Description of the selection expression logic.
+        Must be at least 100 English characters. Write in English.
+        combo_description: (SUPER alpha only) Description of the combo expression logic.
+        Must be at least 100 English characters. Write in English.
     """
     try:
         # Normalize literal \n sequences to actual newlines in case the LLM emits
         # backslash-n as two characters rather than a true newline escape.
         if descriptions and descriptions != "None":
             descriptions = descriptions.replace('\\n', '\n')
-        return await brain_client.set_alpha_properties(alpha_id, name, color, tags, descriptions)
+        return await brain_client.set_alpha_properties(alpha_id, name, color, tags, descriptions,
+                                                       selection_description, combo_description)
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
