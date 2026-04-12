@@ -2003,6 +2003,7 @@ class BrainApiClient:
         start_time = time.time()
         attempt = 0
         consecutive_empty = 0    # track consecutive empty-body responses
+        consecutive_network_failures = 0
         
         while True:
             elapsed = time.time() - start_time
@@ -2051,8 +2052,19 @@ class BrainApiClient:
                 except json.JSONDecodeError:
                     pass
                     
-            except requests.RequestException as e:
-                self.log(f"Failed to get production correlation for {alpha_id}: {e}", "WARNING")
+            except (requests.RequestException, ConnectionError, TimeoutError) as e:
+                consecutive_network_failures += 1
+                retry_delay = min(5 * consecutive_network_failures, poll_interval)
+                self.log(
+                    f"Failed to get production correlation for {alpha_id} "
+                    f"(network failure {consecutive_network_failures}): {e}. "
+                    f"Retrying in {retry_delay}s",
+                    "WARNING"
+                )
+                await asyncio.sleep(retry_delay)
+                continue
+
+            consecutive_network_failures = 0
             
             await asyncio.sleep(poll_interval)
 
