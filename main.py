@@ -28,7 +28,7 @@ import pandas as pd
 import zlib
 import msgpack
 from mcp.server.fastmcp import FastMCP
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, Field, EmailStr, model_validator
 
 # Import the new forum client
 from forum_functions import forum_client
@@ -67,6 +67,23 @@ class SimulationData(BaseModel):
     regular: Optional[str] = None
     combo: Optional[str] = None
     selection: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_super_selection_rules(self) -> "SimulationData":
+        if self.type.upper() != "SUPER":
+            return self
+
+        region = self.settings.region.upper()
+        if region != "USA":
+            return self
+
+        if not self.selection:
+            raise ValueError('USA SUPER simulations require selection to include (prod_correlation > 0)')
+
+        if not re.search(r"\(\s*prod_correlation\s*>\s*0(?:\.0+)?\s*\)", self.selection):
+            raise ValueError('USA SUPER simulations require selection to include (prod_correlation > 0)')
+
+        return self
 
 class BrainApiClient:
     """WorldQuant BRAIN API client with comprehensive functionality."""
@@ -2798,7 +2815,8 @@ async def create_simulation(
         nan_handling: NaN handling method
         alpha_expression: Alpha expression code (for REGULAR type)
         combo: Combo code (for SUPER type)
-        selection: Selection code (for SUPER type)
+        selection: Selection code (for SUPER type). For USA SUPER simulations,
+            this must include (prod_correlation > 0)
     
     Returns:
         Simulation creation result with ID and location
@@ -3751,7 +3769,8 @@ async def create_multi_super_simulation(
 
     Args:
         combo_expressions: List of SUPER alpha combo expressions (e.g., ["1", "combo_a(alpha)"])
-        selection: Selection expression to pick component alphas (e.g., "(own)&&(name == 'group_1')")
+        selection: Selection expression to pick component alphas (e.g., "(own)&&(name == 'group_1')").
+            For USA SUPER simulations, this must include (prod_correlation > 0)
         region: Market region (e.g., "USA", "EUR", "GLB", "ASI", "IND", "CHN")
         universe: Universe of stocks (e.g., "TOP3000")
         delay: Data delay (0 or 1)
