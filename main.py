@@ -3359,7 +3359,9 @@ async def set_alpha_properties(alpha_id: str, name: Optional[str] = None,
       each be at least 100 English characters.
       Args:
         color: may be one of `RED` `GREEN` `YELLOW` `BLUE` `PURPLE`；
-        name: 不能带空格；tags 至少包含 `PowerPoolSelected`；
+        name: 使用生产相关性命名，不能带空格；建议基于 production correlation
+        的最大值命名，例如 `0.6534` 表示 prod correlation = 0.6534；
+        tags 至少包含 `PowerPoolSelected`；
         descriptions: Write in English, <=100 words. The three sections MUST be separated by
         actual newline characters (i.e. use the JSON escape sequence \\n\\n between sections,
         NOT the literal text "\\n\\n"). Example value:
@@ -3374,6 +3376,14 @@ async def set_alpha_properties(alpha_id: str, name: Optional[str] = None,
         Must be at least 100 English characters. Write in English.
     """
     try:
+        if descriptions and descriptions == "None":
+            return {
+                "error": (
+                    "descriptions cannot be the literal string 'None'. "
+                    "Please regenerate it in English using exactly these three sections: "
+                    "Idea:, Rationale for data used:, and Rationale for operators used:."
+                )
+            }
         # Normalize literal \n sequences to actual newlines in case the LLM emits
         # backslash-n as two characters rather than a true newline escape.
         if descriptions and descriptions != "None":
