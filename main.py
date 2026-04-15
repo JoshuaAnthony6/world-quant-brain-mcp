@@ -128,6 +128,10 @@ class BrainApiClient:
         except Exception:
             self._default_timeout_seconds = 30
         self._create_simulation_semaphore = asyncio.Semaphore(int(os.environ.get("BRAIN_CREATE_SIMULATION_MAX_CONCURRENCY", "6")))
+        try:
+            self._forum_rate_limit_seconds = max(0, int(os.environ.get("FORUM_RATE_LIMIT_SECONDS", "0")))
+        except Exception:
+            self._forum_rate_limit_seconds = 0
         self._forum_rate_limit_lock = asyncio.Lock()
         self._forum_rate_limit_until = 0.0
         
@@ -215,13 +219,16 @@ class BrainApiClient:
             self.log(f"Cache write error: {str(e)}", "WARNING")
     
     async def _rate_limit_forum_op(self, op_name: str) -> Optional[Dict[str, Any]]:
+        if self._forum_rate_limit_seconds <= 0:
+            return None
+
         if self.redis_client:
             try:
                 lock_key = "rate_limit:forum_ops"
-                if not self.redis_client.set(lock_key, "locked", ex=60, nx=True):
+                if not self.redis_client.set(lock_key, "locked", ex=self._forum_rate_limit_seconds, nx=True):
                     ttl = self.redis_client.ttl(lock_key)
                     if not isinstance(ttl, int) or ttl < 0:
-                        ttl = 60
+                        ttl = self._forum_rate_limit_seconds
                     return {
                         'status': 'rate_limited',
                         'message': f"Rate limit exceeded. Please wait {ttl} seconds before trying again.",
@@ -242,7 +249,7 @@ class BrainApiClient:
                     'message': f"Rate limit exceeded. Please wait {ttl} seconds before trying again.",
                     'retry_after': ttl,
                 }
-            self._forum_rate_limit_until = now + 60
+            self._forum_rate_limit_until = now + self._forum_rate_limit_seconds
             return None
     
     async def _request(self, method: str, url: str, **kwargs) -> requests.Response:
@@ -3307,7 +3314,7 @@ async def read_forum_post(article_id: str, email: str = "", password: str = "",
     """
     Get a specific forum post by article ID.
     
-    Note: This uses Playwright and is implemented in forum_functions.py
+    Note: This uses Zendesk support SSO plus JSON APIs and is implemented in forum_functions.py
     
     Args:
         article_id: The article ID to retrieve (e.g., "32984819083415-新人求模板")

@@ -18,6 +18,8 @@ python 配置前运行我_安装必要依赖包.py
 	- `FORUM_SETTINGS_BASE_URL` (default https://support.worldquantbrain.com)
 	- `FORUM_SETTINGS_HEADLESS` (true/false, default true)
 	- `FORUM_SETTINGS_TIMEOUT` (seconds, default 15)
+	- `FORUM_MAX_CONCURRENCY` (default 1; serializes forum operations to reduce session contention)
+	- `FORUM_RATE_LIMIT_SECONDS` (default 0; disables the extra MCP-side forum cooldown, set e.g. `10` if you want a soft gap between forum calls)
 	- `MCP_HOST` (default 0.0.0.0 for remote HTTP)
 	- `MCP_PORT` (default 8000)
 	- `MCP_STREAMABLE_HTTP_PATH` (default /mcp)
