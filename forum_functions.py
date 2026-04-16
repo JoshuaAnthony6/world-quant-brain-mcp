@@ -26,13 +26,52 @@ from bs4 import BeautifulSoup
 import requests
 import os
 
+
+_BROWSER_PATH_CACHE = None
+_BROWSER_PATH_CHECKED = False
+
+
+def _html_to_text(html: str) -> str:
+    """Convert forum HTML fragments to readable plain text."""
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, 'html.parser')
+    text = soup.get_text(separator='\n')
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return '\n'.join(lines)
+
+
+def _extract_post_id(post_url_or_id: str) -> str:
+    """Extract numeric forum post id from a raw id, slug, or full URL."""
+    if not post_url_or_id:
+        raise ValueError("Forum post id is required")
+    match = re.search(r'/posts/(\d+)|^(\d+)', str(post_url_or_id))
+    post_id = next((group for group in match.groups() if group), None) if match else None
+    if not post_id:
+        raise ValueError(f"Could not extract forum post id from: {post_url_or_id}")
+    return post_id
+
+
+def _extract_locale(post_url_or_id: str, default: str = "zh-cn") -> str:
+    """Extract forum locale from URL when present."""
+    if isinstance(post_url_or_id, str):
+        match = re.search(r'/hc/([^/]+)/community/posts/', post_url_or_id)
+        if match:
+            return match.group(1)
+    return default
+
 # 导入浏览器设置模块
 def get_browser_path():
     """获取可用的浏览器路径"""
+    global _BROWSER_PATH_CACHE, _BROWSER_PATH_CHECKED
+    if _BROWSER_PATH_CHECKED:
+        return _BROWSER_PATH_CACHE
     try:
         # 尝试直接导入
         import browser_setup
-        return browser_setup.ensure_browser_available()
+        _BROWSER_PATH_CACHE = browser_setup.ensure_browser_available()
+        _BROWSER_PATH_CHECKED = True
+        return _BROWSER_PATH_CACHE
     except ImportError:
         # 如果直接导入失败，尝试从当前目录导入
         try:
@@ -43,7 +82,9 @@ def get_browser_path():
                 import sys
                 sys.path.insert(0, str(current_dir))
                 import browser_setup
-                return browser_setup.ensure_browser_available()
+                _BROWSER_PATH_CACHE = browser_setup.ensure_browser_available()
+                _BROWSER_PATH_CHECKED = True
+                return _BROWSER_PATH_CACHE
         except Exception:
             # Fallback: simple .env parser
             try:
@@ -63,6 +104,8 @@ def get_browser_path():
         
         # 如果都失败了，返回None使用默认设置
         log("未找到browser_setup模块，将使用默认Playwright浏览器", "WARNING")
+        _BROWSER_PATH_CHECKED = True
+        _BROWSER_PATH_CACHE = None
         return None
 
 # --- Parsing Helper Functions (from playwright_forum_test.py) ---
@@ -174,11 +217,86 @@ class ForumClient:
             self.selector_timeout_ms = 15000
         # headless setting
         self.headless = str(os.getenv("FORUM_SETTINGS_HEADLESS", "true")).lower() in ("1","true","yes","on")
+        try:
+            self.max_concurrency = max(1, int(os.getenv("FORUM_MAX_CONCURRENCY", "1")))
+        except Exception:
+            self.max_concurrency = 1
+        self._forum_operation_semaphore = asyncio.Semaphore(self.max_concurrency)
         # The session is mainly used for the initial authentication via brain_client
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
         })
+
+    def _get_post_api_url(self, post_id: str) -> str:
+        return f"{self.base_url}/api/v2/community/posts/{post_id}.json?include=users"
+
+    def _get_comments_api_url(self, post_id: str, page: int) -> str:
+        return f"{self.base_url}/api/v2/community/posts/{post_id}/comments.json?page={page}&include=users"
+
+    async def _ensure_support_session(self, email: str, password: str, locale: str = "zh-cn", timeout_seconds: int = 30):
+        """Establish a Zendesk support session using the authenticated BRAIN session."""
+        try:
+            from main import brain_client
+        except ImportError:
+            import sys
+            from pathlib import Path
+            current_dir = Path(__file__).parent
+            sys.path.insert(0, str(current_dir))
+            from main import brain_client
+
+        try:
+            await asyncio.wait_for(brain_client.ensure_authenticated(), timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            log(f"Authentication check timed out after {timeout_seconds}s, proceeding anyway.", "WARNING")
+        except Exception:
+            log("Authenticating with BRAIN platform...", "INFO")
+            auth_result = await asyncio.wait_for(
+                brain_client.authenticate(email, password),
+                timeout=timeout_seconds
+            )
+            if auth_result.get('status') != 'authenticated':
+                raise Exception("BRAIN platform authentication failed.")
+
+        access_url = (
+            "https://worldquantbrain.zendesk.com/access"
+            f"?brand_id=1500000894061&locale={locale}"
+            f"&return_to={self.base_url}/hc/{locale}"
+        )
+
+        def establish_session():
+            return brain_client.session.get(
+                access_url,
+                timeout=timeout_seconds,
+                allow_redirects=True,
+                headers={
+                    'User-Agent': self.session.headers['User-Agent'],
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                },
+            )
+
+        response = await asyncio.to_thread(establish_session)
+        log(
+            f"Support SSO handshake completed with status={response.status_code}, final_url={response.url}",
+            "INFO"
+        )
+        return brain_client.session
+
+    async def _get_support_json(self, session: requests.Session, url: str, timeout_seconds: int = 30) -> Dict[str, Any]:
+        """Fetch forum JSON using the Zendesk-authenticated session."""
+        def do_request():
+            response = session.get(
+                url,
+                timeout=timeout_seconds,
+                headers={
+                    'User-Agent': self.session.headers['User-Agent'],
+                    'Accept': 'application/json',
+                },
+            )
+            response.raise_for_status()
+            return response.json()
+
+        return await asyncio.to_thread(do_request)
 
     async def _get_browser_context(self, p: Any, email: str, password: str, timeout_seconds: int = 30):
         """Authenticate and return a browser context with the session."""
@@ -281,33 +399,34 @@ class ForumClient:
         """Extract glossary terms from the forum using Playwright."""
         if async_playwright is None:
             raise ImportError("Playwright not available. Please install it with: pip install playwright")
-            
-        async with async_playwright() as p:
-            browser = None
-            try:
-                log("Starting glossary extraction process with Playwright", "INFO")
-                browser, context = await self._get_browser_context(p, email, password)
-                
-                page = await context.new_page()
-                log("Navigating to BRAIN support forum glossary...", "INFO")
-                await page.goto("https://support.worldquantbrain.com/hc/en-us/articles/4902349883927-Click-here-for-a-list-of-terms-and-their-definitions")
-                
-                log("Extracting glossary content...", "INFO")
-                content = await page.content()
-                
-                terms = _parse_glossary_terms(content)
-                
-                log(f"Extracted {len(terms)} glossary terms", "SUCCESS")
-                return terms
 
-            except Exception as e:
-                log(f"Glossary extraction failed: {str(e)}", "ERROR")
-                # Re-raise to be handled by the MCP server wrapper
-                raise
-            finally:
-                if browser:
-                    await browser.close()
-                    log("Browser closed.", "INFO")
+        async with self._forum_operation_semaphore:
+            async with async_playwright() as p:
+                browser = None
+                try:
+                    log("Starting glossary extraction process with Playwright", "INFO")
+                    browser, context = await self._get_browser_context(p, email, password)
+                    
+                    page = await context.new_page()
+                    log("Navigating to BRAIN support forum glossary...", "INFO")
+                    await page.goto("https://support.worldquantbrain.com/hc/en-us/articles/4902349883927-Click-here-for-a-list-of-terms-and-their-definitions")
+                    
+                    log("Extracting glossary content...", "INFO")
+                    content = await page.content()
+                    
+                    terms = _parse_glossary_terms(content)
+                    
+                    log(f"Extracted {len(terms)} glossary terms", "SUCCESS")
+                    return terms
+
+                except Exception as e:
+                    log(f"Glossary extraction failed: {str(e)}", "ERROR")
+                    # Re-raise to be handled by the MCP server wrapper
+                    raise
+                finally:
+                    if browser:
+                        await browser.close()
+                        log("Browser closed.", "INFO")
 
     async def search_forum_posts(self, email: str, password: str, search_query: str, max_results: int = 50, locale: str = "zh-cn") -> Dict[str, Any]:
         """Search for posts on the forum using Playwright, with pagination and timeout protection."""
@@ -320,147 +439,147 @@ class ForumClient:
         
         async def _do_search():
             nonlocal browser
-            async with async_playwright() as p:
-                try:
-                    log(f"Starting forum search for '{search_query}'", "INFO")
-                    browser, context = await asyncio.wait_for(
-                        self._get_browser_context(p, email, password, timeout_seconds),
-                        timeout=timeout_seconds + 15
-                    )
+            async with self._forum_operation_semaphore:
+                async with async_playwright() as p:
+                    try:
+                        log(f"Starting forum search for '{search_query}'", "INFO")
+                        browser, context = await asyncio.wait_for(
+                            self._get_browser_context(p, email, password, timeout_seconds),
+                            timeout=timeout_seconds + 15
+                        )
 
-                    page = await asyncio.wait_for(context.new_page(), timeout=timeout_seconds)
-                    page.set_default_timeout(timeout_seconds * 1000)
-                    page.set_default_navigation_timeout(timeout_seconds * 1000)
-                    
-                    search_results = []
-                    page_num = 1
-                    max_pages = 5  # Limit pages to prevent infinite loops
-                    
-                    while len(search_results) < max_results and page_num <= max_pages:
-                        search_url = f"{self.base_url}/hc/{locale}/search?page={page_num}&query={search_query}#results"
-                        log(f"Navigating to search page {page_num}: {search_url}", "INFO")
+                        page = await asyncio.wait_for(context.new_page(), timeout=timeout_seconds)
+                        page.set_default_timeout(timeout_seconds * 1000)
+                        page.set_default_navigation_timeout(timeout_seconds * 1000)
                         
-                        try:
-                            response = await asyncio.wait_for(
-                                page.goto(search_url, wait_until="domcontentloaded"),
-                                timeout=timeout_seconds
-                            )
-                            if response and response.status == 404:
-                                log(f"Page {page_num} not found. End of results.", "INFO")
+                        search_results = []
+                        page_num = 1
+                        max_pages = 5  # Limit pages to prevent infinite loops
+                        
+                        while len(search_results) < max_results and page_num <= max_pages:
+                            search_url = f"{self.base_url}/hc/{locale}/search?page={page_num}&query={search_query}#results"
+                            log(f"Navigating to search page {page_num}: {search_url}", "INFO")
+                            
+                            try:
+                                response = await asyncio.wait_for(
+                                    page.goto(search_url, wait_until="domcontentloaded"),
+                                    timeout=timeout_seconds
+                                )
+                                if response and response.status == 404:
+                                    log(f"Page {page_num} not found. End of results.", "INFO")
+                                    break
+                                
+                                await asyncio.wait_for(
+                                    page.wait_for_selector('ul.search-results-list', timeout=self.selector_timeout_ms),
+                                    timeout=min(timeout_seconds, 15)
+                                )
+                            except asyncio.TimeoutError:
+                                log(f"Page {page_num} navigation timed out, stopping.", "WARNING")
+                                break
+                            except Exception as e:
+                                log(f"Could not load search results on page {page_num}: {e}", "WARNING")
+                                break
+
+                            try:
+                                content = await asyncio.wait_for(page.content(), timeout=10)
+                            except asyncio.TimeoutError:
+                                log(f"Page content retrieval timed out on page {page_num}", "WARNING")
                                 break
                             
-                            await asyncio.wait_for(
-                                page.wait_for_selector('ul.search-results-list', timeout=self.selector_timeout_ms),
-                                timeout=min(timeout_seconds, 15)
-                            )
-                        except asyncio.TimeoutError:
-                            log(f"Page {page_num} navigation timed out, stopping.", "WARNING")
-                            break
-                        except Exception as e:
-                            log(f"Could not load search results on page {page_num}: {e}", "WARNING")
-                            break
+                            soup = BeautifulSoup(content, 'html.parser')
+                            
+                            results_on_page = soup.select('li.search-result-list-item')
+                            if not results_on_page:
+                                log("No more search results found.", "INFO")
+                                break
 
-                        try:
-                            content = await asyncio.wait_for(page.content(), timeout=10)
-                        except asyncio.TimeoutError:
-                            log(f"Page content retrieval timed out on page {page_num}", "WARNING")
-                            break
-                        
-                        soup = BeautifulSoup(content, 'html.parser')
-                        
-                        results_on_page = soup.select('li.search-result-list-item')
-                        if not results_on_page:
-                            log("No more search results found.", "INFO")
-                            break
+                            for result in results_on_page:
+                                try:
+                                    title_element = result.select_one('h2.search-result-title a')
+                                    snippet_element = result.select_one('.search-results-description')
+                                    
+                                    if title_element:
+                                        title = title_element.get_text(strip=True)
+                                        link = title_element.get('href')
 
-                        for result in results_on_page:
+                                        votes_element = result.select_one('.search-result-votes span[aria-hidden="true"]')
+                                        votes_text = votes_element.get_text(strip=True) if votes_element else '0'
+                                        votes_match = re.search(r'\d+', votes_text)
+                                        votes = int(votes_match.group()) if votes_match else 0
+
+                                        comments_element = result.select_one('.search-result-meta-count span[aria-hidden="true"]')
+                                        comments_text = comments_element.get_text(strip=True) if comments_element else '0'
+                                        comments_match = re.search(r'\d+', comments_text)
+                                        comments = int(comments_match.group()) if comments_match else 0
+
+                                        breadcrumbs_elements = result.select('ol.search-result-breadcrumbs li')
+                                        breadcrumbs = [bc.get_text(strip=True) for bc in breadcrumbs_elements]
+                                        
+                                        meta_group = result.select_one('ul.meta-group')
+                                        author = 'Unknown'
+                                        post_date = 'Unknown'
+                                        if meta_group:
+                                            meta_data_elements = meta_group.select('li.meta-data')
+                                            if len(meta_data_elements) > 0:
+                                                author = meta_data_elements[0].get_text(strip=True)
+                                            if len(meta_data_elements) > 1:
+                                                time_element = meta_data_elements[1].select_one('time')
+                                                if time_element:
+                                                    post_date = time_element.get('datetime', time_element.get_text(strip=True))
+
+                                        snippet = snippet_element.get_text(strip=True) if snippet_element else ''
+                                        
+                                        full_link = ''
+                                        if link and isinstance(link, str):
+                                            if link.startswith('http'):
+                                                full_link = link
+                                            else:
+                                                full_link = f"{self.base_url}{link}"
+                                        
+                                        search_results.append({
+                                            'title': title,
+                                            'link': full_link,
+                                            'snippet': snippet,
+                                            'votes': votes,
+                                            'comments': comments,
+                                            'author': author,
+                                            'date': post_date,
+                                            'breadcrumbs': breadcrumbs
+                                        })
+                                    
+                                    if len(search_results) >= max_results:
+                                        break
+                                except Exception as e:
+                                    log(f"Error parsing search result: {str(e)}", "DEBUG")
+                                    continue
+                            
+                            if len(search_results) >= max_results:
+                                break
+
+                            page_num += 1
+
+                        log(f"Found {len(search_results)} results for '{search_query}'", "SUCCESS")
+                        
+                        return {
+                            "success": True,
+                            "results": search_results,
+                            "total_found": len(search_results)
+                        }
+
+                    except Exception as e:
+                        log(f"Forum search failed: {str(e)}", "ERROR")
+                        return {
+                            "success": False,
+                            "results": [],
+                            "total_found": 0,
+                            "error": str(e)
+                        }
+                    finally:
+                        if browser:
                             try:
-                                title_element = result.select_one('h2.search-result-title a')
-                                snippet_element = result.select_one('.search-results-description')
-                                
-                                if title_element:
-                                    title = title_element.get_text(strip=True)
-                                    link = title_element.get('href')
-
-                                    votes_element = result.select_one('.search-result-votes span[aria-hidden="true"]')
-                                    votes_text = votes_element.get_text(strip=True) if votes_element else '0'
-                                    votes_match = re.search(r'\d+', votes_text)
-                                    votes = int(votes_match.group()) if votes_match else 0
-
-                                    comments_element = result.select_one('.search-result-meta-count span[aria-hidden="true"]')
-                                    comments_text = comments_element.get_text(strip=True) if comments_element else '0'
-                                    comments_match = re.search(r'\d+', comments_text)
-                                    comments = int(comments_match.group()) if comments_match else 0
-
-                                    breadcrumbs_elements = result.select('ol.search-result-breadcrumbs li')
-                                    breadcrumbs = [bc.get_text(strip=True) for bc in breadcrumbs_elements]
-                                    
-                                    meta_group = result.select_one('ul.meta-group')
-                                    author = 'Unknown'
-                                    post_date = 'Unknown'
-                                    if meta_group:
-                                        meta_data_elements = meta_group.select('li.meta-data')
-                                        if len(meta_data_elements) > 0:
-                                            author = meta_data_elements[0].get_text(strip=True)
-                                        if len(meta_data_elements) > 1:
-                                            time_element = meta_data_elements[1].select_one('time')
-                                            if time_element:
-                                                post_date = time_element.get('datetime', time_element.get_text(strip=True))
-
-                                    snippet = snippet_element.get_text(strip=True) if snippet_element else ''
-                                    
-                                    full_link = ''
-                                    if link and isinstance(link, str):
-                                        if link.startswith('http'):
-                                            full_link = link
-                                        else:
-                                            full_link = f"{self.base_url}{link}"
-                                    
-                                    search_results.append({
-                                        'title': title,
-                                        'link': full_link,
-                                        'snippet': snippet,
-                                        'votes': votes,
-                                        'comments': comments,
-                                        'author': author,
-                                        'date': post_date,
-                                        'breadcrumbs': breadcrumbs
-                                    })
-                                
-                                if len(search_results) >= max_results:
-                                    break
-                            except Exception as e:
-                                log(f"Error parsing search result: {str(e)}", "DEBUG")
-                                continue
-                        
-                        if len(search_results) >= max_results:
-                            break
-
-                        page_num += 1
-                        await asyncio.sleep(0.3)  # Small delay between pages
-
-                    log(f"Found {len(search_results)} results for '{search_query}'", "SUCCESS")
-                    
-                    return {
-                        "success": True,
-                        "results": search_results,
-                        "total_found": len(search_results)
-                    }
-
-                except Exception as e:
-                    log(f"Forum search failed: {str(e)}", "ERROR")
-                    return {
-                        "success": False,
-                        "results": [],
-                        "total_found": 0,
-                        "error": str(e)
-                    }
-                finally:
-                    if browser:
-                        try:
-                            await asyncio.wait_for(browser.close(), timeout=5)
-                        except:
-                            pass
+                                await asyncio.wait_for(browser.close(), timeout=5)
+                            except Exception:
+                                pass
         
         try:
             return await asyncio.wait_for(_do_search(), timeout=overall_timeout)
@@ -474,115 +593,76 @@ class ForumClient:
             }
 
     async def read_full_forum_post(self, email: str, password: str, post_url_or_id: str, include_comments: bool = True) -> Dict[str, Any]:
-        """Read a complete forum post and all its comments using Playwright."""
-        if async_playwright is None:
-            raise ImportError("Playwright not available. Please install it with: pip install playwright")
-            
-        async with async_playwright() as p:
-            browser = None
-            try:
-                log("Starting forum post reading process with Playwright", "INFO")
+        """Read a complete forum post and its comments via Zendesk JSON API."""
+        try:
+            async with self._forum_operation_semaphore:
+                log("Starting forum post reading process via Zendesk API", "INFO")
 
-                if isinstance(post_url_or_id, str) and post_url_or_id.startswith('http'):
-                    initial_url = post_url_or_id
-                else:
-                    initial_url = f"https://support.worldquantbrain.com/hc/zh-cn/community/posts/{post_url_or_id}"
+                post_id = _extract_post_id(post_url_or_id)
+                locale = _extract_locale(post_url_or_id)
+                session = await self._ensure_support_session(email, password, locale=locale)
 
-                browser, context = await self._get_browser_context(p, email, password)
-                page = await context.new_page()
-
-                # --- Get Main Post Content and Final URL ---
-                log(f"Navigating to initial URL: {initial_url}", "INFO")
-                await page.goto(initial_url)
-                await page.wait_for_selector('.post-body, .article-body', timeout=self.selector_timeout_ms)
-                
-                # Get the final URL after any redirects
-                base_url = re.sub(r'(\?|&)page=\d+', '', page.url).split('#')[0]
-                log(f"Resolved to Base URL: {base_url}", "INFO")
-                await page.wait_for_selector('.post-body, .article-body', timeout=self.selector_timeout_ms)
-                content = await page.content()
-                soup = BeautifulSoup(content, 'html.parser')
-
-                post_data = {}
-                title_element = soup.select_one('.post-title, h1.article-title, .article__title')
-                post_data['title'] = title_element.get_text(strip=True) if title_element else 'Unknown Title'
-
-                author_span = soup.select_one('.post-author span[title]')
-                post_data['author'] = author_span['title'] if author_span else 'Unknown Author'
-
-                body_element = soup.select_one('.post-body, .article-body')
-                post_data['body'] = body_element.get_text(strip=True) if body_element else 'Body not found'
-                
-                votes_element = soup.select_one('.vote-sum')
-                date_element = soup.select_one('.post-meta .meta-data')
-                post_data['details'] = {
-                    'votes': votes_element.get_text(strip=True) if votes_element else '0',
-                    'date': date_element.get_text(strip=True) if date_element else 'Unknown Date'
+                post_payload = await self._get_support_json(session, self._get_post_api_url(post_id))
+                post_record = post_payload.get('post') or {}
+                user_map = {
+                    user.get('id'): user.get('name')
+                    for user in post_payload.get('users', [])
+                    if isinstance(user, dict)
                 }
 
-                # --- Get Comments with Pagination ---
-                comments = []
+                post_data = {
+                    'title': post_record.get('title', 'Unknown Title'),
+                    'author': user_map.get(post_record.get('author_id'), 'Unknown Author'),
+                    'body': _html_to_text(post_record.get('details', '')) or 'Body not found',
+                    'details': {
+                        'votes': str(post_record.get('vote_sum', 0)),
+                        'date': post_record.get('created_at', 'Unknown Date') or 'Unknown Date',
+                        'url': post_record.get('html_url') or post_record.get('url')
+                    }
+                }
+
+                comments: List[Dict[str, Any]] = []
                 if include_comments:
-                    log("Starting comment extraction...", "INFO")
                     page_num = 1
                     while True:
-                        comment_url = f"{base_url}?page={page_num}#comments"
-                        log(f"Navigating to comment page: {comment_url}", "INFO")
-                        
-                        try:
-                            response = await page.goto(comment_url)
-                            if response.status == 404:
-                                log(f"Page {page_num} returned 404. End of comments.", "INFO")
-                                break
-                            await page.wait_for_selector('.comment-list', timeout=self.selector_timeout_ms)
-                        except Exception as e:
-                            log(f"Could not load page {page_num}: {e}. Assuming end of comments.", "INFO")
+                        comments_payload = await self._get_support_json(
+                            session,
+                            self._get_comments_api_url(post_id, page_num)
+                        )
+                        comment_records = comments_payload.get('comments') or []
+                        if not comment_records:
                             break
 
-                        comment_soup = BeautifulSoup(await page.content(), 'html.parser')
-                        comment_elements = comment_soup.select('.comment')
+                        users = comments_payload.get('users') or []
+                        user_map.update({
+                            user.get('id'): user.get('name')
+                            for user in users
+                            if isinstance(user, dict)
+                        })
 
-                        if not comment_elements:
-                            log(f"No comments found on page {page_num}. Ending extraction.", "INFO")
-                            break
-                        
-                        log(f"Found {len(comment_elements)} comments on page {page_num}.", "INFO")
-                        
-                        new_comments_found_on_page = 0
-                        for comment_element in comment_elements:
-                            author_span = comment_element.select_one('.comment-author span[title]')
-                            author_id = author_span['title'] if author_span else 'Unknown'
-
-                            body_element = comment_element.select_one('.comment-body')
-                            date_element = comment_element.select_one('.comment-meta .meta-data')
-                            
+                        for comment_record in comment_records:
                             comment_data = {
-                                'author': author_id,
-                                'body': body_element.get_text(strip=True) if body_element else '',
-                                'date': date_element.get_text(strip=True) if date_element else 'Unknown Date'
+                                'author': user_map.get(comment_record.get('author_id'), 'Unknown'),
+                                'body': _html_to_text(comment_record.get('body', '')),
+                                'date': comment_record.get('created_at', 'Unknown Date') or 'Unknown Date'
                             }
-                            
-                            if comment_data not in comments:
-                                comments.append(comment_data)
-                                new_comments_found_on_page += 1
+                            comments.append(comment_data)
 
-                        if new_comments_found_on_page == 0 and page_num > 1:
-                            log(f"No new comments detected on page {page_num}. Ending extraction.", "INFO")
+                        if not comments_payload.get('next_page'):
                             break
-                            
                         page_num += 1
 
                 log(f"Extracted {len(comments)} comments in total.", "SUCCESS")
                 return {
-                    "success": True, "post": post_data, "comments": comments, "total_comments": len(comments)
+                    'success': True,
+                    'post': post_data,
+                    'comments': comments,
+                    'total_comments': len(comments)
                 }
 
-            except Exception as e:
-                log(f"Failed to read forum post: {str(e)}", "ERROR")
-                raise
-            finally:
-                if browser:
-                    await browser.close()
+        except Exception as e:
+            log(f"Failed to read forum post: {str(e)}", "ERROR")
+            raise
 
 # Initialize forum client
 forum_client = ForumClient()

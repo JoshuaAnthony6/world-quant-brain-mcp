@@ -21,11 +21,14 @@ from time import sleep
 from urllib.parse import urljoin
 import redis
 import hashlib
+import math
 
 import requests
 import pandas as pd
+import zlib
+import msgpack
 from mcp.server.fastmcp import FastMCP
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, Field, EmailStr, model_validator
 
 # Import the new forum client
 from forum_functions import forum_client
@@ -64,6 +67,23 @@ class SimulationData(BaseModel):
     regular: Optional[str] = None
     combo: Optional[str] = None
     selection: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_super_selection_rules(self) -> "SimulationData":
+        if self.type.upper() != "SUPER":
+            return self
+
+        region = self.settings.region.upper()
+        if region != "USA":
+            return self
+
+        if not self.selection:
+            raise ValueError('USA SUPER simulations require selection to include (prod_correlation > 0)')
+
+        if not re.search(r"\(\s*prod_correlation\s*>\s*0(?:\.0+)?\s*\)", self.selection):
+            raise ValueError('USA SUPER simulations require selection to include (prod_correlation > 0)')
+
+        return self
 
 class BrainApiClient:
     """WorldQuant BRAIN API client with comprehensive functionality."""
@@ -108,6 +128,10 @@ class BrainApiClient:
         except Exception:
             self._default_timeout_seconds = 30
         self._create_simulation_semaphore = asyncio.Semaphore(int(os.environ.get("BRAIN_CREATE_SIMULATION_MAX_CONCURRENCY", "6")))
+        try:
+            self._forum_rate_limit_seconds = max(0, int(os.environ.get("FORUM_RATE_LIMIT_SECONDS", "0")))
+        except Exception:
+            self._forum_rate_limit_seconds = 0
         self._forum_rate_limit_lock = asyncio.Lock()
         self._forum_rate_limit_until = 0.0
         
@@ -117,6 +141,19 @@ class BrainApiClient:
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
         
+        # Load OS/IS Sharpe ratio data for datafield quality filtering
+        self._isos_data = {}
+        try:
+            info_data_path = Path(__file__).parent / 'config' / 'info_data.bin'
+            if info_data_path.exists():
+                with open(info_data_path, 'rb') as f:
+                    self._isos_data = msgpack.unpackb(zlib.decompress(f.read()), raw=False)
+                self.log(f"Loaded OS/IS Sharpe data: {len(self._isos_data)} region_delay entries", "INFO")
+            else:
+                self.log(f"OS/IS Sharpe data file not found at {info_data_path}, sharpe filtering disabled", "WARNING")
+        except Exception as e:
+            self.log(f"Failed to load OS/IS Sharpe data: {str(e)}, sharpe filtering disabled", "WARNING")
+
         # Initialize Redis connection
         try:
             redis_host = os.environ.get('REDIS_HOST', 'localhost')
@@ -171,8 +208,8 @@ class BrainApiClient:
             self.log(f"Cache read error: {str(e)}", "WARNING")
         return None
     
-    def _set_cached_data(self, cache_key: str, data: Dict[str, Any], ttl: int = 86400):
-        """Set data in Redis cache with TTL (default 1 day = 86400 seconds)."""
+    def _set_cached_data(self, cache_key: str, data: Dict[str, Any], ttl: int = 604800):
+        """Set data in Redis cache with TTL (default 1 week = 604800 seconds)."""
         if not self.redis_client:
             return
         try:
@@ -182,13 +219,16 @@ class BrainApiClient:
             self.log(f"Cache write error: {str(e)}", "WARNING")
     
     async def _rate_limit_forum_op(self, op_name: str) -> Optional[Dict[str, Any]]:
+        if self._forum_rate_limit_seconds <= 0:
+            return None
+
         if self.redis_client:
             try:
                 lock_key = "rate_limit:forum_ops"
-                if not self.redis_client.set(lock_key, "locked", ex=60, nx=True):
+                if not self.redis_client.set(lock_key, "locked", ex=self._forum_rate_limit_seconds, nx=True):
                     ttl = self.redis_client.ttl(lock_key)
                     if not isinstance(ttl, int) or ttl < 0:
-                        ttl = 60
+                        ttl = self._forum_rate_limit_seconds
                     return {
                         'status': 'rate_limited',
                         'message': f"Rate limit exceeded. Please wait {ttl} seconds before trying again.",
@@ -209,7 +249,7 @@ class BrainApiClient:
                     'message': f"Rate limit exceeded. Please wait {ttl} seconds before trying again.",
                     'retry_after': ttl,
                 }
-            self._forum_rate_limit_until = now + 60
+            self._forum_rate_limit_until = now + self._forum_rate_limit_seconds
             return None
     
     async def _request(self, method: str, url: str, **kwargs) -> requests.Response:
@@ -672,8 +712,14 @@ class BrainApiClient:
                     'offset': offset
                 }
                 
-                response = await self._request('GET', f"{self.base_url}/data-sets", params=params)
-                response.raise_for_status()
+                while True:
+                    response = await self._request('GET', f"{self.base_url}/data-sets", params=params)
+                    if response.status_code == 429:
+                        self.log(f"get_datasets 429 rate limit, retrying after 5s (offset={offset})", "WARNING")
+                        await asyncio.sleep(5)
+                        continue
+                    response.raise_for_status()
+                    break
                 data = response.json()
                 
                 results = data.get('results', [])
@@ -696,8 +742,8 @@ class BrainApiClient:
                 'from_cache': False
             }
             
-            # Cache the complete data (1 day TTL)
-            self._set_cached_data(cache_key, complete_data, ttl=86400)
+            # Cache the complete data (1 week TTL)
+            self._set_cached_data(cache_key, complete_data, ttl=604800)
             
             # Apply search filter if needed
             if search:
@@ -717,13 +763,19 @@ class BrainApiClient:
     async def get_datafields(self, instrument_type: str = "EQUITY", region: str = "USA",
                             delay: int = 1, universe: str = "TOP3000", theme: str = "false",
                             dataset_id: Optional[str] = None, data_type: str = "",
-                            search: Optional[str] = None) -> Dict[str, Any]:
+                            search: Optional[str] = None,
+                            filter_sharpe: bool = True) -> Dict[str, Any]:
         """Get available data fields with Redis caching (1 day TTL) and fetch all data at once.
         
         Search supports fuzzy matching across multiple fields:
         - Searches in: name, description, dataset.name, dataset.vendor, id
         - Multiple keywords (space-separated) use AND logic
         - Case-insensitive matching
+        
+        OS/IS Sharpe filtering (filter_sharpe=True by default):
+        - Filters out datafields whose OS/IS Sharpe ratio < 0 to improve field quality
+        - Uses pre-aggregated statistics from WebDataScope info_data.bin
+        - Matching is done at datafield level first, then dataset level as fallback
         
         Examples:
         - search="price" -> matches any field containing "price"
@@ -813,22 +865,52 @@ class BrainApiClient:
             }
             cache_key = self._generate_cache_key('datafields', cache_params)
             
+            def sharpe_filter(items: list, rgn: str, dly: int) -> tuple:
+                """Filter out datafields with OS/IS sharpe < 0. Returns (filtered_items, removed_count, applied)."""
+                if not self._isos_data:
+                    return items, 0, False
+                region_key = f"{rgn}_{dly}"
+                isos_info = self._isos_data.get(region_key, {})
+                isos_section = isos_info.get('isos', {})
+                datafield_sharpe = isos_section.get('datafield', {})
+                dataset_sharpe_map = isos_section.get('dataset', {})
+                if not datafield_sharpe and not dataset_sharpe_map:
+                    return items, 0, False
+                filtered = []
+                for item in items:
+                    field_name = item.get('id', '') or item.get('name', '')
+                    dataset_info = item.get('dataset', {})
+                    ds_id = dataset_info.get('id', '') if isinstance(dataset_info, dict) else ''
+                    df_stats = datafield_sharpe.get(field_name)
+                    if df_stats is not None:
+                        sr = df_stats.get('sharpe_ratio')
+                        if sr is not None and sr < 0:
+                            continue
+                    if df_stats is None and ds_id:
+                        ds_stats = dataset_sharpe_map.get(ds_id)
+                        if ds_stats is not None:
+                            sr = ds_stats.get('sharpe_ratio')
+                            if sr is not None and sr < 0:
+                                continue
+                    filtered.append(item)
+                return filtered, len(items) - len(filtered), True
+
             # Try to get from cache
             cached_data = self._get_cached_data(cache_key)
             if cached_data:
+                result = {**cached_data, 'from_cache': True}
+                results = result.get('results', [])
                 # Apply fuzzy search filter if needed
                 if search:
-                    filtered_results = [
-                        item for item in cached_data.get('results', [])
-                        if fuzzy_search_filter(item, search)
-                    ]
-                    return {
-                        **cached_data,
-                        'results': filtered_results,
-                        'count': len(filtered_results),
-                        'from_cache': True
-                    }
-                return {**cached_data, 'from_cache': True}
+                    results = [item for item in results if fuzzy_search_filter(item, search)]
+                # Apply OS/IS Sharpe filtering
+                if filter_sharpe:
+                    results, removed, applied = sharpe_filter(results, region, delay)
+                    result['sharpe_filter_applied'] = applied
+                    result['sharpe_filter_removed'] = removed
+                result['results'] = results
+                result['count'] = len(results)
+                return result
             
             # Fetch all data from API (pagination loop)
             all_results = []
@@ -852,8 +934,14 @@ class BrainApiClient:
                 if dataset_id:
                     params['dataset.id'] = dataset_id
                 
-                response = await self._request('GET', f"{self.base_url}/data-fields", params=params)
-                response.raise_for_status()
+                while True:
+                    response = await self._request('GET', f"{self.base_url}/data-fields", params=params)
+                    if response.status_code == 429:
+                        self.log(f"get_datafields 429 rate limit, retrying after 5s (offset={offset})", "WARNING")
+                        await asyncio.sleep(5)
+                        continue
+                    response.raise_for_status()
+                    break
                 data = response.json()
                 
                 results = data.get('results', [])
@@ -879,7 +967,7 @@ class BrainApiClient:
             }
             
             # Cache the complete data (1 day TTL)
-            self._set_cached_data(cache_key, complete_data, ttl=86400)
+            self._set_cached_data(cache_key, complete_data, ttl=604800)
             
             # Apply fuzzy search filter if needed
             if search:
@@ -889,6 +977,16 @@ class BrainApiClient:
                 ]
                 complete_data['results'] = filtered_results
                 complete_data['count'] = len(filtered_results)
+            
+            # Apply OS/IS Sharpe ratio filtering
+            if filter_sharpe:
+                results, removed, applied = sharpe_filter(complete_data['results'], region, delay)
+                complete_data['results'] = results
+                complete_data['count'] = len(results)
+                complete_data['sharpe_filter_applied'] = applied
+                complete_data['sharpe_filter_removed'] = removed
+                if applied:
+                    self.log(f"Sharpe filter ({region}_{delay}): removed {removed}/{removed + len(results)} fields with OS/IS sharpe < 0", "INFO")
             
             return complete_data
             
@@ -966,6 +1064,22 @@ class BrainApiClient:
         
         return {}
     
+    def _match_alpha_filters(self, alpha: Dict[str, Any], region: Optional[str],
+                             status: Optional[str], alpha_type: Optional[str],
+                             is_super: Optional[bool]) -> bool:
+        """Check if an alpha matches the client-side filters."""
+        if region and alpha.get('settings', {}).get('region', '').upper() != region.upper():
+            return False
+        if status and alpha.get('status', '').upper() != status.upper():
+            return False
+        if alpha_type and alpha.get('type', '').upper() != alpha_type.upper():
+            return False
+        if is_super is not None:
+            actual_is_super = alpha.get('type', '').upper() == 'SUPER'
+            if actual_is_super != is_super:
+                return False
+        return True
+
     async def get_user_alphas(
         self,
         stage: str = "OS",
@@ -977,48 +1091,113 @@ class BrainApiClient:
         submission_end_date: Optional[str] = None,
         order: Optional[str] = None,
         hidden: Optional[bool] = None,
+        region: Optional[str] = None,
+        status: Optional[str] = None,
+        alpha_type: Optional[str] = None,
+        is_super: Optional[bool] = None,
     ) -> Dict[str, Any]:
-        """Get user's alphas with advanced filtering and Redis caching (1 day TTL)."""
+        """Get user's alphas with advanced filtering and Redis caching (1 day TTL).
+        
+        Note: The BRAIN API does not support region/status/type/is_super as query
+        parameters. These are applied as client-side filters after fetching.
+        """
         await self.ensure_authenticated()
         
+        need_client_filter = any([region, status, is_super is not None])
+        
         try:
-            # Build params for both API call and cache key
-            params = {
+            # Build API params (only params the API actually supports)
+            api_params = {
                 "stage": stage,
-                "limit": limit,
-                "offset": offset,
             }
             if start_date:
-                params["dateCreated>"] = start_date
+                api_params["dateCreated>"] = start_date
             if end_date:
-                params["dateCreated<"] = end_date
+                api_params["dateCreated<"] = end_date
             if submission_start_date:
-                params["dateSubmitted>"] = submission_start_date
+                api_params["dateSubmitted>"] = submission_start_date
             if submission_end_date:
-                params["dateSubmitted<"] = submission_end_date
+                api_params["dateSubmitted<"] = submission_end_date
             if order:
-                params["order"] = order
+                api_params["order"] = order
             if hidden is not None:
-                params["hidden"] = str(hidden).lower()
+                api_params["hidden"] = str(hidden).lower()
+            # 'type' is supported server-side (REGULAR, SUPER, etc.)
+            if alpha_type:
+                api_params["type"] = alpha_type
             
-            # Generate cache key from all parameters
-            cache_key = self._generate_cache_key('user_alphas', params)
+            # Build full cache key including client-side filter params
+            cache_params = {**api_params, "limit": limit, "offset": offset}
+            if region:
+                cache_params["_region"] = region
+            if status:
+                cache_params["_status"] = status
+            if alpha_type:
+                cache_params["_type"] = alpha_type
+            if is_super is not None:
+                cache_params["_is_super"] = str(is_super).lower()
+            
+            cache_key = self._generate_cache_key('user_alphas', cache_params)
             
             # Try to get from cache
             cached_data = self._get_cached_data(cache_key)
             if cached_data:
                 return {**cached_data, 'from_cache': True}
             
-            # Fetch from API
-            response = await self._request('GET', f"{self.base_url}/users/self/alphas", params=params)
-            response.raise_for_status()
-            data = response.json()
+            if not need_client_filter:
+                # No client-side filtering needed — use simple server-side pagination
+                api_params["limit"] = limit
+                api_params["offset"] = offset
+                response = await self._request('GET', f"{self.base_url}/users/self/alphas", params=api_params)
+                response.raise_for_status()
+                data = response.json()
+            else:
+                # Client-side filtering: fetch all matching alphas, then filter
+                # Note: The API caps results at 100 per request regardless of limit param
+                BATCH_SIZE = 100
+                filtered_results = []
+                api_offset = 0
+                total_server_count = None
+                
+                while True:
+                    api_params_batch = {**api_params, "limit": BATCH_SIZE, "offset": api_offset}
+                    response = await self._request('GET', f"{self.base_url}/users/self/alphas", params=api_params_batch)
+                    response.raise_for_status()
+                    batch_data = response.json()
+                    
+                    if total_server_count is None:
+                        total_server_count = batch_data.get('count', 0)
+                    
+                    batch_results = batch_data.get('results', [])
+                    if not batch_results:
+                        break
+                    
+                    for alpha in batch_results:
+                        if self._match_alpha_filters(alpha, region, status, alpha_type, is_super):
+                            filtered_results.append(alpha)
+                    
+                    api_offset += len(batch_results)
+                    # Stop if we've exhausted all server-side results
+                    if api_offset >= total_server_count:
+                        break
+                
+                # Apply user's offset/limit to the filtered results
+                total_filtered = len(filtered_results)
+                page_results = filtered_results[offset:offset + limit]
+                
+                next_offset = offset + limit
+                data = {
+                    'count': total_filtered,
+                    'next': f"offset={next_offset}&limit={limit}" if next_offset < total_filtered else None,
+                    'previous': f"offset={max(0, offset - limit)}&limit={limit}" if offset > 0 else None,
+                    'results': page_results,
+                }
             
             # Add metadata
             data['from_cache'] = False
             
             # Cache the data (1 day TTL)
-            self._set_cached_data(cache_key, data, ttl=86400)
+            self._set_cached_data(cache_key, data, ttl=604800)
             
             return data
             
@@ -1026,17 +1205,174 @@ class BrainApiClient:
             self.log(f"Failed to get user alphas: {str(e)}", "ERROR")
             raise
     
+    def pre_submit_check(self, alpha_details: Dict[str, Any]) -> Dict[str, Any]:
+        """Check IS metrics against submission thresholds before submitting.
+
+        Criteria:
+        - Sharpe > 1.3 and Fitness > 0.75 (relaxed thresholds for pre-submission check)
+        - Margin > 0.05% for USA, otherwise > 0.15% (hard floor 0.08%)
+        - Turnover between 4% and 40%
+        - Returns > 4%
+        - All other IS checks must PASS (no FAIL)
+        """
+        is_data = alpha_details.get('is')
+        if not is_data:
+            return {'passed': False, 'reason': 'No IS data available for this alpha. Simulation may not be complete.', 'details': []}
+
+        failures = []
+        warnings = []
+
+        sharpe = is_data.get('sharpe', 0)
+        fitness = is_data.get('fitness', 0)
+        margin = is_data.get('margin', 0)
+        turnover = is_data.get('turnover', 0)
+        returns = is_data.get('returns', 0)
+        drawdown = is_data.get('drawdown', 0)
+        settings = alpha_details.get('settings') or {}
+        region = (settings.get('region') or alpha_details.get('region') or '').upper()
+
+        # Sharpe > 1.3
+        if sharpe <= 1.3:
+            failures.append(f'Sharpe {sharpe} <= 1.3 (required > 1.3)')
+
+        # Fitness > 0.75
+        if fitness <= 0.75:
+            failures.append(f'Fitness {fitness} <= 0.75 (required > 0.75)')
+
+        # USA margin rule is relaxed to >5bp. Other regions keep the >15bp target with a 8bp hard floor.
+        if region == 'USA':
+            if margin <= 0.0005:
+                failures.append(f'Margin {margin*100:.4f}% <= 5bp (required > 5bp for USA)')
+        else:
+            if margin <= 0.0008:
+                failures.append(f'Margin {margin*100:.4f}% <= 8bp (hard floor, required > 15bp)')
+            elif margin <= 0.0015:
+                warnings.append(f'Margin {margin*100:.4f}% <= 15bp (recommended > 15bp, current above 8bp hard floor)')
+
+        # Turnover between 4% and 40%
+        if turnover < 0.04:
+            failures.append(f'Turnover {turnover*100:.2f}% < 4% (required 4%-40%)')
+        elif turnover > 0.40:
+            failures.append(f'Turnover {turnover*100:.2f}% > 40% (required 4%-40%)')
+
+        # Returns > 4%
+        if returns <= 0.04:
+            failures.append(f'Returns {returns*100:.2f}% <= 4% (required > 4%)')
+
+        # # Returns > drawdown
+        # if returns <= drawdown:
+        #     failures.append(f'Returns {returns*100:.2f}% <= Drawdown {drawdown*100:.2f}% (required Returns > Drawdown)')
+
+        # All other IS checks must not be FAIL
+        checks = is_data.get('checks', [])
+        for chk in checks:
+            result = chk.get('result', '')
+            name = chk.get('name', 'UNKNOWN')
+            if result == 'FAIL':
+                value = chk.get('value', 'N/A')
+                limit = chk.get('limit', 'N/A')
+                failures.append(f'IS check {name} FAILED (value={value}, limit={limit})')
+
+        passed = len(failures) == 0
+        return {
+            'passed': passed,
+            'failures': failures,
+            'warnings': warnings,
+            'metrics': {
+                'region': region or None,
+                'sharpe': sharpe,
+                'fitness': fitness,
+                'margin': margin,
+                'margin_bp': round(margin * 10000, 2),
+                'turnover': turnover,
+                'returns': returns,
+                'drawdown': drawdown,
+            },
+            'is_checks_summary': [
+                {'name': c.get('name'), 'result': c.get('result'), 'value': c.get('value'), 'limit': c.get('limit')}
+                for c in checks
+            ],
+        }
+
     async def submit_alpha(self, alpha_id: str) -> bool:
-        """Submit an alpha for production."""
+        """Submit an alpha for production.
+        
+        Implements the correct submit flow from submit.py:
+        1. POST to /alphas/{alpha_id}/submit
+        2. If response has Retry-After header, switch to GET polling until no more retry-after
+        3. Non-200/403 responses retry after 2 minutes
+        4. Parses response JSON to check IS checks for ALREADY_SUBMITTED and FAILs
+        """
         await self.ensure_authenticated()
         
-        try:
-            response = await self._request('POST', f"{self.base_url}/alphas/{alpha_id}/submit")
-            response.raise_for_status()
-            return True
-        except Exception as e:
-            self.log(f"Failed to submit alpha: {str(e)}", "ERROR")
-            raise
+        submit_url = f"{self.base_url}/alphas/{alpha_id}/submit"
+        attempt = 0
+
+        while True:
+            attempt += 1
+            self.log(f"Submit attempt {attempt} for alpha {alpha_id}", "INFO")
+
+            try:
+                response = await self._request('POST', submit_url)
+            except Exception as e:
+                self.log(f"Submit POST failed for {alpha_id}: {e}", "ERROR")
+                raise
+
+            self.log(f"Alpha submit, alpha_id={alpha_id}, status_code={response.status_code}", "INFO")
+
+            # Handle Retry-After header: switch to GET polling
+            while 'retry-after' in {k.lower() for k in response.headers}:
+                retry_after_raw = response.headers.get('Retry-After') or response.headers.get('retry-after', '5')
+                try:
+                    wait_time = float(retry_after_raw)
+                except ValueError:
+                    wait_time = 5.0
+                # Match reference: 5x multiplier for short waits
+                actual_wait = 5 * wait_time if wait_time < 60 else wait_time
+                self.log(f"Rate limited (Retry-After={retry_after_raw}s), waiting {actual_wait:.0f}s then GET polling...", "INFO")
+                await asyncio.sleep(actual_wait)
+                try:
+                    response = await self._request('GET', submit_url)
+                    self.log(f"GET poll response, alpha_id={alpha_id}, status_code={response.status_code}", "INFO")
+                except Exception as e:
+                    self.log(f"Submit GET poll failed for {alpha_id}: {e}", "ERROR")
+                    raise
+
+            if response.status_code == 200:
+                # Parse response JSON to validate IS checks
+                try:
+                    res_json = response.json()
+                except (json.JSONDecodeError, ValueError):
+                    self.log(f"Submit response for {alpha_id} is not valid JSON: {(response.text or '')[:200]}", "ERROR")
+                    return False
+
+                if not res_json:
+                    return False
+
+                if 'detail' in res_json and res_json['detail'] == 'Not found.':
+                    self.log(f"Submit failed: alpha {alpha_id} not found", "ERROR")
+                    return False
+
+                # Check IS checks in response
+                if 'is' in res_json and 'checks' in res_json['is']:
+                    for item in res_json['is']['checks']:
+                        if item.get('name') == 'ALREADY_SUBMITTED':
+                            self.log(f"Alpha {alpha_id} already submitted", "WARNING")
+                            return False
+                        if item.get('result') == 'FAIL':
+                            self.log(f"Alpha {alpha_id} IS check failed: {item.get('name')} limit={item.get('limit')} value={item.get('value')}", "ERROR")
+                            return False
+
+                self.log(f"Alpha {alpha_id} submission successful!", "INFO")
+                return True
+
+            elif response.status_code == 403:
+                self.log(f"Submit forbidden (403) for alpha {alpha_id}", "ERROR")
+                return False
+
+            else:
+                self.log(f"Submit failed status={response.status_code} for {alpha_id}, waiting 2 minutes before retry...", "WARNING")
+                await asyncio.sleep(120)
     
     async def get_events(self) -> Dict[str, Any]:
         """Get available events and competitions."""
@@ -1228,6 +1564,197 @@ class BrainApiClient:
         except Exception as e:
             self.log(f"Failed to get operators: {str(e)}", "ERROR")
             raise
+
+    async def recommend_datasets(self, region: str = "USA", delay: int = 1,
+                                  universe: str = "TOP3000", top_n: int = 20) -> Dict[str, Any]:
+        """Recommend datasets based on pyramid lighting, submission distribution, and quality.
+
+        Scoring logic (references WebDataScope distribution.js & dataFlag.js):
+        1. Pyramid lighting: uses /users/self/activities/diversity API (dataDiversity.check).
+           Categories not yet "PASS" (< 3 alphas) get a higher priority bonus.
+           Among unlit categories, the one with fewest submissions gets the highest boost.
+        2. Submission distribution: categories and datasets with fewer submitted alphas
+           get a higher score to encourage diversification.
+        3. Dataset quality: uses pre-aggregated OS/IS Sharpe from info_data.bin.
+           Higher mean sharpe = higher quality score.
+
+        Returns ranked list with per-dataset scores and breakdown.
+        """
+        await self.ensure_authenticated()
+
+        # ---- 1. Fetch diversity / submission distribution ----
+        diversity_data = {}
+        try:
+            response = await self._request(
+                'GET',
+                f"{self.base_url}/users/self/activities/diversity",
+                params={'grouping': 'region,delay,dataCategory'}
+            )
+            response.raise_for_status()
+            diversity_data = response.json()
+        except Exception as e:
+            self.log(f"Failed to fetch diversity data: {e}", "WARNING")
+
+        # Parse alpha distribution per category for selected region & delay
+        category_alpha_counts: Dict[str, int] = {}   # category_id -> alphaCount
+        category_pass_status: Dict[str, bool] = {}    # category_id -> is_lit
+        category_need_count: Dict[str, int] = {}      # category_id -> how many more needed to light
+
+        for item in diversity_data.get('alphas', []):
+            if item.get('region') != region or item.get('delay') != delay:
+                continue
+            cat_id = item.get('dataCategory', {}).get('id', '') if isinstance(item.get('dataCategory'), dict) else ''
+            if not cat_id:
+                continue
+            alpha_count = item.get('alphaCount', 0)
+            is_pass = item.get('dataDiversity', {}).get('check', '') == 'PASS'
+            category_alpha_counts[cat_id] = alpha_count
+            category_pass_status[cat_id] = is_pass
+            # dataDiversity check: PASS means ≥3, else need more
+            if not is_pass:
+                category_need_count[cat_id] = max(0, 3 - alpha_count)
+            else:
+                category_need_count[cat_id] = 0
+
+        # Total submitted alphas count for normalization
+        total_submitted = sum(category_alpha_counts.values()) or 1
+
+        # ---- 2. Fetch available datasets for this region/delay ----
+        datasets_resp = await self.get_datasets(region=region, delay=delay, universe=universe)
+        all_datasets = datasets_resp.get('results', [])
+        if not all_datasets:
+            return {'error': 'No datasets available for the given region/delay/universe'}
+
+        # ---- 3. Load dataset quality from OS/IS Sharpe (info_data.bin) ----
+        region_key = f"{region}_{delay}"
+        isos_info = self._isos_data.get(region_key, {}).get('isos', {}) if self._isos_data else {}
+        dataset_sharpe_map = isos_info.get('dataset', {})
+        mean_sharpe = isos_info.get('mean', {}).get('sharpe_ratio', 0.0)
+
+        # ---- 4. Fetch OS alphas to analyze dataset-level submission spread ----
+        dataset_submission_counts: Dict[str, int] = {}
+        try:
+            now = datetime.utcnow()
+            q_start_month = (now.month - 1) // 3 * 3 + 1
+            quarter_start = datetime(now.year, q_start_month, 1)
+            os_alphas = await self.get_user_alphas(
+                stage='OS', limit=200,
+                submission_start_date=quarter_start.strftime("%Y-%m-%dT00:00:00Z")
+            )
+            for a in os_alphas.get('results', []):
+                ds_id = ''
+                if isinstance(a.get('datanodes'), dict):
+                    ds_id = a['datanodes'].get('dataset', {}).get('id', '')
+                elif isinstance(a.get('settings'), dict):
+                    pass  # some alpha formats differ
+                # Try to extract from regular code or other fields
+                if not ds_id:
+                    detail_region = a.get('settings', {}).get('region', '') if isinstance(a.get('settings'), dict) else ''
+                    if detail_region and detail_region != region:
+                        continue
+                dataset_submission_counts[ds_id] = dataset_submission_counts.get(ds_id, 0) + 1
+        except Exception as e:
+            self.log(f"Failed to fetch OS alphas for dataset spread: {e}", "WARNING")
+
+        # ---- 5. Score each dataset ----
+        scored_datasets = []
+        for ds in all_datasets:
+            ds_id = ds.get('id', '')
+            ds_name = ds.get('name', ds_id)
+            cat_obj = ds.get('category', {})
+            ds_category = cat_obj.get('id', '') if isinstance(cat_obj, dict) else str(cat_obj)
+            sub_obj = ds.get('subcategory', {})
+            ds_subcategory = sub_obj.get('id', '') if isinstance(sub_obj, dict) else str(sub_obj)
+
+            # --- Pyramid lighting score (0~40 points) ---
+            pyramid_score = 0.0
+            cat_lit = category_pass_status.get(ds_category, True)  # default True = already lit
+            cat_count = category_alpha_counts.get(ds_category, 0)
+            need = category_need_count.get(ds_category, 0)
+
+            if not cat_lit:
+                # Unlit category gets big bonus; fewer submissions = higher priority
+                pyramid_score = 40.0 * (1.0 / (1.0 + cat_count))
+            else:
+                # Already lit: small bonus for categories with fewer alphas (encourage evenness)
+                max_cat_count = max(category_alpha_counts.values()) if category_alpha_counts else 1
+                pyramid_score = 5.0 * (1.0 - cat_count / max(max_cat_count, 1))
+
+            # --- Submission distribution score (0~30 points) ---
+            dist_score = 0.0
+            ds_sub_count = dataset_submission_counts.get(ds_id, 0)
+            # Favor datasets with zero or few submissions
+            dist_score = 30.0 * (1.0 / (1.0 + ds_sub_count))
+
+            # --- Quality score from OS/IS Sharpe (0~30 points) ---
+            quality_score = 0.0
+            ds_sharpe_info = dataset_sharpe_map.get(ds_id, {})
+            ds_sharpe = ds_sharpe_info.get('sharpe_ratio') if ds_sharpe_info else None
+            ds_os_count = ds_sharpe_info.get('count', 0) if ds_sharpe_info else 0
+
+            if ds_sharpe is not None:
+                if ds_sharpe < 0:
+                    quality_score = 0.0  # negative sharpe = poor quality
+                elif mean_sharpe > 0 and ds_sharpe > mean_sharpe:
+                    quality_score = 30.0  # above average = excellent
+                elif mean_sharpe > 0:
+                    quality_score = 15.0 * (ds_sharpe / mean_sharpe)  # proportional
+                else:
+                    quality_score = 15.0  # mean is 0 or negative, any positive sharpe is decent
+
+            total_score = pyramid_score + dist_score + quality_score
+
+            scored_datasets.append({
+                'dataset_id': ds_id,
+                'dataset_name': ds_name,
+                'category': ds_category,
+                'subcategory': ds_subcategory,
+                'total_score': round(total_score, 2),
+                'pyramid_score': round(pyramid_score, 2),
+                'distribution_score': round(dist_score, 2),
+                'quality_score': round(quality_score, 2),
+                'category_lit': cat_lit,
+                'category_alpha_count': cat_count,
+                'category_need_to_light': need,
+                'dataset_submissions_this_quarter': ds_sub_count,
+                'os_is_sharpe': round(ds_sharpe, 4) if ds_sharpe is not None else None,
+                'os_is_count': ds_os_count,
+            })
+
+        # Sort by total_score descending
+        scored_datasets.sort(key=lambda x: x['total_score'], reverse=True)
+
+        # Build category summary
+        category_summary = {}
+        for cat_id, is_lit in category_pass_status.items():
+            category_summary[cat_id] = {
+                'lit': is_lit,
+                'alpha_count': category_alpha_counts.get(cat_id, 0),
+                'need_to_light': category_need_count.get(cat_id, 0),
+            }
+
+        # Count unlit categories
+        unlit_count = sum(1 for v in category_pass_status.values() if not v)
+        lit_count = sum(1 for v in category_pass_status.values() if v)
+
+        return {
+            'region': region,
+            'delay': delay,
+            'universe': universe,
+            'recommendations': scored_datasets[:top_n],
+            'total_datasets_scored': len(scored_datasets),
+            'category_summary': category_summary,
+            'pyramid_status': {
+                'lit_categories': lit_count,
+                'unlit_categories': unlit_count,
+                'total_categories': lit_count + unlit_count,
+            },
+            'scoring_weights': {
+                'pyramid_lighting': '0~40 pts (unlit categories get priority)',
+                'submission_distribution': '0~30 pts (less-used datasets get priority)',
+                'dataset_quality': '0~30 pts (higher OS/IS Sharpe = better)',
+            }
+        }
             
     async def run_selection(
         self,
@@ -1468,120 +1995,185 @@ class BrainApiClient:
         return {}
         
     async def get_production_correlation(self, alpha_id: str) -> Dict[str, Any]:
-        """Get production correlation data for an alpha."""
+        """Get production correlation data for an alpha.
+        
+        Polls every 30 seconds for up to 1 hour to handle platform rate-limiting.
+        For super alphas, the platform may return an empty body (HTTP 200) for a few
+        minutes after simulation completes while it computes the correlation data.
+        The polling loop handles this by retrying until data is available.
+        Returns {'status': 'pending', ...} after max_wait_seconds if data never arrives.
+        """
         await self.ensure_authenticated()
         
-        max_retries = 50
-        retry_delay = 5
+        max_wait_seconds = 3600  # 1 hour total
+        poll_interval = 30       # 30 seconds per attempt (matches reference implementation)
+        start_time = time.time()
+        attempt = 0
+        consecutive_empty = 0    # track consecutive empty-body responses
+        consecutive_network_failures = 0
         
-        for attempt in range(max_retries):
+        while True:
+            elapsed = time.time() - start_time
+            if elapsed >= max_wait_seconds:
+                self.log(f"Production correlation timeout after {int(elapsed)}s for {alpha_id}", "WARNING")
+                return {
+                    'status': 'pending',
+                    'message': (
+                        f"Production correlation data for alpha {alpha_id} was not available "
+                        f"after {int(elapsed)}s of polling. The platform may still be computing "
+                        "it. Please retry check_correlation in a few minutes."
+                    ),
+                    'max': None,
+                    'records': [],
+                }
+            
+            attempt += 1
             try:
-                self.log(f"Attempting to get production correlation for alpha {alpha_id} (attempt {attempt + 1}/{max_retries})", "INFO")
+                if attempt % 5 == 1:
+                    self.log(f"[PC等待] 正在等待 Alpha {alpha_id} 的 PC 数据 (第 {attempt} 次查询, 已等待 {int(elapsed)}s)", "INFO")
                 
                 response = await self._request('GET', f"{self.base_url}/alphas/{alpha_id}/correlations/prod")
                 response.raise_for_status()
                 
-                # Check if response has content
                 text = (response.text or "").strip()
                 if not text:
-                    if attempt < max_retries - 1:
-                        self.log(f"Empty production correlation response for {alpha_id}, retrying in {retry_delay} seconds...", "WARNING")
-                        await asyncio.sleep(retry_delay)
-                        continue
-                    else:
-                        self.log(f"Empty production correlation response after {max_retries} attempts for {alpha_id}", "WARNING")
-                        return {}
+                    consecutive_empty += 1
+                    if consecutive_empty == 3:
+                        # Platform is still computing — log once so users understand the wait
+                        self.log(
+                            f"[PC计算中] Alpha {alpha_id} 的生产相关性数据尚未就绪 "
+                            f"(已收到 {consecutive_empty} 次空响应). "
+                            "平台正在计算中，通常需要 1-5 分钟，请耐心等待...",
+                            "INFO"
+                        )
+                    await asyncio.sleep(poll_interval)
+                    continue
                 
+                # Got a non-empty response — reset empty counter
+                consecutive_empty = 0
                 try:
                     corr_data = response.json()
-                    if corr_data:
+                    if corr_data and corr_data.get('max') is not None:
+                        self.log(f"[PC成功] Alpha {alpha_id} PC={corr_data['max']} (第 {attempt} 次查询, 耗时 {int(elapsed)}s)", "INFO")
                         return corr_data
-                    else:
-                        if attempt < max_retries - 1:
-                            self.log(f"Empty production correlation JSON for {alpha_id}, retrying...", "WARNING")
-                            await asyncio.sleep(retry_delay)
-                            retry_delay *= 1.5
-                            continue
-                        else:
-                            return {}
-                            
                 except json.JSONDecodeError:
-                    if attempt < max_retries - 1:
-                        self.log(f"Production correlation JSON parse failed for {alpha_id}, retrying...", "WARNING")
-                        await asyncio.sleep(retry_delay)
-                        retry_delay *= 1.5
-                        continue
-                    else:
-                        raise
-                        
-            except requests.RequestException as e:
-                if attempt < max_retries - 1:
-                    self.log(f"Failed to get production correlation for {alpha_id}, retrying: {e}", "WARNING")
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 1.5
-                    continue
-                else:
-                    raise
-        
-        return {}
+                    pass
+                    
+            except (requests.RequestException, ConnectionError, TimeoutError) as e:
+                consecutive_network_failures += 1
+                retry_delay = min(5 * consecutive_network_failures, poll_interval)
+                self.log(
+                    f"Failed to get production correlation for {alpha_id} "
+                    f"(network failure {consecutive_network_failures}): {e}. "
+                    f"Retrying in {retry_delay}s",
+                    "WARNING"
+                )
+                await asyncio.sleep(retry_delay)
+                continue
+
+            consecutive_network_failures = 0
+            
+            await asyncio.sleep(poll_interval)
 
     async def get_self_correlation(self, alpha_id: str) -> Dict[str, Any]:
-        """Get self correlation data for an alpha."""
+        """Calculate self-correlation locally by comparing target alpha PnL against OS alpha pool.
+        
+        Avoids calling /correlations/self platform API by computing correlation locally.
+        Follows the same approach as calculate_sc_locally in the reference implementation:
+        - Fetches PnL for target alpha and all OS alphas
+        - Computes pairwise correlation on the last 4 years of daily returns
+        - Returns max correlation against the OS pool
+        """
         await self.ensure_authenticated()
-        
-        max_retries = 50
-        retry_delay = 5
-        
-        for attempt in range(max_retries):
+
+        def pnl_response_to_series(aid: str, pnl_data: dict) -> Optional[pd.Series]:
+            """Convert a raw PnL API response dict to a pandas Series indexed by date."""
             try:
-                self.log(f"Attempting to get self correlation for alpha {alpha_id} (attempt {attempt + 1}/{max_retries})", "INFO")
-                
-                response = await self._request('GET', f"{self.base_url}/alphas/{alpha_id}/correlations/self")
-                response.raise_for_status()
-                
-                # Check if response has content
-                text = (response.text or "").strip()
-                if not text:
-                    if attempt < max_retries - 1:
-                        self.log(f"Empty self correlation response for {alpha_id}, retrying in {retry_delay} seconds...", "WARNING")
-                        await asyncio.sleep(retry_delay)
-                        continue
-                    else:
-                        self.log(f"Empty self correlation response after {max_retries} attempts for {alpha_id}", "WARNING")
-                        return {}
-                
-                try:
-                    corr_data = response.json()
-                    if corr_data:
-                        return corr_data
-                    else:
-                        if attempt < max_retries - 1:
-                            self.log(f"Empty self correlation JSON for {alpha_id}, retrying...", "WARNING")
-                            await asyncio.sleep(retry_delay)
-                            retry_delay *= 1.5
-                            continue
-                        else:
-                            return {}
-                            
-                except json.JSONDecodeError:
-                    if attempt < max_retries - 1:
-                        self.log(f"Self correlation JSON parse failed for {alpha_id}, retrying...", "WARNING")
-                        await asyncio.sleep(retry_delay)
-                        retry_delay *= 1.5
-                        continue
-                    else:
-                        raise
-                        
-            except requests.RequestException as e:
-                if attempt < max_retries - 1:
-                    self.log(f"Failed to get self correlation for {alpha_id}, retrying: {e}", "WARNING")
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 1.5
-                    continue
-                else:
-                    raise
-        
-        return {}
+                records = pnl_data.get('records', [])
+                schema = pnl_data.get('schema', {}).get('properties', [])
+                if not records or not schema:
+                    return None
+                cols = [p['name'] for p in schema]
+                df = pd.DataFrame(records, columns=cols)
+                df['date'] = pd.to_datetime(df['date'])
+                df.set_index('date', inplace=True)
+                if 'pnl' not in df.columns:
+                    return None
+                return df['pnl'].rename(aid)
+            except Exception:
+                return None
+
+        try:
+            # Fetch target alpha PnL
+            target_pnl_data = await self.get_alpha_pnl(alpha_id)
+            target_series = pnl_response_to_series(alpha_id, target_pnl_data)
+            if target_series is None:
+                self.log(f"Could not parse PnL for target alpha {alpha_id}, falling back to empty result", "WARNING")
+                return {}
+
+            # Fetch OS alphas list
+            os_alphas_data = await self.get_user_alphas(stage='OS', limit=100)
+            os_ids = [a['id'] for a in os_alphas_data.get('results', []) if a.get('id') != alpha_id]
+
+            if not os_ids:
+                self.log(f"No OS alphas found; self-correlation for {alpha_id} is 0", "INFO")
+                return {'max': 0.0, 'records': [], 'local_calculation': True, 'pool_size': 0}
+
+            # Fetch PnL for OS alphas concurrently (rate-limited to 5 parallel)
+            fetch_sem = asyncio.Semaphore(5)
+
+            async def fetch_pnl_safe(oid: str):
+                async with fetch_sem:
+                    try:
+                        data = await self.get_alpha_pnl(oid)
+                        return oid, pnl_response_to_series(oid, data)
+                    except Exception:
+                        return oid, None
+
+            tasks = [fetch_pnl_safe(oid) for oid in os_ids[:100]]
+            fetch_results = await asyncio.gather(*tasks)
+
+            pool_series = [target_series]
+            for res in fetch_results:
+                if isinstance(res, tuple) and res[1] is not None:
+                    pool_series.append(res[1])
+
+            if len(pool_series) < 2:
+                self.log(f"Insufficient PnL data for self-correlation pool (got {len(pool_series)-1} OS alphas)", "INFO")
+                return {'max': 0.0, 'records': [], 'local_calculation': True, 'pool_size': 0}
+
+            # Combine PnL series, forward-fill gaps, diff to get daily returns
+            combined = pd.concat(pool_series, axis=1).ffill()
+            rets = combined.diff()
+
+            # Use last 4 years of returns (mirrors reference calculate_sc_locally)
+            last_date = rets.index.max()
+            rets = rets[rets.index > last_date - pd.DateOffset(years=4)]
+
+            corr_matrix = rets.corr()
+            if alpha_id not in corr_matrix.columns:
+                return {'max': 0.0, 'records': [], 'local_calculation': True, 'pool_size': len(pool_series) - 1}
+
+            sc_series = corr_matrix[alpha_id].drop(alpha_id).dropna()
+            max_corr = float(sc_series.max()) if not sc_series.empty else 0.0
+
+            # Top-10 correlated alphas as records (mirrors API response structure)
+            records = [
+                {'id': oid, 'correlation': float(val)}
+                for oid, val in sc_series.nlargest(10).items()
+            ]
+
+            self.log(f"[SC本地] Alpha {alpha_id}: max_self_corr={max_corr:.4f} (pool={len(pool_series)-1} OS alphas)", "INFO")
+            return {
+                'max': max_corr,
+                'records': records,
+                'local_calculation': True,
+                'pool_size': len(pool_series) - 1
+            }
+
+        except Exception as e:
+            self.log(f"Failed to calculate self-correlation locally: {str(e)}", "ERROR")
+            raise
 
     async def check_correlation(self, alpha_id: str, correlation_type: str = "production", threshold: float = 0.7) -> Dict[str, Any]:
         """ Only where all IS metrics PASS to Check alpha correlation, Check alpha correlation against production alphas, self alphas, or both."""
@@ -1618,17 +2210,31 @@ class BrainApiClient:
             else:
                 check_types = [correlation_type]
             
-            all_passed = False
+            all_passed = True
             
             for check_type in check_types:
                 if check_type == "production":
                     correlation_data = await self.get_production_correlation(alpha_id)
                     
+                    # Handle pending/data-not-yet-available case (super alphas, fresh simulations)
+                    if correlation_data and correlation_data.get('status') == 'pending':
+                        results['checks'][check_type] = {
+                            'max_correlation': None,
+                            'passes_check': None,
+                            'status': 'pending',
+                            'message': correlation_data.get('message', ''),
+                            'correlation_data': correlation_data,
+                        }
+                        results['all_passed'] = None
+                        results['status'] = 'pending'
+                        results['message'] = correlation_data.get('message', '')
+                        return results
+
                     if (
                         correlation_data
                         and isinstance(correlation_data.get('records'), list)
                         and len(correlation_data['records']) > 0
-                        and 'max' in correlation_data
+                        and correlation_data.get('max') is not None
                     ):
                         max_correlation = correlation_data['max']
                         passes_check = max_correlation < threshold
@@ -1642,26 +2248,33 @@ class BrainApiClient:
                             results["all_passed"] = all_passed
                             return results
                     else:
-                        max_correlation = 0
-                        passes_check = False
+                        # Data returned but has no usable records/max (empty or malformed).
+                        # Return None to signal "data unavailable" rather than faking max=0.
                         results['checks'][check_type] = {
-                            'max_correlation': max_correlation,
-                            'passes_check': passes_check,
-                            'correlation_data': correlation_data
+                            'max_correlation': None,
+                            'passes_check': None,
+                            'status': 'data_unavailable',
+                            'message': (
+                                'Production correlation data is unavailable for this alpha. '
+                                'This may be a newly-created super alpha where the platform '
+                                'has not yet computed the correlation. Please retry in a few minutes.'
+                            ),
+                            'correlation_data': correlation_data,
                         }
-                        results['all_passed'] = passes_check
+                        results['all_passed'] = None
+                        results['status'] = 'data_unavailable'
                         return results
                 elif check_type == "self":
                     correlation_data = await self.get_self_correlation(alpha_id)
                 else:
                     continue
                 
-                # Analyze correlation data
+                # Analyze correlation data (self-correlation path)
                 if (
                     correlation_data
                     and isinstance(correlation_data.get('records'), list)
                     and len(correlation_data['records']) > 0
-                    and 'max' in correlation_data
+                    and correlation_data.get('max') is not None
                 ):
                     max_correlation = correlation_data['max']
                     passes_check = max_correlation < threshold
@@ -1709,21 +2322,24 @@ class BrainApiClient:
 
     async def set_alpha_properties(self, alpha_id: str, name: Optional[str] = None, 
                                    color: Optional[str] = None, tags: Optional[List[str]] = None,
-                                   selection_desc: str = "None", combo_desc: str = "None") -> Dict[str, Any]:
+                                   descriptions: str = "None",
+                                   selection_description: Optional[str] = None,
+                                   combo_description: Optional[str] = None
+                                   ) -> Dict[str, Any]:
         """Update alpha properties (name, color, tags, descriptions)."""
         await self.ensure_authenticated()
         
         try:
             payload = {
-                "name": name,
                 "color": color,
-                "tags": tags,
-                # "descriptions": {
-                #     "selection": selection_desc,
-                #     "combo": combo_desc
-                # }
+                "name": name,
+                "tags": tags if tags is not None else [],
+                "regular": {"description": descriptions}
             }
-            payload = {k: v for k, v in payload.items() if v is not None}
+            if selection_description is not None:
+                payload["selection"] = {"description": selection_description}
+            if combo_description is not None:
+                payload["combo"] = {"description": combo_description}
             
             response = await self._request('PATCH', f"{self.base_url}/alphas/{alpha_id}", json=payload)
             response.raise_for_status()
@@ -1786,10 +2402,25 @@ class BrainApiClient:
 
     async def get_pyramid_alphas(self, start_date: Optional[str] = None,
                                end_date: Optional[str] = None) -> Dict[str, Any]:
-        """Get user's current alpha distribution across pyramid categories."""
+        """Get user's current alpha distribution across pyramid categories.
+        Defaults to the current quarter if no dates are provided."""
         await self.ensure_authenticated()
         
         try:
+            # Default to current quarter boundaries
+            if not start_date or not end_date:
+                now = datetime.utcnow()
+                q_start_month = (now.month - 1) // 3 * 3 + 1
+                quarter_start = datetime(now.year, q_start_month, 1)
+                if q_start_month + 3 > 12:
+                    quarter_end = datetime(now.year + 1, 1, 1)
+                else:
+                    quarter_end = datetime(now.year, q_start_month + 3, 1)
+                if not start_date:
+                    start_date = quarter_start.strftime("%Y-%m-%d")
+                if not end_date:
+                    end_date = quarter_end.strftime("%Y-%m-%d")
+
             params = {}
             if start_date:
                 params["startDate"] = start_date
@@ -1922,7 +2553,7 @@ class BrainApiClient:
             }
             
             # Cache the data (1 day TTL)
-            self._set_cached_data(cache_key, result, ttl=86400)
+            self._set_cached_data(cache_key, result, ttl=604800)
             
             return result
             
@@ -2177,7 +2808,7 @@ async def create_simulation(
     truncation: float = 0.08,
     test_period: str = "P0Y0M",
     nan_handling: str = "ON",
-    regular: Optional[str] = None,
+    alpha_expression: Optional[str] = None,
     combo: Optional[str] = None,
     selection: Optional[str] = None,
     pasteurization: str = "ON",
@@ -2201,9 +2832,10 @@ async def create_simulation(
         truncation: Truncation value
         test_period: Test period (e.g., "P0Y0M" for 1 year 6 months)
         nan_handling: NaN handling method
-        regular: Regular simulation code (for REGULAR type)
+        alpha_expression: Alpha expression code (for REGULAR type)
         combo: Combo code (for SUPER type)
-        selection: Selection code (for SUPER type)
+        selection: Selection code (for SUPER type). For USA SUPER simulations,
+            this must include (prod_correlation > 0)
     
     Returns:
         Simulation creation result with ID and location
@@ -2227,7 +2859,7 @@ async def create_simulation(
             language=language,
             visualization=visualization,
             pasteurization=pasteurization,
-            maxTrade=max_trade if region != "ASI" else "ON",  # ASI区maxTrade必须设置为ON
+            maxTrade=max_trade, 
             selectionHandling=selection_handling,
             selectionLimit=selection_limit,
             componentActivation=component_activation,
@@ -2236,7 +2868,7 @@ async def create_simulation(
         sim_data = SimulationData(
             type=type,
             settings=settings,
-            regular=regular,
+            regular=alpha_expression,
             combo=combo,
             selection=selection
         )
@@ -2305,11 +2937,13 @@ async def get_datafields(
     delay: int = 1,
     data_type: str = "",
     search: Optional[str] = None,
+    filter_sharpe: bool = True,
 ) -> Dict[str, Any]:
     """
     Get available data fields for alpha construction.
     
     Use this to find specific data fields you can use in your alpha formulas.
+    By default, fields with OS/IS Sharpe ratio < 0 are filtered out to improve quality.
     
     Args:
         region: Market region (e.g., "USA"、"GLB"、"IND"、"ASI"、"CHN")
@@ -2318,6 +2952,7 @@ async def get_datafields(
         dataset_id: Specific dataset ID to filter by
         data_type: Type of data (e.g., "MATRIX",'VECTOR','GROUP')
         search: Search term to filter fields
+        filter_sharpe: Filter out fields with OS/IS Sharpe < 0 (default: True)
     
     Returns:
         Available data fields
@@ -2325,7 +2960,7 @@ async def get_datafields(
     instrument_type = "EQUITY"
     theme = "false"
     try:
-        return await brain_client.get_datafields(instrument_type, region, delay, universe, theme, dataset_id, data_type, search)
+        return await brain_client.get_datafields(instrument_type, region, delay, universe, theme, dataset_id, data_type, search, filter_sharpe)
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
@@ -2356,12 +2991,17 @@ async def get_user_alphas(
     submission_end_date: Optional[str] = None,
     order: Optional[str] = None,
     hidden: Optional[bool] = None,
+    region: Optional[str] = None,
+    status: Optional[str] = None,
+    type: Optional[str] = None,
+    is_super: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Get user's alphas with advanced filtering, pagination, and sorting.
 
     This tool retrieves a list of your alphas, allowing for detailed filtering based on stage,
-    creation date, submission date, and visibility. It also supports pagination and custom sorting.
+    creation date, submission date, visibility, region, status, type, and super alpha flag.
+    It also supports pagination and custom sorting.
 
     Args:
         stage (str): The stage of the alphas to retrieve.
@@ -2392,6 +3032,17 @@ async def get_user_alphas(
             - `True`: Only return hidden alphas.
             - `False`: Only return non-hidden alphas.
             If not provided, both hidden and non-hidden alphas are returned.
+        region (Optional[str]): Filter alphas by region.
+            Common values: "USA", "EUR", "ASI", "GLB", etc.
+            If not provided, alphas from all regions are returned.
+        status (Optional[str]): Filter alphas by their OS status.
+            Common values: "ACTIVE", "SUPERSEDED", "UNSUBMITTED", etc.
+            If not provided, alphas with any status are returned.
+        type (Optional[str]): Filter alphas by their expression type.
+            Common values: "REGULAR", "SUPER", etc.
+            If not provided, alphas of all types are returned.
+        is_super (Optional[bool]): Filter to only super alphas (True) or non-super alphas (False).
+            If not provided, both super and non-super alphas are returned.
 
     Returns:
         Dict[str, Any]: A dictionary containing a list of alpha details under the 'results' key,
@@ -2401,7 +3052,8 @@ async def get_user_alphas(
         return await brain_client.get_user_alphas(
             stage=stage, limit=limit, offset=offset, start_date=start_date,
             end_date=end_date, submission_start_date=submission_start_date,
-            submission_end_date=submission_end_date, order=order, hidden=hidden
+            submission_end_date=submission_end_date, order=order, hidden=hidden,
+            region=region, status=status, alpha_type=type, is_super=is_super,
         )
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
@@ -2409,19 +3061,48 @@ async def get_user_alphas(
 @mcp.tool()
 async def submit_alpha(alpha_id: str) -> Dict[str, Any]:
     """
-    Submit an alpha for production.
+    Submit an alpha for production with pre-submission IS metrics check.
     
-    Use this when your alpha is ready for production deployment.
+    Before submitting, this tool automatically checks the alpha's IS metrics against
+    the following thresholds:
+    - Sharpe > 1.58, Fitness > 1
+    - Margin > 5bp for USA, otherwise > 15bp (hard floor 10bp)
+    - Turnover between 5% and 20%
+    - Returns > 5% and Returns > Drawdown
+    - All IS checks must PASS (no FAIL)
+    
+    If the check fails, submission is blocked and failure details are returned.
     
     Args:
-        alpha_id: The ID of the alpha to submit
-    
+        alpha_id: The ID of the alpha to submit    
     Returns:
-        Submission result
+        Submission result including pre-check details
     """
+    force = False
     try:
-        success = await brain_client.submit_alpha(alpha_id)
-        return {"success": success}
+        if not force:
+            # Fetch alpha details for IS metrics check
+            alpha_details = await brain_client.get_alpha_details(alpha_id)
+            check_result = brain_client.pre_submit_check(alpha_details)
+            
+            if not check_result['passed']:
+                return {
+                    "success": False,
+                    "blocked": True,
+                    "reason": "Pre-submission IS metrics check failed. Alpha does not meet submission thresholds.",
+                    "check_result": check_result,
+                }
+            
+            # Passed check — proceed to submit
+            success = await brain_client.submit_alpha(alpha_id)
+            return {
+                "success": success,
+                "blocked": False,
+                "check_result": check_result,
+            }
+        else:
+            success = await brain_client.submit_alpha(alpha_id)
+            return {"success": success, "forced": True}
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
@@ -2633,7 +3314,7 @@ async def read_forum_post(article_id: str, email: str = "", password: str = "",
     """
     Get a specific forum post by article ID.
     
-    Note: This uses Playwright and is implemented in forum_functions.py
+    Note: This uses Zendesk support SSO plus JSON APIs and is implemented in forum_functions.py
     
     Args:
         article_id: The article ID to retrieve (e.g., "32984819083415-新人求模板")
@@ -2676,10 +3357,46 @@ async def check_correlation(alpha_id: str) -> Dict[str, Any]:
 @mcp.tool()
 async def set_alpha_properties(alpha_id: str, name: Optional[str] = None, 
                                color: Optional[str] = None, tags: Optional[List[str]] = None,
-                               selection_desc: str = "None", combo_desc: str = "None") -> Dict[str, Any]:
-    """Update alpha properties (name, color, tags, descriptions). color may be one of `RED` `GREEN` `YELLOW` `BLUE` `PURPLE`"""
+                               descriptions: str = "None",
+                               selection_description: Optional[str] = None,
+                               combo_description: Optional[str] = None) -> Dict[str, Any]:
+    """
+      Note: Update alpha properties (name, color, tags, descriptions).
+      For SUPER alphas, selection_description and combo_description are also required and must
+      each be at least 100 English characters.
+      Args:
+        color: may be one of `RED` `GREEN` `YELLOW` `BLUE` `PURPLE`；
+        name: 使用生产相关性命名，不能带空格；建议基于 production correlation
+        的最大值命名，例如 `0.6534` 表示 prod correlation = 0.6534；
+        tags 至少包含 `PowerPoolSelected`；
+        descriptions: Write in English, <=100 words. The three sections MUST be separated by
+        actual newline characters (i.e. use the JSON escape sequence \\n\\n between sections,
+        NOT the literal text "\\n\\n"). Example value:
+        "Idea: <your idea here>\\n\\nRationale for data used: <your rationale>\\n\\nRationale for operators used: <your rationale>"
+        The three section headers must appear exactly as:
+        - Idea:
+        - Rationale for data used:
+        - Rationale for operators used:
+        selection_description: (SUPER alpha only) Description of the selection expression logic.
+        Must be at least 100 English characters. Write in English.
+        combo_description: (SUPER alpha only) Description of the combo expression logic.
+        Must be at least 100 English characters. Write in English.
+    """
     try:
-        return await brain_client.set_alpha_properties(alpha_id, name, color, tags, selection_desc, combo_desc)
+        if descriptions and descriptions == "None":
+            return {
+                "error": (
+                    "descriptions cannot be the literal string 'None'. "
+                    "Please regenerate it in English using exactly these three sections: "
+                    "Idea:, Rationale for data used:, and Rationale for operators used:."
+                )
+            }
+        # Normalize literal \n sequences to actual newlines in case the LLM emits
+        # backslash-n as two characters rather than a true newline escape.
+        if descriptions and descriptions != "None":
+            descriptions = descriptions.replace('\\n', '\n')
+        return await brain_client.set_alpha_properties(alpha_id, name, color, tags, descriptions,
+                                                       selection_description, combo_description)
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
@@ -2718,9 +3435,46 @@ async def get_pyramid_multipliers() -> Dict[str, Any]:
 @mcp.tool()
 async def get_pyramid_alphas(start_date: Optional[str] = None,
                                end_date: Optional[str] = None) -> Dict[str, Any]:
-    """Get user's current alpha distribution across pyramid categories."""
+    """Get user's current alpha distribution across pyramid categories.
+    Defaults to the current quarter if no dates are provided."""
     try:
         return await brain_client.get_pyramid_alphas(start_date, end_date)
+    except Exception as e:
+        return {"error": f"An unexpected error occurred: {str(e)}"}
+
+@mcp.tool()
+async def recommend_datasets(
+    region: str = "USA",
+    delay: int = 1,
+    universe: str = "TOP3000",
+    top_n: int = 20,
+) -> Dict[str, Any]:
+    """
+    Recommend datasets for alpha construction based on three dimensions:
+    
+    1. **Pyramid lighting (点塔)**: Prioritizes data categories not yet lit (need 3 alphas per category
+       to light up). Encourages uniform coverage across all categories.
+    2. **Submission distribution**: Favors datasets with fewer submitted alphas this quarter,
+       encouraging diversification across different datasets.
+    3. **Dataset quality**: Ranks by OS/IS Sharpe ratio from historical aggregated data.
+       Higher Sharpe = better quality dataset.
+    
+    Each dataset gets a score (0~100):
+    - Pyramid lighting: 0~40 pts (unlit categories get highest priority)
+    - Submission distribution: 0~30 pts (less-used datasets get priority)
+    - Dataset quality: 0~30 pts (higher OS/IS Sharpe = better)
+    
+    Args:
+        region: Market region (e.g., "USA", "CHN", "EUR", "ASI", "GLB")
+        delay: Data delay (0 or 1)
+        universe: Stock universe (e.g., "TOP3000")
+        top_n: Number of top recommendations to return (default 20)
+    
+    Returns:
+        Ranked dataset recommendations with scores and pyramid status summary
+    """
+    try:
+        return await brain_client.recommend_datasets(region, delay, universe, top_n)
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
         
@@ -2868,7 +3622,7 @@ async def create_multi_simulation(
                     'language': language,
                     'visualization': visualization,
                     'testPeriod': test_period,
-                    'maxTrade': max_trade if region != "ASI" else "ON"  # ASI区maxTrade必须设置为ON
+                    'maxTrade': max_trade 
                 },
                 'regular': alpha_expr
             }
@@ -3007,6 +3761,160 @@ async def _wait_for_multisimulation_completion(location: str, expected_children:
         
     except Exception as e:
         return {"error": f"Error waiting for multisimulation completion: {str(e)}"}
+
+# --- SUPER Alpha Multi-Simulation Tools ---
+
+@mcp.tool()
+async def create_multi_super_simulation(
+    combo_expressions: List[str],
+    selection: str,
+    region: str = "USA",
+    universe: str = "TOP3000",
+    delay: int = 1,
+    decay: int = 5,
+    neutralization: str = "INDUSTRY",
+    neutralizations: Optional[List[str]] = None,
+    truncation: float = 0.08,
+    test_period: str = "P0Y",
+    nan_handling: str = "OFF",
+    pasteurization: str = "ON",
+    max_trade: str = "OFF",
+    selection_handling: str = "POSITIVE",
+    selection_limit: int = 100,
+    max_simulations: int = 50,
+) -> Dict[str, Any]:
+    """
+    Create multiple SUPER alpha simulations on BRAIN platform in parallel.
+
+    SUPER alphas combine multiple submitted REGULAR alphas using combo expressions
+    and selection criteria. This tool creates multiple SUPER alpha simulations with
+    different combo expressions (and optionally different neutralizations).
+
+    If 'neutralizations' list is provided, creates all combinations of
+    (combo_expression x neutralization). Otherwise uses the single 'neutralization'
+    for all combos.
+
+    The total number of simulations is capped by 'max_simulations'.
+
+    Args:
+        combo_expressions: List of SUPER alpha combo expressions (e.g., ["1", "combo_a(alpha)"])
+        selection: Selection expression to pick component alphas (e.g., "(own)&&(name == 'group_1')").
+            For USA SUPER simulations, this must include (prod_correlation > 0)
+        region: Market region (e.g., "USA", "EUR", "GLB", "ASI", "IND", "CHN")
+        universe: Universe of stocks (e.g., "TOP3000")
+        delay: Data delay (0 or 1)
+        decay: Decay value (default: 5)
+        neutralization: Single neutralization method (used when 'neutralizations' is not provided)
+        neutralizations: Optional list of neutralization methods to create combinations
+            (e.g., ["INDUSTRY", "SUBINDUSTRY", "MARKET", "SECTOR"])
+        truncation: Truncation value (default: 0.08)
+        test_period: Test period (default: "P0Y")
+        nan_handling: NaN handling (default: "OFF")
+        pasteurization: Pasteurization setting (default: "ON")
+        max_trade: Max trade setting (default: "OFF")
+        selection_handling: Selection handling (default: "POSITIVE")
+        selection_limit: Number of component alphas to select (default: 100)
+        max_simulations: Maximum number of simulations to create (default: 50)
+
+    Returns:
+        Dictionary containing results for each SUPER alpha simulation
+    """
+    try:
+        if not combo_expressions:
+            return {"error": "At least 1 combo expression is required"}
+        if not selection:
+            return {"error": "Selection expression is required for SUPER alpha"}
+
+        # Build neutralization list
+        neut_list = neutralizations if neutralizations else [neutralization]
+
+        # Generate all simulation configs (combo x neutralization)
+        sim_configs = []
+        for combo_expr in combo_expressions:
+            for neut in neut_list:
+                sim_configs.append({
+                    "combo": combo_expr,
+                    "neutralization": neut,
+                })
+
+        # Cap the number of simulations
+        if len(sim_configs) > max_simulations:
+            import random as _rand
+            sim_configs = _rand.sample(sim_configs, max_simulations)
+
+        brain_client.log(
+            f"Creating {len(sim_configs)} SUPER alpha simulations "
+            f"(region={region}, selection_limit={selection_limit})...",
+            "INFO",
+        )
+
+        # Create simulation tasks
+        async def _run_one(cfg: dict, index: int) -> dict:
+            try:
+                settings = SimulationSettings(
+                    instrumentType="EQUITY",
+                    region=region,
+                    universe=universe,
+                    delay=delay,
+                    decay=decay,
+                    neutralization=cfg["neutralization"],
+                    truncation=truncation,
+                    testPeriod=test_period,
+                    unitHandling="VERIFY",
+                    nanHandling=nan_handling,
+                    language="FASTEXPR",
+                    visualization=False,
+                    pasteurization=pasteurization,
+                    maxTrade=max_trade,
+                    selectionHandling=selection_handling,
+                    selectionLimit=selection_limit,
+                )
+                sim_data = SimulationData(
+                    type="SUPER",
+                    settings=settings,
+                    combo=cfg["combo"],
+                    selection=selection,
+                )
+                result = await brain_client.create_simulation(sim_data)
+                alpha_id = result.get("id", "unknown")
+                return {
+                    "index": index,
+                    "alpha_id": alpha_id,
+                    "combo": cfg["combo"],
+                    "neutralization": cfg["neutralization"],
+                    "details": result,
+                }
+            except Exception as exc:
+                return {
+                    "index": index,
+                    "combo": cfg["combo"],
+                    "neutralization": cfg["neutralization"],
+                    "error": str(exc),
+                }
+
+        # Run all simulations concurrently
+        tasks = [_run_one(cfg, i) for i, cfg in enumerate(sim_configs)]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+
+        succeeded = [r for r in results if "error" not in r]
+        failed = [r for r in results if "error" in r]
+
+        return {
+            "success": True,
+            "message": f"Created {len(succeeded)} SUPER alpha simulations ({len(failed)} failed)",
+            "total_requested": len(sim_configs),
+            "total_succeeded": len(succeeded),
+            "total_failed": len(failed),
+            "region": region,
+            "selection": selection,
+            "selection_limit": selection_limit,
+            "alpha_results": succeeded,
+            "errors": failed if failed else None,
+        }
+
+    except Exception as e:
+        return {"error": f"Error creating multi SUPER simulation: {str(e)}"}
+
 # --- Payment and Financial Tools ---
 
 @mcp.tool()
