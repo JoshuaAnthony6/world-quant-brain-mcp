@@ -1,14 +1,17 @@
 services:
   mcp:
-    build: .
-    image: worldquant/mcp:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APT_MIRROR: mirrors.tuna.tsinghua.edu.cn
+        PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
     container_name: mcp
     restart: unless-stopped
     shm_size: '4gb'
     volumes:
       - ./:/app:rw
       - mcp_config:/app/config:rw
-      - playwright_data:/root/.cache/ms-playwright:rw
     ports:
       - "8876:8000"
     environment:
@@ -34,9 +37,7 @@ services:
       - redis_data:/data
     ports:
       - 6479:6379
-    # No host port mapping to avoid conflicts; service is reachable by other containers as 'redis:6379'
 
 volumes:
   redis_data:
   mcp_config:
-  playwright_data:
