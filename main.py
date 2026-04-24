@@ -2075,105 +2075,417 @@ class BrainApiClient:
             
             await asyncio.sleep(poll_interval)
 
+    @staticmethod
+    def _pnl_response_to_series(aid: str, pnl_data: dict) -> Optional[pd.Series]:
+        """Convert a raw PnL API response dict to a pandas Series indexed by date."""
+        try:
+            if not pnl_data:
+                return None
+            records = pnl_data.get('records', [])
+            schema = pnl_data.get('schema', {}).get('properties', [])
+            if not records or not schema:
+                return None
+            cols = [p['name'] for p in schema]
+            df = pd.DataFrame(records, columns=cols)
+            df['date'] = pd.to_datetime(df['date'])
+            df.set_index('date', inplace=True)
+            if 'pnl' not in df.columns:
+                return None
+            return df['pnl'].rename(aid)
+        except Exception:
+            return None
+
+    def _os_pnl_pool_path(
+        self,
+        instrument_type: str,
+        region: str,
+        universe: str,
+        delay: Union[int, str],
+    ) -> Path:
+        """Return the on-disk cache path for a configuration-specific OS PnL pool."""
+        cache_dir = Path(__file__).parent / 'downloads'
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        safe_parts = [
+            str(instrument_type).strip().lower() or 'unknown',
+            str(region).strip().lower() or 'unknown',
+            str(universe).strip().lower() or 'unknown',
+            f"delay{delay}",
+        ]
+        return cache_dir / f"os_pnl_pool_{'_'.join(safe_parts)}.pkl"
+
+    async def _list_matching_os_alpha_ids(
+        self,
+        instrument_type: str,
+        region: str,
+        universe: str,
+        delay: Union[int, str],
+    ) -> List[str]:
+        """Fetch OS alpha IDs that match the target alpha's market configuration.
+
+        The platform self-correlation endpoint compares against the user's self
+        alpha pool for the same instrument/region/universe/delay, and it can
+        include both REGULAR and SUPER alphas. Filtering locally on the same
+        configuration keeps the local calculation aligned with the platform.
+        """
+        all_ids: List[str] = []
+        offset = 0
+        page_size = 100
+        while True:
+            params = {
+                'stage': 'OS',
+                'limit': page_size,
+                'offset': offset,
+                'order': '-dateSubmitted',
+            }
+            try:
+                response = await self._request('GET', f"{self.base_url}/users/self/alphas", params=params)
+                response.raise_for_status()
+                data = response.json() or {}
+            except Exception as e:
+                self.log(f"Failed to page OS alpha list at offset={offset}: {e}", "WARNING")
+                break
+            results = data.get('results') or []
+            if not results:
+                break
+            for alpha in results:
+                if not alpha.get('id'):
+                    continue
+                settings = alpha.get('settings', {})
+                if settings.get('instrumentType') != instrument_type:
+                    continue
+                if settings.get('region') != region:
+                    continue
+                if settings.get('universe') != universe:
+                    continue
+                if str(settings.get('delay')) != str(delay):
+                    continue
+                all_ids.append(alpha['id'])
+            if len(results) < page_size:
+                break
+            offset += page_size
+        return all_ids
+
+    async def sync_os_pnl_pool(
+        self,
+        instrument_type: str,
+        region: str,
+        universe: str,
+        delay: Union[int, str],
+        exclude_id: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """Incrementally sync the matching OS alpha PnL pool cache on disk.
+
+        Closed-loop logic (mirrors the reference implementation):
+        - Fetch the current server-side list of matching OS alpha IDs.
+        - Load the local pickle cache (if any) and drop any columns whose alpha
+          is no longer present on the server (handles deletions).
+        - Download PnL only for IDs that are on the server but missing locally
+          (OS alpha PnL is effectively static, so old columns are reused).
+        - Persist the merged pool back to disk and return it.
+        """
+        pool_path = self._os_pnl_pool_path(instrument_type, region, universe, delay)
+        server_ids = await self._list_matching_os_alpha_ids(
+            instrument_type, region, universe, delay
+        )
+        if exclude_id:
+            server_ids = [aid for aid in server_ids if aid != exclude_id]
+
+        # Load existing cache and drop removed alphas (closed-loop cleanup)
+        local_pool = pd.DataFrame()
+        if pool_path.exists():
+            try:
+                local_pool = await asyncio.to_thread(pd.read_pickle, pool_path)
+                if isinstance(local_pool, pd.DataFrame) and not local_pool.empty:
+                    keep_cols = [c for c in local_pool.columns if c in set(server_ids)]
+                    dropped = local_pool.shape[1] - len(keep_cols)
+                    if dropped > 0:
+                        self.log(f"[SC cache] Dropping {dropped} alpha(s) removed from OS list", "INFO")
+                    local_pool = local_pool[keep_cols]
+                else:
+                    local_pool = pd.DataFrame()
+            except Exception as e:
+                self.log(f"[SC cache] Failed to read pool pickle, rebuilding: {e}", "WARNING")
+                local_pool = pd.DataFrame()
+
+        need_download = [aid for aid in server_ids if aid not in local_pool.columns]
+
+        if not need_download:
+            self.log(f"[SC cache] Pool up-to-date: {local_pool.shape[1]} OS alphas", "INFO")
+            return local_pool
+
+        self.log(f"[SC cache] Incremental download: {len(need_download)} new OS alpha(s)", "INFO")
+
+        fetch_sem = asyncio.Semaphore(5)
+
+        async def fetch_one(oid: str):
+            async with fetch_sem:
+                try:
+                    data = await self.get_alpha_pnl(oid)
+                    return self._pnl_response_to_series(oid, data)
+                except Exception as e:
+                    self.log(f"[SC cache] Skip {oid}: PnL fetch failed ({e})", "WARNING")
+                    return None
+
+        fetched = await asyncio.gather(*[fetch_one(oid) for oid in need_download])
+        new_series = [s for s in fetched if s is not None]
+
+        if new_series:
+            new_df = pd.concat(new_series, axis=1)
+            full_pool = new_df if local_pool.empty else pd.concat([local_pool, new_df], axis=1)
+            full_pool = full_pool.sort_index()
+            try:
+                await asyncio.to_thread(full_pool.to_pickle, pool_path)
+            except Exception as e:
+                self.log(f"[SC cache] Failed to persist pool pickle: {e}", "WARNING")
+            local_pool = full_pool
+            self.log(f"[SC cache] Pool now has {local_pool.shape[1]} OS alphas", "INFO")
+        else:
+            self.log(f"[SC cache] No new PnL captured (all fetches failed?); keeping {local_pool.shape[1]} cached", "WARNING")
+
+        return local_pool
+
     async def get_self_correlation(self, alpha_id: str) -> Dict[str, Any]:
-        """Calculate self-correlation locally by comparing target alpha PnL against OS alpha pool.
-        
-        Avoids calling /correlations/self platform API by computing correlation locally.
-        Follows the same approach as calculate_sc_locally in the reference implementation:
-        - Fetches PnL for target alpha and all OS alphas
-        - Computes pairwise correlation on the last 4 years of daily returns
-        - Returns max correlation against the OS pool
+        """Calculate self-correlation locally using an incrementally-cached OS PnL pool.
+
+        - OS alpha PnL is considered static and cached on disk
+          (``downloads/os_pnl_pool.pkl``); only newly-submitted OS alphas are
+          downloaded on each call and stale entries are pruned.
+        - The target alpha's PnL is always fetched fresh (it is typically still
+          IS and may change between calls).
+        - Correlation is computed on the last 4 years of daily returns, matching
+          the reference ``calculate_sc_locally`` semantics.
         """
         await self.ensure_authenticated()
 
-        def pnl_response_to_series(aid: str, pnl_data: dict) -> Optional[pd.Series]:
-            """Convert a raw PnL API response dict to a pandas Series indexed by date."""
-            try:
-                records = pnl_data.get('records', [])
-                schema = pnl_data.get('schema', {}).get('properties', [])
-                if not records or not schema:
-                    return None
-                cols = [p['name'] for p in schema]
-                df = pd.DataFrame(records, columns=cols)
-                df['date'] = pd.to_datetime(df['date'])
-                df.set_index('date', inplace=True)
-                if 'pnl' not in df.columns:
-                    return None
-                return df['pnl'].rename(aid)
-            except Exception:
-                return None
-
         try:
-            # Fetch target alpha PnL
+            # Target alpha PnL: always fresh
             target_pnl_data = await self.get_alpha_pnl(alpha_id)
-            target_series = pnl_response_to_series(alpha_id, target_pnl_data)
+            target_series = self._pnl_response_to_series(alpha_id, target_pnl_data)
             if target_series is None:
-                self.log(f"Could not parse PnL for target alpha {alpha_id}, falling back to empty result", "WARNING")
+                self.log(f"Could not parse PnL for target alpha {alpha_id}", "WARNING")
                 return {}
 
-            # Fetch OS alphas list
-            os_alphas_data = await self.get_user_alphas(stage='OS', limit=100)
-            os_ids = [a['id'] for a in os_alphas_data.get('results', []) if a.get('id') != alpha_id]
+            target_details = await self.get_alpha_details(alpha_id)
+            target_settings = target_details.get('settings', {})
+            instrument_type = target_settings.get('instrumentType')
+            region = target_settings.get('region')
+            universe = target_settings.get('universe')
+            delay = target_settings.get('delay')
+            if not all([instrument_type, region, universe]) or delay is None:
+                self.log(
+                    f"Missing target settings for self-correlation on {alpha_id}: {target_settings}",
+                    "WARNING",
+                )
+                return {}
 
-            if not os_ids:
-                self.log(f"No OS alphas found; self-correlation for {alpha_id} is 0", "INFO")
+            # Sync only the OS pool matching the target alpha's market configuration.
+            os_pool = await self.sync_os_pnl_pool(
+                instrument_type=instrument_type,
+                region=region,
+                universe=universe,
+                delay=delay,
+                exclude_id=alpha_id,
+            )
+
+            if os_pool is None or os_pool.empty:
+                self.log(f"No OS alphas available; self-correlation for {alpha_id} is 0", "INFO")
                 return {'max': 0.0, 'records': [], 'local_calculation': True, 'pool_size': 0}
 
-            # Fetch PnL for OS alphas concurrently (rate-limited to 5 parallel)
-            fetch_sem = asyncio.Semaphore(5)
-
-            async def fetch_pnl_safe(oid: str):
-                async with fetch_sem:
-                    try:
-                        data = await self.get_alpha_pnl(oid)
-                        return oid, pnl_response_to_series(oid, data)
-                    except Exception:
-                        return oid, None
-
-            tasks = [fetch_pnl_safe(oid) for oid in os_ids[:100]]
-            fetch_results = await asyncio.gather(*tasks)
-
-            pool_series = [target_series]
-            for res in fetch_results:
-                if isinstance(res, tuple) and res[1] is not None:
-                    pool_series.append(res[1])
-
-            if len(pool_series) < 2:
-                self.log(f"Insufficient PnL data for self-correlation pool (got {len(pool_series)-1} OS alphas)", "INFO")
-                return {'max': 0.0, 'records': [], 'local_calculation': True, 'pool_size': 0}
-
-            # Combine PnL series, forward-fill gaps, diff to get daily returns
-            combined = pd.concat(pool_series, axis=1).ffill()
+            # Combine target with pool, forward-fill gaps, diff -> daily returns
+            combined = pd.concat([os_pool, target_series.to_frame()], axis=1).ffill()
             rets = combined.diff()
+            if rets.empty:
+                return {'max': 0.0, 'records': [], 'local_calculation': True, 'pool_size': os_pool.shape[1]}
 
-            # Use last 4 years of returns (mirrors reference calculate_sc_locally)
             last_date = rets.index.max()
             rets = rets[rets.index > last_date - pd.DateOffset(years=4)]
 
             corr_matrix = rets.corr()
             if alpha_id not in corr_matrix.columns:
-                return {'max': 0.0, 'records': [], 'local_calculation': True, 'pool_size': len(pool_series) - 1}
+                return {'max': 0.0, 'records': [], 'local_calculation': True, 'pool_size': os_pool.shape[1]}
 
-            sc_series = corr_matrix[alpha_id].drop(alpha_id).dropna()
+            sc_series = corr_matrix[alpha_id].drop(alpha_id, errors='ignore').dropna()
             max_corr = float(sc_series.max()) if not sc_series.empty else 0.0
 
-            # Top-10 correlated alphas as records (mirrors API response structure)
             records = [
                 {'id': oid, 'correlation': float(val)}
                 for oid, val in sc_series.nlargest(10).items()
             ]
 
-            self.log(f"[SC本地] Alpha {alpha_id}: max_self_corr={max_corr:.4f} (pool={len(pool_series)-1} OS alphas)", "INFO")
+            self.log(
+                f"[SC本地] Alpha {alpha_id}: max_self_corr={max_corr:.4f} "
+                f"(pool={os_pool.shape[1]} OS alphas, incremental cache)",
+                "INFO",
+            )
             return {
                 'max': max_corr,
                 'records': records,
                 'local_calculation': True,
-                'pool_size': len(pool_series) - 1
+                'pool_size': int(os_pool.shape[1]),
             }
 
         except Exception as e:
             self.log(f"Failed to calculate self-correlation locally: {str(e)}", "ERROR")
             raise
+
+    async def get_platform_self_correlation(
+        self,
+        alpha_id: str,
+        max_wait_seconds: int = 600,
+        poll_interval: int = 15,
+    ) -> Dict[str, Any]:
+        """Fetch the platform-computed self-correlation from the BRAIN API.
+
+        Calls ``/alphas/{alpha_id}/correlations/self`` and polls while the
+        platform is still computing (empty body / HTTP 202). Returns the raw
+        response dict (typically ``{'max': ..., 'records': [...]}``) or
+        ``{'status': 'pending', ...}`` if the data never materialises within
+        ``max_wait_seconds``.
+        """
+        await self.ensure_authenticated()
+
+        start_time = time.time()
+        attempt = 0
+        consecutive_empty = 0
+        consecutive_network_failures = 0
+
+        while True:
+            elapsed = time.time() - start_time
+            if elapsed >= max_wait_seconds:
+                self.log(f"[SC平台] Timeout after {int(elapsed)}s for {alpha_id}", "WARNING")
+                return {
+                    'status': 'pending',
+                    'message': (
+                        f"Platform self-correlation for alpha {alpha_id} was not available "
+                        f"after {int(elapsed)}s of polling. Please retry later."
+                    ),
+                    'max': None,
+                    'records': [],
+                }
+
+            attempt += 1
+            try:
+                response = await self._request(
+                    'GET', f"{self.base_url}/alphas/{alpha_id}/correlations/self"
+                )
+                response.raise_for_status()
+
+                text = (response.text or "").strip()
+                if not text:
+                    consecutive_empty += 1
+                    await asyncio.sleep(poll_interval)
+                    continue
+
+                consecutive_empty = 0
+                try:
+                    data = response.json()
+                    if data and data.get('max') is not None:
+                        self.log(
+                            f"[SC平台] Alpha {alpha_id} max={data['max']} "
+                            f"(attempt {attempt}, {int(elapsed)}s)",
+                            "INFO",
+                        )
+                        return data
+                except json.JSONDecodeError:
+                    pass
+            except (requests.RequestException, ConnectionError, TimeoutError) as e:
+                consecutive_network_failures += 1
+                retry_delay = min(5 * consecutive_network_failures, poll_interval)
+                self.log(
+                    f"[SC平台] network failure {consecutive_network_failures} for {alpha_id}: {e}. "
+                    f"Retry in {retry_delay}s",
+                    "WARNING",
+                )
+                await asyncio.sleep(retry_delay)
+                continue
+
+            consecutive_network_failures = 0
+            await asyncio.sleep(poll_interval)
+
+    async def check_self_correlation(
+        self,
+        alpha_id: str,
+        threshold: float = 0.7,
+        tolerance: float = 0.05,
+        platform_max_wait_seconds: int = 600,
+    ) -> Dict[str, Any]:
+        """Compute self-correlation locally AND fetch it from the BRAIN platform,
+        then cross-validate the two results.
+
+        Args:
+            alpha_id: Target alpha ID.
+            threshold: Max-correlation threshold used for the pass/fail check.
+            tolerance: Absolute difference tolerance between local and platform
+                ``max`` considered "consistent".
+            platform_max_wait_seconds: How long to poll the platform endpoint
+                before giving up.
+        """
+        await self.ensure_authenticated()
+
+        # Run both computations concurrently.
+        local_task = asyncio.create_task(self.get_self_correlation(alpha_id))
+        platform_task = asyncio.create_task(
+            self.get_platform_self_correlation(
+                alpha_id, max_wait_seconds=platform_max_wait_seconds
+            )
+        )
+        local_res, platform_res = await asyncio.gather(
+            local_task, platform_task, return_exceptions=True
+        )
+
+        def _extract_max(res: Any) -> Tuple[Optional[float], Optional[str]]:
+            if isinstance(res, Exception):
+                return None, f"error: {res}"
+            if not isinstance(res, dict) or not res:
+                return None, "no_data"
+            if res.get('status') == 'pending':
+                return None, 'pending'
+            val = res.get('max')
+            if val is None:
+                return None, 'no_max'
+            try:
+                return float(val), None
+            except (TypeError, ValueError):
+                return None, 'invalid_max'
+
+        local_max, local_err = _extract_max(local_res)
+        platform_max, platform_err = _extract_max(platform_res)
+
+        local_passes = local_max is not None and local_max < threshold
+        platform_passes = platform_max is not None and platform_max < threshold
+
+        diff: Optional[float] = None
+        consistent: Optional[bool] = None
+        if local_max is not None and platform_max is not None:
+            diff = abs(local_max - platform_max)
+            consistent = diff <= tolerance
+
+        return {
+            'alpha_id': alpha_id,
+            'threshold': threshold,
+            'tolerance': tolerance,
+            'local': {
+                'max': local_max,
+                'passes_check': local_passes if local_max is not None else None,
+                'error': local_err,
+                'data': None if isinstance(local_res, Exception) else local_res,
+            },
+            'platform': {
+                'max': platform_max,
+                'passes_check': platform_passes if platform_max is not None else None,
+                'error': platform_err,
+                'data': None if isinstance(platform_res, Exception) else platform_res,
+            },
+            'comparison': {
+                'abs_diff': diff,
+                'consistent': consistent,
+                'both_pass': (
+                    local_passes and platform_passes
+                    if (local_max is not None and platform_max is not None)
+                    else None
+                ),
+            },
+        }
 
     async def check_correlation(self, alpha_id: str, correlation_type: str = "production", threshold: float = 0.7) -> Dict[str, Any]:
         """ Only where all IS metrics PASS to Check alpha correlation, Check alpha correlation against production alphas, self alphas, or both."""
@@ -3351,6 +3663,44 @@ async def check_correlation(alpha_id: str) -> Dict[str, Any]:
     threshold = 0.7
     try:
         return await brain_client.check_correlation(alpha_id, correlation_type, threshold)
+    except Exception as e:
+        return {"error": str(e)}
+
+@mcp.tool()
+async def check_self_correlation(
+    alpha_id: str,
+    threshold: float = 0.7,
+    tolerance: float = 0.05,
+    platform_max_wait_seconds: int = 600,
+) -> Dict[str, Any]:
+    """Validate self-correlation by running the local incremental-cache
+    calculation AND calling the BRAIN platform's /correlations/self endpoint,
+    then comparing the two max values.
+
+    Use this to audit the locally-computed self-correlation (which relies on a
+    cached OS PnL pool) against the platform's authoritative value.
+
+    Args:
+        alpha_id: Target alpha ID.
+        threshold: Pass/fail threshold applied to each max correlation
+            (passes when max < threshold). Default 0.7.
+        tolerance: Absolute difference allowed between local and platform max
+            for the two results to be reported as ``consistent``. Default 0.05.
+        platform_max_wait_seconds: Upper bound on how long to poll the BRAIN
+            platform endpoint while it computes. Default 600s.
+
+    Returns:
+        Dict with ``local``, ``platform``, and ``comparison`` sections; the
+        ``comparison.consistent`` flag indicates whether the two results agree
+        within ``tolerance``.
+    """
+    try:
+        return await brain_client.check_self_correlation(
+            alpha_id,
+            threshold=threshold,
+            tolerance=tolerance,
+            platform_max_wait_seconds=platform_max_wait_seconds,
+        )
     except Exception as e:
         return {"error": str(e)}
 
