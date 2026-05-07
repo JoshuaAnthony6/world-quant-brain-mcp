@@ -8,7 +8,7 @@ import json
 import time
 import asyncio
 import logging
-from typing import Dict, List, Optional, Any, Union, Tuple
+from typing import Dict, List, Optional, Any, Union
 import re
 import base64
 from bs4 import BeautifulSoup
@@ -22,6 +22,8 @@ from urllib.parse import urljoin
 import redis
 import hashlib
 import math
+import uuid
+import random
 
 import requests
 import pandas as pd
@@ -122,6 +124,29 @@ class BrainApiClient:
         self._request_semaphore = asyncio.Semaphore(int(os.environ.get("BRAIN_MAX_CONCURRENCY", "8")))
         self._session_lock = asyncio.Lock()
         self._auth_lock = asyncio.Lock()
+        self._auth_validated_until = 0.0
+        try:
+            self._auth_check_ttl_seconds = max(0.0, float(os.environ.get("BRAIN_AUTH_CHECK_TTL_SECONDS", "300")))
+        except Exception:
+            self._auth_check_ttl_seconds = 300.0
+        self._brain_correlation_local_lock = asyncio.Lock()
+        self._os_pnl_pool_locks: Dict[str, asyncio.Lock] = {}
+        self._os_pnl_pool_locks_guard = asyncio.Lock()
+        self._os_pnl_pool_last_sync: Dict[str, Any] = {}
+        try:
+            self._os_pnl_pool_sync_debounce_seconds = max(
+                0.0,
+                float(os.environ.get("BRAIN_SC_POOL_SYNC_DEBOUNCE_SECONDS", "1")),
+            )
+        except Exception:
+            self._os_pnl_pool_sync_debounce_seconds = 1.0
+        try:
+            self._brain_correlation_busy_retry_after_seconds = max(
+                1,
+                int(os.environ.get("BRAIN_CORRELATION_BUSY_RETRY_AFTER_SECONDS", "180")),
+            )
+        except Exception:
+            self._brain_correlation_busy_retry_after_seconds = 180
         # Allow timeout override via env (e.g., API_SETTINGS_TIMEOUT)
         try:
             self._default_timeout_seconds = int(os.environ.get("API_SETTINGS_TIMEOUT", "30"))
@@ -217,6 +242,96 @@ class BrainApiClient:
             self.log(f"Cached data with key: {cache_key}, TTL: {ttl}s", "INFO")
         except Exception as e:
             self.log(f"Cache write error: {str(e)}", "WARNING")
+
+    def _brain_correlation_lock_key(self) -> str:
+        """Per-account lock key. BRAIN's correlation concurrency limit is per
+        account, so multi-account deployments sharing one Redis must not block
+        each other."""
+        email = (self.auth_credentials or {}).get('email') if self.auth_credentials else None
+        if email:
+            digest = hashlib.md5(email.encode()).hexdigest()[:12]
+            return f"lock:brain_correlation:{digest}"
+        return "lock:brain_correlation"
+
+    async def _try_acquire_brain_correlation_lock(self, op_name: str) -> Dict[str, Any]:
+        """Try once to acquire the per-account platform correlation slot."""
+        lock_key = self._brain_correlation_lock_key()
+        try:
+            lock_ttl = int(os.environ.get("BRAIN_CORRELATION_LOCK_TTL_SECONDS", "3700"))
+        except Exception:
+            lock_ttl = 3700
+        lock_token = uuid.uuid4().hex
+
+        if self.redis_client:
+            try:
+                if self.redis_client.set(lock_key, lock_token, ex=lock_ttl, nx=True):
+                    self.log(
+                        f"[corr-lock] Acquired {lock_key} for {op_name} (ttl={lock_ttl}s)",
+                        "INFO",
+                    )
+                    return {
+                        'acquired': True,
+                        'backend': 'redis',
+                        'lock_key': lock_key,
+                        'lock_token': lock_token,
+                    }
+                ttl = self.redis_client.ttl(lock_key)
+                self.log(
+                    f"[corr-lock] Busy {lock_key} for {op_name} (holder_ttl={ttl}s)",
+                    "INFO",
+                )
+                return {
+                    'acquired': False,
+                    'backend': 'redis',
+                    'lock_key': lock_key,
+                    'retry_after': ttl if ttl and ttl > 0 else None,
+                }
+            except Exception as e:
+                self.log(
+                    f"[corr-lock] Redis error acquiring lock for {op_name}: {e}. "
+                    "Falling back to local fail-fast lock.",
+                    "WARNING",
+                )
+
+        if self._brain_correlation_local_lock.locked():
+            self.log(f"[corr-lock] Busy local correlation lock for {op_name}", "INFO")
+            return {
+                'acquired': False,
+                'backend': 'local',
+                'lock_key': lock_key,
+                'retry_after': None,
+            }
+
+        await self._brain_correlation_local_lock.acquire()
+        self.log(f"[corr-lock] Acquired local correlation lock for {op_name}", "INFO")
+        return {
+            'acquired': True,
+            'backend': 'local',
+            'lock_key': lock_key,
+            'lock_token': lock_token,
+        }
+
+    async def _release_brain_correlation_lock(self, lock_info: Dict[str, Any], op_name: str):
+        if not lock_info or not lock_info.get('acquired'):
+            return
+        backend = lock_info.get('backend')
+        if backend == 'redis' and self.redis_client:
+            try:
+                self.redis_client.eval(
+                    "if redis.call('get', KEYS[1]) == ARGV[1] then "
+                    "return redis.call('del', KEYS[1]) else return 0 end",
+                    1,
+                    lock_info['lock_key'],
+                    lock_info['lock_token'],
+                )
+                self.log(f"[corr-lock] Released {lock_info['lock_key']} for {op_name}", "INFO")
+            except Exception as e:
+                self.log(f"[corr-lock] Lock release failed for {op_name}: {e}", "WARNING")
+            return
+
+        if backend == 'local' and self._brain_correlation_local_lock.locked():
+            self._brain_correlation_local_lock.release()
+            self.log(f"[corr-lock] Released local correlation lock for {op_name}", "INFO")
     
     async def _rate_limit_forum_op(self, op_name: str) -> Optional[Dict[str, Any]]:
         if self._forum_rate_limit_seconds <= 0:
@@ -295,85 +410,180 @@ class BrainApiClient:
                         self.log(f"Remote disconnected for {method} {absolute_url}: {error_str}", "ERROR")
                         raise ConnectionError(f"Remote server disconnected: {absolute_url}") from e
                     raise
+
+    def _retry_wait_seconds(self, response: Optional[requests.Response], attempt: int, base_delay: float = 2.0, max_delay: float = 60.0) -> float:
+        if response is not None:
+            retry_after = response.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    return min(max(float(retry_after), 0.0), max_delay)
+                except (TypeError, ValueError):
+                    pass
+        backoff = min(base_delay * (1.6 ** attempt), max_delay)
+        return backoff + random.uniform(0, min(1.0, backoff * 0.1))
+
+    async def _request_json_with_retries(
+        self,
+        method: str,
+        url: str,
+        *,
+        op_name: str,
+        max_retries: int = 6,
+        retry_statuses: Optional[set] = None,
+        allow_empty: bool = False,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Request JSON with bounded retries for bulk/paginated endpoints."""
+        retry_statuses = retry_statuses or {429, 500, 502, 503, 504}
+        last_error: Optional[Exception] = None
+
+        for attempt in range(max_retries):
+            response: Optional[requests.Response] = None
+            try:
+                response = await self._request(method, url, **kwargs)
+                if response.status_code == 401:
+                    self._auth_validated_until = 0.0
+                    if attempt < max_retries - 1:
+                        self.log(
+                            f"{op_name}: HTTP 401, refreshing authentication "
+                            f"(attempt {attempt + 1}/{max_retries})",
+                            "WARNING",
+                        )
+                        await self.ensure_authenticated()
+                        continue
+                    response.raise_for_status()
+                if response.status_code in retry_statuses:
+                    wait = self._retry_wait_seconds(response, attempt)
+                    self.log(
+                        f"{op_name}: HTTP {response.status_code}, retrying in {wait:.1f}s "
+                        f"(attempt {attempt + 1}/{max_retries})",
+                        "WARNING",
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+
+                response.raise_for_status()
+                text = (response.text or "").strip()
+                if not text:
+                    if allow_empty:
+                        return {}
+                    wait = self._retry_wait_seconds(response, attempt)
+                    self.log(
+                        f"{op_name}: empty response, retrying in {wait:.1f}s "
+                        f"(attempt {attempt + 1}/{max_retries})",
+                        "WARNING",
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                try:
+                    return response.json() or {}
+                except json.JSONDecodeError as e:
+                    last_error = e
+                    wait = self._retry_wait_seconds(response, attempt)
+                    self.log(
+                        f"{op_name}: JSON parse failed, retrying in {wait:.1f}s "
+                        f"(attempt {attempt + 1}/{max_retries})",
+                        "WARNING",
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+            except requests.HTTPError:
+                raise
+            except (ConnectionError, TimeoutError, requests.RequestException) as e:
+                last_error = e
+                wait = self._retry_wait_seconds(response, attempt)
+                self.log(
+                    f"{op_name}: transient request failure ({e}), retrying in {wait:.1f}s "
+                    f"(attempt {attempt + 1}/{max_retries})",
+                    "WARNING",
+                )
+                await asyncio.sleep(wait)
+
+        if last_error:
+            raise last_error
+        raise RuntimeError(f"{op_name}: failed after {max_retries} attempts")
     
     async def authenticate(self, email: str, password: str) -> Dict[str, Any]:
         """Authenticate with WorldQuant BRAIN platform with biometric support."""
+        async with self._auth_lock:
+            return await self._authenticate_unlocked(email, password)
+
+    async def _authenticate_unlocked(self, email: str, password: str) -> Dict[str, Any]:
+        """Authenticate while ``_auth_lock`` is already held."""
         self.log("🔐 Starting Authentication process...", "INFO")
         auth_timeout = self._default_timeout_seconds + 10  # Extra buffer for asyncio timeout
         
         try:
-            async with self._auth_lock:
-                # Store credentials for potential re-authentication
-                self.auth_credentials = {'email': email, 'password': password}
-                
-                # Clear any existing session data (quick operation, no lock needed for this)
-                self.session.cookies.clear()
-                self.session.auth = None
-                
-                # Create Basic Authentication header (base64 encoded credentials)
-                import base64
-                credentials = f"{email}:{password}"
-                encoded_credentials = base64.b64encode(credentials.encode()).decode()
-                
-                # Send POST request with Basic Authentication header
-                headers = {
-                    'Authorization': f'Basic {encoded_credentials}'
-                }
-                
-                # Use a direct thread call with timeout, no nested locks
-                try:
-                    response = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            self.session.request,
-                            'POST',
-                            'https://api.worldquantbrain.com/authentication',
-                            headers=headers,
-                            timeout=self._default_timeout_seconds,
-                        ),
-                        timeout=auth_timeout
-                    )
-                except asyncio.TimeoutError:
-                    self.log(f"❌ Authentication request timed out after {auth_timeout}s", "ERROR")
-                    raise TimeoutError(f"Authentication timed out after {auth_timeout}s")
+            # Store credentials for potential re-authentication
+            self.auth_credentials = {'email': email, 'password': password}
+            self._auth_validated_until = 0.0
+            
+            # Clear any existing session data (quick operation, no lock needed for this)
+            self.session.cookies.clear()
+            self.session.auth = None
+            
+            # Create Basic Authentication header (base64 encoded credentials)
+            import base64
+            credentials = f"{email}:{password}"
+            encoded_credentials = base64.b64encode(credentials.encode()).decode()
+            
+            # Send POST request with Basic Authentication header
+            headers = {
+                'Authorization': f'Basic {encoded_credentials}'
+            }
+            
+            # Use a direct thread call with timeout, no nested locks
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.session.request,
+                        'POST',
+                        'https://api.worldquantbrain.com/authentication',
+                        headers=headers,
+                        timeout=self._default_timeout_seconds,
+                    ),
+                    timeout=auth_timeout
+                )
+            except asyncio.TimeoutError:
+                self.log(f"❌ Authentication request timed out after {auth_timeout}s", "ERROR")
+                raise TimeoutError(f"Authentication timed out after {auth_timeout}s")
 
-                # Check for successful authentication (status code 201)
-                if response.status_code == 201:
-                    self.log("Authentication successful", "SUCCESS")
-                    
-                    # Check if JWT token was automatically stored by session
-                    jwt_token = self.session.cookies.get('t')
-                    if jwt_token:
-                        self.log("JWT token automatically stored by session", "SUCCESS")
-                    
-                    # Return success response
-                    return {
-                        'user': {'email': email},
-                        'status': 'authenticated',
-                        'permissions': ['read', 'write'],
-                        'message': 'Authentication successful',
-                        'status_code': response.status_code,
-                        'has_jwt': jwt_token is not None
-                    }
+            # Check for successful authentication (status code 201)
+            if response.status_code == 201:
+                self.log("Authentication successful", "SUCCESS")
                 
-                # Check if biometric authentication is required (401 with persona)
-                elif response.status_code == 401:
-                    www_auth = response.headers.get("WWW-Authenticate")
-                    location = response.headers.get("Location")
+                # Check if JWT token was automatically stored by session
+                jwt_token = self.session.cookies.get('t')
+                if jwt_token:
+                    self._auth_validated_until = time.time() + self._auth_check_ttl_seconds
+                    self.log("JWT token automatically stored by session", "SUCCESS")
+                
+                # Return success response
+                return {
+                    'user': {'email': email},
+                    'status': 'authenticated',
+                    'permissions': ['read', 'write'],
+                    'message': 'Authentication successful',
+                    'status_code': response.status_code,
+                    'has_jwt': jwt_token is not None
+                }
+            
+            # Check if biometric authentication is required (401 with persona)
+            elif response.status_code == 401:
+                www_auth = response.headers.get("WWW-Authenticate")
+                location = response.headers.get("Location")
+                
+                if www_auth == "persona" and location:
+                    self.log("🔴 Biometric authentication required", "INFO")
                     
-                    if www_auth == "persona" and location:
-                        self.log("🔴 Biometric authentication required", "INFO")
-                        
-                        # Handle biometric authentication
-                        from urllib.parse import urljoin
-                        biometric_url = urljoin(response.url, location)
-                        
-                        # Release auth_lock before calling biometric auth to avoid deadlock
-                        # Biometric auth will acquire its own locks as needed
-                        return await self._handle_biometric_auth(biometric_url, email)
-                    else:
-                        raise Exception("Incorrect email or password")
+                    # Handle biometric authentication
+                    from urllib.parse import urljoin
+                    biometric_url = urljoin(response.url, location)
+                    return await self._handle_biometric_auth(biometric_url, email)
                 else:
-                    raise Exception(f"Authentication failed with status code: {response.status_code}")
+                    raise Exception("Incorrect email or password")
+            else:
+                raise Exception(f"Authentication failed with status code: {response.status_code}")
                     
         except asyncio.TimeoutError:
             self.log(f"❌ Authentication timed out", "ERROR")
@@ -483,17 +693,24 @@ class BrainApiClient:
             jwt_token = self.session.cookies.get('t')
             if not jwt_token:
                 self.log("❌ No JWT token found", "INFO")
+                self._auth_validated_until = 0.0
                 return False
+
+            if time.time() < self._auth_validated_until:
+                return True
             
             # Test authentication with a simple API call
             response = await self._request('GET', f"{self.base_url}/authentication")
             if response.status_code == 200:
+                self._auth_validated_until = time.time() + self._auth_check_ttl_seconds
                 return True
             elif response.status_code == 401:
                 self.log("❌ JWT token expired or invalid (401)", "INFO")
+                self._auth_validated_until = 0.0
                 return False
             else:
                 self.log(f"⚠️ Unexpected status code during auth check: {response.status_code}", "WARNING")
+                self._auth_validated_until = 0.0
                 return False
         except (TimeoutError, ConnectionError) as e:
             self.log(f"❌ Network error checking authentication: {str(e)}", "ERROR")
@@ -504,7 +721,30 @@ class BrainApiClient:
     
     async def ensure_authenticated(self):
         """Ensure authentication is valid, re-authenticate if needed."""
-        if not await self.is_authenticated():
+        jwt_token = self.session.cookies.get('t')
+        if jwt_token and time.time() < self._auth_validated_until:
+            return
+
+        async with self._auth_lock:
+            # Double-check after waiting for another coroutine's auth refresh.
+            jwt_token = self.session.cookies.get('t')
+            if jwt_token and time.time() < self._auth_validated_until:
+                return
+
+            if jwt_token:
+                try:
+                    response = await self._request('GET', f"{self.base_url}/authentication")
+                    if response.status_code == 200:
+                        self._auth_validated_until = time.time() + self._auth_check_ttl_seconds
+                        return
+                    if response.status_code == 401:
+                        self.log("❌ JWT token expired or invalid (401)", "INFO")
+                    else:
+                        self.log(f"⚠️ Unexpected status code during auth check: {response.status_code}", "WARNING")
+                except (TimeoutError, ConnectionError) as e:
+                    self.log(f"❌ Network error checking authentication: {str(e)}", "ERROR")
+
+            self._auth_validated_until = 0.0
             if not self.auth_credentials:
                 self.log("No credentials in memory, loading from config...", "INFO")
                 config = load_config()
@@ -516,7 +756,7 @@ class BrainApiClient:
                 self.auth_credentials = {'email': email, 'password': password}
 
             self.log("🔄 Re-authenticating...", "INFO")
-            await self.authenticate(self.auth_credentials['email'], self.auth_credentials['password'])
+            await self._authenticate_unlocked(self.auth_credentials['email'], self.auth_credentials['password'])
     
     async def get_authentication_status(self) -> Optional[Dict[str, Any]]:
         """Get current authentication status and user info."""
@@ -712,15 +952,12 @@ class BrainApiClient:
                     'offset': offset
                 }
                 
-                while True:
-                    response = await self._request('GET', f"{self.base_url}/data-sets", params=params)
-                    if response.status_code == 429:
-                        self.log(f"get_datasets 429 rate limit, retrying after 5s (offset={offset})", "WARNING")
-                        await asyncio.sleep(5)
-                        continue
-                    response.raise_for_status()
-                    break
-                data = response.json()
+                data = await self._request_json_with_retries(
+                    'GET',
+                    f"{self.base_url}/data-sets",
+                    params=params,
+                    op_name=f"get_datasets(offset={offset})",
+                )
                 
                 results = data.get('results', [])
                 all_results.extend(results)
@@ -934,15 +1171,12 @@ class BrainApiClient:
                 if dataset_id:
                     params['dataset.id'] = dataset_id
                 
-                while True:
-                    response = await self._request('GET', f"{self.base_url}/data-fields", params=params)
-                    if response.status_code == 429:
-                        self.log(f"get_datafields 429 rate limit, retrying after 5s (offset={offset})", "WARNING")
-                        await asyncio.sleep(5)
-                        continue
-                    response.raise_for_status()
-                    break
-                data = response.json()
+                data = await self._request_json_with_retries(
+                    'GET',
+                    f"{self.base_url}/data-fields",
+                    params=params,
+                    op_name=f"get_datafields(offset={offset})",
+                )
                 
                 results = data.get('results', [])
                 # 等待2秒
@@ -1148,28 +1382,52 @@ class BrainApiClient:
                 # No client-side filtering needed — use simple server-side pagination
                 api_params["limit"] = limit
                 api_params["offset"] = offset
-                response = await self._request('GET', f"{self.base_url}/users/self/alphas", params=api_params)
-                response.raise_for_status()
-                data = response.json()
+                data = await self._request_json_with_retries(
+                    'GET',
+                    f"{self.base_url}/users/self/alphas",
+                    params=api_params,
+                    op_name=f"get_user_alphas(stage={stage}, offset={offset})",
+                )
             else:
-                # Client-side filtering: fetch all matching alphas, then filter
-                # Note: The API caps results at 100 per request regardless of limit param
+                # Client-side filtering: fetch only enough server pages to
+                # satisfy the requested page. Scanning the whole alpha history
+                # can take minutes for accounts with thousands of IS alphas.
+                # Note: The API caps results at 100 per request regardless of limit param.
                 BATCH_SIZE = 100
+                try:
+                    max_scan = max(
+                        BATCH_SIZE,
+                        int(os.environ.get("BRAIN_USER_ALPHAS_CLIENT_FILTER_MAX_SCAN", "1000")),
+                    )
+                except Exception:
+                    max_scan = 1000
+                target_matches = max(offset, 0) + max(limit, 0)
                 filtered_results = []
                 api_offset = 0
                 total_server_count = None
+                exhausted = False
+                hit_scan_limit = False
                 
                 while True:
-                    api_params_batch = {**api_params, "limit": BATCH_SIZE, "offset": api_offset}
-                    response = await self._request('GET', f"{self.base_url}/users/self/alphas", params=api_params_batch)
-                    response.raise_for_status()
-                    batch_data = response.json()
+                    if api_offset >= max_scan:
+                        hit_scan_limit = True
+                        break
+
+                    batch_limit = min(BATCH_SIZE, max_scan - api_offset)
+                    api_params_batch = {**api_params, "limit": batch_limit, "offset": api_offset}
+                    batch_data = await self._request_json_with_retries(
+                        'GET',
+                        f"{self.base_url}/users/self/alphas",
+                        params=api_params_batch,
+                        op_name=f"get_user_alphas(stage={stage}, offset={api_offset})",
+                    )
                     
                     if total_server_count is None:
                         total_server_count = batch_data.get('count', 0)
                     
                     batch_results = batch_data.get('results', [])
                     if not batch_results:
+                        exhausted = True
                         break
                     
                     for alpha in batch_results:
@@ -1177,8 +1435,11 @@ class BrainApiClient:
                             filtered_results.append(alpha)
                     
                     api_offset += len(batch_results)
+                    if target_matches and len(filtered_results) >= target_matches:
+                        break
                     # Stop if we've exhausted all server-side results
                     if api_offset >= total_server_count:
+                        exhausted = True
                         break
                 
                 # Apply user's offset/limit to the filtered results
@@ -1186,18 +1447,35 @@ class BrainApiClient:
                 page_results = filtered_results[offset:offset + limit]
                 
                 next_offset = offset + limit
+                has_more = (
+                    total_filtered > next_offset
+                    or (
+                        len(page_results) == limit
+                        and not exhausted
+                        and not hit_scan_limit
+                        and total_server_count is not None
+                        and api_offset < total_server_count
+                    )
+                )
+                partial_count = not exhausted
                 data = {
-                    'count': total_filtered,
-                    'next': f"offset={next_offset}&limit={limit}" if next_offset < total_filtered else None,
+                    'count': total_filtered if not partial_count else max(total_filtered, next_offset if has_more else total_filtered),
+                    'next': f"offset={next_offset}&limit={limit}" if has_more else None,
                     'previous': f"offset={max(0, offset - limit)}&limit={limit}" if offset > 0 else None,
                     'results': page_results,
+                    'partial_count': partial_count,
+                    'server_scanned': api_offset,
+                    'server_count': total_server_count,
+                    'max_scan': max_scan,
                 }
             
             # Add metadata
             data['from_cache'] = False
             
-            # Cache the data (1 day TTL)
-            self._set_cached_data(cache_key, data, ttl=604800)
+            # Cache complete pages longer. Partial client-filtered pages are
+            # fast-path snapshots, so keep their TTL short.
+            cache_ttl = 300 if data.get('partial_count') else 604800
+            self._set_cached_data(cache_key, data, ttl=cache_ttl)
             
             return data
             
@@ -1567,57 +1845,119 @@ class BrainApiClient:
 
     async def recommend_datasets(self, region: str = "USA", delay: int = 1,
                                   universe: str = "TOP3000", top_n: int = 20) -> Dict[str, Any]:
-        """Recommend datasets based on pyramid lighting, submission distribution, and quality.
+        """Recommend datasets with unlit pyramid priority and in-pyramid quality ranking.
 
-        Scoring logic (references WebDataScope distribution.js & dataFlag.js):
-        1. Pyramid lighting: uses /users/self/activities/diversity API (dataDiversity.check).
-           Categories not yet "PASS" (< 3 alphas) get a higher priority bonus.
-           Among unlit categories, the one with fewest submissions gets the highest boost.
-        2. Submission distribution: categories and datasets with fewer submitted alphas
-           get a higher score to encourage diversification.
-        3. Dataset quality: uses pre-aggregated OS/IS Sharpe from info_data.bin.
-           Higher mean sharpe = higher quality score.
-
-        Returns ranked list with per-dataset scores and breakdown.
+        The ranking favors datasets from unlit pyramids first. Within those
+        pyramids it prefers high OS/IS Sharpe, high dataset userCount, and high
+        dataset alphaCount, with a small random component to avoid returning the
+        exact same list on every call.
         """
         await self.ensure_authenticated()
 
-        # ---- 1. Fetch diversity / submission distribution ----
-        diversity_data = {}
+        def _category_id(value: Any) -> str:
+            if isinstance(value, dict):
+                return str(value.get('id') or '')
+            return str(value or '')
+
+        def _category_name(value: Any) -> str:
+            if isinstance(value, dict):
+                return str(value.get('name') or value.get('id') or '')
+            return str(value or '')
+
+        def _as_float(value: Any, default: float = 0.0) -> float:
+            try:
+                if value is None:
+                    return default
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        def _as_int(value: Any, default: int = 0) -> int:
+            try:
+                if value is None:
+                    return default
+                return int(float(value))
+            except (TypeError, ValueError):
+                return default
+
+        def _rank_score(value: Optional[float], values: List[float], points: float) -> float:
+            """Return 0..points based on value's rank in the supplied sample."""
+            if value is None or not values:
+                return 0.0
+            sorted_values = sorted(values)
+            if len(sorted_values) == 1:
+                return points
+            below_or_equal = sum(1 for item in sorted_values if item <= value)
+            percentile = (below_or_equal - 1) / (len(sorted_values) - 1)
+            return points * max(0.0, min(1.0, percentile))
+
+        def _log_score(value: int, values: List[int], points: float) -> float:
+            if not values:
+                return 0.0
+            log_values = [math.log1p(max(0, item)) for item in values]
+            return _rank_score(math.log1p(max(0, value)), log_values, points)
+
+        def _region_delay_match(item: Dict[str, Any]) -> bool:
+            return item.get('region') == region and _as_int(item.get('delay'), -1) == delay
+
+        def _platform_row_match(item: Dict[str, Any], require_universe: bool = True) -> bool:
+            if item.get('InstrumentType') != 'EQUITY':
+                return False
+            if item.get('Region') != region:
+                return False
+            if _as_int(item.get('Delay'), -1) != delay:
+                return False
+            if not require_universe:
+                return True
+            return universe in (item.get('Universe') or [])
+
+        # ---- 1. Fetch pyramid status from the platform's pyramid endpoints ----
+        pyramid_alphas: Dict[str, Any] = {}
+        pyramid_multipliers: Dict[str, Any] = {}
         try:
-            response = await self._request(
-                'GET',
-                f"{self.base_url}/users/self/activities/diversity",
-                params={'grouping': 'region,delay,dataCategory'}
+            pyramid_alphas, pyramid_multipliers = await asyncio.gather(
+                self.get_pyramid_alphas(),
+                self.get_pyramid_multipliers(),
             )
-            response.raise_for_status()
-            diversity_data = response.json()
         except Exception as e:
-            self.log(f"Failed to fetch diversity data: {e}", "WARNING")
+            self.log(f"Failed to fetch pyramid status: {e}", "WARNING")
 
-        # Parse alpha distribution per category for selected region & delay
-        category_alpha_counts: Dict[str, int] = {}   # category_id -> alphaCount
-        category_pass_status: Dict[str, bool] = {}    # category_id -> is_lit
-        category_need_count: Dict[str, int] = {}      # category_id -> how many more needed to light
-
-        for item in diversity_data.get('alphas', []):
-            if item.get('region') != region or item.get('delay') != delay:
+        pyramid_summary: Dict[str, Dict[str, Any]] = {}
+        for item in pyramid_multipliers.get('pyramids', []):
+            if not isinstance(item, dict) or not _region_delay_match(item):
                 continue
-            cat_id = item.get('dataCategory', {}).get('id', '') if isinstance(item.get('dataCategory'), dict) else ''
+            cat_obj = item.get('category', {})
+            cat_id = _category_id(cat_obj)
             if not cat_id:
                 continue
-            alpha_count = item.get('alphaCount', 0)
-            is_pass = item.get('dataDiversity', {}).get('check', '') == 'PASS'
-            category_alpha_counts[cat_id] = alpha_count
-            category_pass_status[cat_id] = is_pass
-            # dataDiversity check: PASS means ≥3, else need more
-            if not is_pass:
-                category_need_count[cat_id] = max(0, 3 - alpha_count)
-            else:
-                category_need_count[cat_id] = 0
+            pyramid_summary[cat_id] = {
+                'category_id': cat_id,
+                'category_name': _category_name(cat_obj),
+                'alpha_count': 0,
+                'need_to_light': 3,
+                'lit': False,
+                'multiplier': _as_float(item.get('multiplier'), 1.0),
+            }
 
-        # Total submitted alphas count for normalization
-        total_submitted = sum(category_alpha_counts.values()) or 1
+        for item in pyramid_alphas.get('pyramids', []):
+            if not isinstance(item, dict) or not _region_delay_match(item):
+                continue
+            cat_obj = item.get('category', {})
+            cat_id = _category_id(cat_obj)
+            if not cat_id:
+                continue
+            alpha_count = _as_int(item.get('alphaCount'), 0)
+            pyramid_summary.setdefault(cat_id, {
+                'category_id': cat_id,
+                'category_name': _category_name(cat_obj),
+                'multiplier': 1.0,
+            })
+            pyramid_summary[cat_id].update({
+                'category_name': pyramid_summary[cat_id].get('category_name') or _category_name(cat_obj),
+                'alpha_count': alpha_count,
+                'need_to_light': max(0, 3 - alpha_count),
+                'lit': alpha_count >= 3,
+            })
 
         # ---- 2. Fetch available datasets for this region/delay ----
         datasets_resp = await self.get_datasets(region=region, delay=delay, universe=universe)
@@ -1625,134 +1965,218 @@ class BrainApiClient:
         if not all_datasets:
             return {'error': 'No datasets available for the given region/delay/universe'}
 
+        # ---- 2.1. Fetch neutralization options for the same simulation settings ----
+        neutralization_options: List[str] = []
+        neutralization_info: Dict[str, Any] = {
+            'instrument_type': 'EQUITY',
+            'region': region,
+            'delay': delay,
+            'universe': universe,
+            'options': neutralization_options,
+            'available': False,
+            'source': 'platform_setting_options',
+        }
+        try:
+            platform_options = await self.get_platform_setting_options()
+            setting_rows = platform_options.get('instrument_options', [])
+            matching_rows = [
+                item for item in setting_rows
+                if isinstance(item, dict) and _platform_row_match(item)
+            ]
+            universe_matched = True
+            if not matching_rows:
+                matching_rows = [
+                    item for item in setting_rows
+                    if isinstance(item, dict) and _platform_row_match(item, require_universe=False)
+                ]
+                universe_matched = False
+
+            neutralization_options = sorted({
+                str(option)
+                for row in matching_rows
+                for option in (row.get('Neutralization') or [])
+                if option
+            })
+            available_universes = sorted({
+                str(option)
+                for row in matching_rows
+                for option in (row.get('Universe') or [])
+                if option
+            })
+            neutralization_info.update({
+                'options': neutralization_options,
+                'available': bool(neutralization_options),
+                'universe_matched': universe_matched,
+                'available_universes': available_universes,
+            })
+        except Exception as e:
+            self.log(f"Failed to fetch neutralization options for dataset recommendations: {e}", "WARNING")
+            neutralization_info.update({
+                'error': str(e),
+                'available': False,
+            })
+
+        for ds in all_datasets:
+            cat_obj = ds.get('category', {})
+            cat_id = _category_id(cat_obj)
+            if not cat_id:
+                continue
+            pyramid_summary.setdefault(cat_id, {
+                'category_id': cat_id,
+                'category_name': _category_name(cat_obj),
+                'alpha_count': 0,
+                'need_to_light': 3,
+                'lit': False,
+                'multiplier': _as_float(ds.get('pyramidMultiplier'), 1.0),
+            })
+
         # ---- 3. Load dataset quality from OS/IS Sharpe (info_data.bin) ----
         region_key = f"{region}_{delay}"
         isos_info = self._isos_data.get(region_key, {}).get('isos', {}) if self._isos_data else {}
         dataset_sharpe_map = isos_info.get('dataset', {})
-        mean_sharpe = isos_info.get('mean', {}).get('sharpe_ratio', 0.0)
 
-        # ---- 4. Fetch OS alphas to analyze dataset-level submission spread ----
-        dataset_submission_counts: Dict[str, int] = {}
-        try:
-            now = datetime.utcnow()
-            q_start_month = (now.month - 1) // 3 * 3 + 1
-            quarter_start = datetime(now.year, q_start_month, 1)
-            os_alphas = await self.get_user_alphas(
-                stage='OS', limit=200,
-                submission_start_date=quarter_start.strftime("%Y-%m-%dT00:00:00Z")
-            )
-            for a in os_alphas.get('results', []):
-                ds_id = ''
-                if isinstance(a.get('datanodes'), dict):
-                    ds_id = a['datanodes'].get('dataset', {}).get('id', '')
-                elif isinstance(a.get('settings'), dict):
-                    pass  # some alpha formats differ
-                # Try to extract from regular code or other fields
-                if not ds_id:
-                    detail_region = a.get('settings', {}).get('region', '') if isinstance(a.get('settings'), dict) else ''
-                    if detail_region and detail_region != region:
-                        continue
-                dataset_submission_counts[ds_id] = dataset_submission_counts.get(ds_id, 0) + 1
-        except Exception as e:
-            self.log(f"Failed to fetch OS alphas for dataset spread: {e}", "WARNING")
-
-        # ---- 5. Score each dataset ----
-        scored_datasets = []
+        datasets_by_category: Dict[str, List[Dict[str, Any]]] = {}
         for ds in all_datasets:
+            cat_id = _category_id(ds.get('category', {}))
+            datasets_by_category.setdefault(cat_id, []).append(ds)
+
+        sharpe_values_by_category: Dict[str, List[float]] = {}
+        user_counts_by_category: Dict[str, List[int]] = {}
+        alpha_counts_by_category: Dict[str, List[int]] = {}
+        for cat_id, datasets in datasets_by_category.items():
+            for ds in datasets:
+                ds_id = ds.get('id', '')
+                ds_sharpe_info = dataset_sharpe_map.get(ds_id, {})
+                ds_sharpe = ds_sharpe_info.get('sharpe_ratio') if isinstance(ds_sharpe_info, dict) else None
+                if ds_sharpe is not None:
+                    sharpe_values_by_category.setdefault(cat_id, []).append(_as_float(ds_sharpe))
+                user_counts_by_category.setdefault(cat_id, []).append(_as_int(ds.get('userCount'), 0))
+                alpha_counts_by_category.setdefault(cat_id, []).append(_as_int(ds.get('alphaCount'), 0))
+
+        unlit_categories = {cat_id for cat_id, item in pyramid_summary.items() if not item.get('lit')}
+        restrict_to_unlit = any(
+            _category_id(ds.get('category', {})) in unlit_categories
+            for ds in all_datasets
+        )
+        candidate_datasets = [
+            ds for ds in all_datasets
+            if not restrict_to_unlit or _category_id(ds.get('category', {})) in unlit_categories
+        ]
+
+        # ---- 4. Score each dataset ----
+        scored_datasets = []
+        max_multiplier = max(
+            [_as_float(item.get('multiplier'), 1.0) for item in pyramid_summary.values()] or [1.0]
+        )
+        for ds in candidate_datasets:
             ds_id = ds.get('id', '')
             ds_name = ds.get('name', ds_id)
             cat_obj = ds.get('category', {})
-            ds_category = cat_obj.get('id', '') if isinstance(cat_obj, dict) else str(cat_obj)
+            ds_category = _category_id(cat_obj)
+            ds_category_name = _category_name(cat_obj)
             sub_obj = ds.get('subcategory', {})
-            ds_subcategory = sub_obj.get('id', '') if isinstance(sub_obj, dict) else str(sub_obj)
+            ds_subcategory = _category_id(sub_obj)
+            pyramid = pyramid_summary.get(ds_category, {})
 
             # --- Pyramid lighting score (0~40 points) ---
-            pyramid_score = 0.0
-            cat_lit = category_pass_status.get(ds_category, True)  # default True = already lit
-            cat_count = category_alpha_counts.get(ds_category, 0)
-            need = category_need_count.get(ds_category, 0)
-
+            cat_lit = bool(pyramid.get('lit', False))
+            cat_count = _as_int(pyramid.get('alpha_count'), 0)
+            need = _as_int(pyramid.get('need_to_light'), max(0, 3 - cat_count))
+            multiplier = _as_float(pyramid.get('multiplier'), _as_float(ds.get('pyramidMultiplier'), 1.0))
             if not cat_lit:
-                # Unlit category gets big bonus; fewer submissions = higher priority
-                pyramid_score = 40.0 * (1.0 / (1.0 + cat_count))
+                need_score = 24.0 * (need / 3.0)
+                multiplier_score = 16.0 * (multiplier / max(max_multiplier, 1.0))
+                pyramid_score = min(40.0, need_score + multiplier_score)
             else:
-                # Already lit: small bonus for categories with fewer alphas (encourage evenness)
-                max_cat_count = max(category_alpha_counts.values()) if category_alpha_counts else 1
-                pyramid_score = 5.0 * (1.0 - cat_count / max(max_cat_count, 1))
-
-            # --- Submission distribution score (0~30 points) ---
-            dist_score = 0.0
-            ds_sub_count = dataset_submission_counts.get(ds_id, 0)
-            # Favor datasets with zero or few submissions
-            dist_score = 30.0 * (1.0 / (1.0 + ds_sub_count))
+                pyramid_score = 5.0 * (multiplier / max(max_multiplier, 1.0))
 
             # --- Quality score from OS/IS Sharpe (0~30 points) ---
-            quality_score = 0.0
             ds_sharpe_info = dataset_sharpe_map.get(ds_id, {})
-            ds_sharpe = ds_sharpe_info.get('sharpe_ratio') if ds_sharpe_info else None
-            ds_os_count = ds_sharpe_info.get('count', 0) if ds_sharpe_info else 0
+            ds_sharpe = ds_sharpe_info.get('sharpe_ratio') if isinstance(ds_sharpe_info, dict) else None
+            ds_sharpe_float = _as_float(ds_sharpe) if ds_sharpe is not None else None
+            ds_os_count = _as_int(ds_sharpe_info.get('count'), 0) if isinstance(ds_sharpe_info, dict) else 0
+            quality_score = _rank_score(
+                ds_sharpe_float,
+                sharpe_values_by_category.get(ds_category, []),
+                30.0,
+            )
 
-            if ds_sharpe is not None:
-                if ds_sharpe < 0:
-                    quality_score = 0.0  # negative sharpe = poor quality
-                elif mean_sharpe > 0 and ds_sharpe > mean_sharpe:
-                    quality_score = 30.0  # above average = excellent
-                elif mean_sharpe > 0:
-                    quality_score = 15.0 * (ds_sharpe / mean_sharpe)  # proportional
-                else:
-                    quality_score = 15.0  # mean is 0 or negative, any positive sharpe is decent
+            # --- Dataset popularity: prefer more users and more submitted alphas (0~20 points) ---
+            ds_user_count = _as_int(ds.get('userCount'), 0)
+            ds_alpha_count = _as_int(ds.get('alphaCount'), 0)
+            usage_score = _log_score(
+                ds_user_count,
+                user_counts_by_category.get(ds_category, []),
+                10.0,
+            )
+            submission_score = _log_score(
+                ds_alpha_count,
+                alpha_counts_by_category.get(ds_category, []),
+                10.0,
+            )
 
-            total_score = pyramid_score + dist_score + quality_score
+            # --- Controlled randomness (0~5 points) ---
+            random_score = random.uniform(0.0, 5.0)
+            total_score = pyramid_score + quality_score + usage_score + submission_score + random_score
 
             scored_datasets.append({
                 'dataset_id': ds_id,
                 'dataset_name': ds_name,
                 'category': ds_category,
+                'category_name': ds_category_name,
                 'subcategory': ds_subcategory,
                 'total_score': round(total_score, 2),
                 'pyramid_score': round(pyramid_score, 2),
-                'distribution_score': round(dist_score, 2),
                 'quality_score': round(quality_score, 2),
+                'usage_score': round(usage_score, 2),
+                'submission_score': round(submission_score, 2),
+                'random_score': round(random_score, 2),
+                'distribution_score': round(usage_score + submission_score, 2),
                 'category_lit': cat_lit,
                 'category_alpha_count': cat_count,
                 'category_need_to_light': need,
-                'dataset_submissions_this_quarter': ds_sub_count,
-                'os_is_sharpe': round(ds_sharpe, 4) if ds_sharpe is not None else None,
+                'pyramid_multiplier': multiplier,
+                'dataset_user_count': ds_user_count,
+                'dataset_alpha_count': ds_alpha_count,
+                'dataset_submissions_this_quarter': None,
+                'os_is_sharpe': round(ds_sharpe_float, 4) if ds_sharpe_float is not None else None,
                 'os_is_count': ds_os_count,
+                'neutralization_options': neutralization_options,
+                'neutralization_info': neutralization_info,
             })
 
         # Sort by total_score descending
         scored_datasets.sort(key=lambda x: x['total_score'], reverse=True)
 
-        # Build category summary
-        category_summary = {}
-        for cat_id, is_lit in category_pass_status.items():
-            category_summary[cat_id] = {
-                'lit': is_lit,
-                'alpha_count': category_alpha_counts.get(cat_id, 0),
-                'need_to_light': category_need_count.get(cat_id, 0),
-            }
-
-        # Count unlit categories
-        unlit_count = sum(1 for v in category_pass_status.values() if not v)
-        lit_count = sum(1 for v in category_pass_status.values() if v)
+        lit_count = sum(1 for item in pyramid_summary.values() if item.get('lit'))
+        unlit_count = sum(1 for item in pyramid_summary.values() if not item.get('lit'))
+        unlit_category_ids = sorted([cat_id for cat_id, item in pyramid_summary.items() if not item.get('lit')])
 
         return {
             'region': region,
             'delay': delay,
             'universe': universe,
+            'neutralization_options': neutralization_options,
+            'neutralization_info': neutralization_info,
             'recommendations': scored_datasets[:top_n],
             'total_datasets_scored': len(scored_datasets),
-            'category_summary': category_summary,
+            'total_available_datasets': len(all_datasets),
+            'total_candidate_datasets': len(candidate_datasets),
+            'restricted_to_unlit_categories': restrict_to_unlit,
+            'category_summary': pyramid_summary,
+            'pyramid_summary': pyramid_summary,
             'pyramid_status': {
                 'lit_categories': lit_count,
                 'unlit_categories': unlit_count,
                 'total_categories': lit_count + unlit_count,
+                'unlit_category_ids': unlit_category_ids,
             },
             'scoring_weights': {
-                'pyramid_lighting': '0~40 pts (unlit categories get priority)',
-                'submission_distribution': '0~30 pts (less-used datasets get priority)',
-                'dataset_quality': '0~30 pts (higher OS/IS Sharpe = better)',
+                'pyramid_lighting': '0~40 pts (unlit pyramids get priority; higher multiplier helps)',
+                'dataset_quality': '0~30 pts (higher OS/IS Sharpe rank within the same pyramid)',
+                'dataset_usage': '0~10 pts (higher dataset userCount rank within the same pyramid)',
+                'dataset_submissions': '0~10 pts (higher dataset alphaCount rank within the same pyramid)',
+                'randomness': '0~5 pts (small random jitter for exploration)',
             }
         }
             
@@ -1996,22 +2420,49 @@ class BrainApiClient:
         
     async def get_production_correlation(self, alpha_id: str) -> Dict[str, Any]:
         """Get production correlation data for an alpha.
-        
+
         Polls every 30 seconds for up to 1 hour to handle platform rate-limiting.
         For super alphas, the platform may return an empty body (HTTP 200) for a few
         minutes after simulation completes while it computes the correlation data.
         The polling loop handles this by retrying until data is available.
         Returns {'status': 'pending', ...} after max_wait_seconds if data never arrives.
+
+        BRAIN allows only one in-flight correlation computation per account. If
+        another request is already polling, this returns ``correlation_busy``
+        immediately instead of queueing behind it.
         """
         await self.ensure_authenticated()
-        
+
+        op_name = f"get_production_correlation({alpha_id})"
+        lock_info = await self._try_acquire_brain_correlation_lock(op_name)
+        if not lock_info.get('acquired'):
+            retry_after = self._brain_correlation_busy_retry_after_seconds
+            return {
+                'status': 'correlation_busy',
+                'message': (
+                    'Another production correlation check is already running for this account. '
+                    'The BRAIN platform supports only one in-flight correlation computation. '
+                    f'Please retry in {retry_after} seconds.'
+                ),
+                'retry_after': retry_after,
+                'lock_retry_after': lock_info.get('retry_after'),
+                'max': None,
+                'records': [],
+            }
+
+        try:
+            return await self._poll_production_correlation(alpha_id)
+        finally:
+            await self._release_brain_correlation_lock(lock_info, op_name)
+
+    async def _poll_production_correlation(self, alpha_id: str) -> Dict[str, Any]:
         max_wait_seconds = 3600  # 1 hour total
         poll_interval = 30       # 30 seconds per attempt (matches reference implementation)
         start_time = time.time()
         attempt = 0
         consecutive_empty = 0    # track consecutive empty-body responses
         consecutive_network_failures = 0
-        
+
         while True:
             elapsed = time.time() - start_time
             if elapsed >= max_wait_seconds:
@@ -2113,6 +2564,22 @@ class BrainApiClient:
         ]
         return cache_dir / f"os_pnl_pool_{'_'.join(safe_parts)}.pkl"
 
+    async def _get_os_pnl_pool_lock(self, pool_path: Path) -> asyncio.Lock:
+        """Return the in-process lock for one configuration-specific OS PnL cache."""
+        pool_key = str(pool_path)
+        async with self._os_pnl_pool_locks_guard:
+            lock = self._os_pnl_pool_locks.get(pool_key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._os_pnl_pool_locks[pool_key] = lock
+            return lock
+
+    @staticmethod
+    def _exclude_os_pnl_target(pool: pd.DataFrame, exclude_id: Optional[str]) -> pd.DataFrame:
+        if exclude_id and isinstance(pool, pd.DataFrame) and exclude_id in pool.columns:
+            return pool.drop(columns=[exclude_id], errors='ignore')
+        return pool
+
     async def _list_matching_os_alpha_ids(
         self,
         instrument_type: str,
@@ -2122,10 +2589,10 @@ class BrainApiClient:
     ) -> List[str]:
         """Fetch OS alpha IDs that match the target alpha's market configuration.
 
-        The platform self-correlation endpoint compares against the user's self
-        alpha pool for the same instrument/region/universe/delay, and it can
-        include both REGULAR and SUPER alphas. Filtering locally on the same
-        configuration keeps the local calculation aligned with the platform.
+        BRAIN self-correlation semantics compare against the user's self alpha
+        pool for the same instrument/region/universe/delay, and can include
+        both REGULAR and SUPER alphas. Filtering locally on the same
+        configuration keeps the local calculation aligned with those semantics.
         """
         all_ids: List[str] = []
         offset = 0
@@ -2138,9 +2605,12 @@ class BrainApiClient:
                 'order': '-dateSubmitted',
             }
             try:
-                response = await self._request('GET', f"{self.base_url}/users/self/alphas", params=params)
-                response.raise_for_status()
-                data = response.json() or {}
+                data = await self._request_json_with_retries(
+                    'GET',
+                    f"{self.base_url}/users/self/alphas",
+                    params=params,
+                    op_name=f"list_matching_os_alphas(offset={offset})",
+                )
             except Exception as e:
                 self.log(f"Failed to page OS alpha list at offset={offset}: {e}", "WARNING")
                 break
@@ -2184,11 +2654,37 @@ class BrainApiClient:
         - Persist the merged pool back to disk and return it.
         """
         pool_path = self._os_pnl_pool_path(instrument_type, region, universe, delay)
+        pool_lock = await self._get_os_pnl_pool_lock(pool_path)
+        async with pool_lock:
+            pool_key = str(pool_path)
+            debounce = self._os_pnl_pool_sync_debounce_seconds
+            cached_sync = self._os_pnl_pool_last_sync.get(pool_key)
+            if cached_sync and debounce > 0:
+                synced_at, synced_pool = cached_sync
+                if time.time() - synced_at <= debounce:
+                    return self._exclude_os_pnl_target(synced_pool, exclude_id)
+
+            synced_pool = await self._sync_os_pnl_pool_unlocked(
+                pool_path=pool_path,
+                instrument_type=instrument_type,
+                region=region,
+                universe=universe,
+                delay=delay,
+            )
+            self._os_pnl_pool_last_sync[pool_key] = (time.time(), synced_pool)
+            return self._exclude_os_pnl_target(synced_pool, exclude_id)
+
+    async def _sync_os_pnl_pool_unlocked(
+        self,
+        pool_path: Path,
+        instrument_type: str,
+        region: str,
+        universe: str,
+        delay: Union[int, str],
+    ) -> pd.DataFrame:
         server_ids = await self._list_matching_os_alpha_ids(
             instrument_type, region, universe, delay
         )
-        if exclude_id:
-            server_ids = [aid for aid in server_ids if aid != exclude_id]
 
         # Load existing cache and drop removed alphas (closed-loop cleanup)
         local_pool = pd.DataFrame()
@@ -2258,14 +2754,17 @@ class BrainApiClient:
         await self.ensure_authenticated()
 
         try:
-            # Target alpha PnL: always fresh
-            target_pnl_data = await self.get_alpha_pnl(alpha_id)
+            # Target alpha PnL is always fresh; details are needed only for the
+            # market-configuration key. Fetch both independent endpoints at once.
+            target_pnl_data, target_details = await asyncio.gather(
+                self.get_alpha_pnl(alpha_id),
+                self.get_alpha_details(alpha_id),
+            )
             target_series = self._pnl_response_to_series(alpha_id, target_pnl_data)
             if target_series is None:
                 self.log(f"Could not parse PnL for target alpha {alpha_id}", "WARNING")
                 return {}
 
-            target_details = await self.get_alpha_details(alpha_id)
             target_settings = target_details.get('settings', {})
             instrument_type = target_settings.get('instrumentType')
             region = target_settings.get('region')
@@ -2291,8 +2790,11 @@ class BrainApiClient:
                 self.log(f"No OS alphas available; self-correlation for {alpha_id} is 0", "INFO")
                 return {'max': 0.0, 'records': [], 'local_calculation': True, 'pool_size': 0}
 
-            # Combine target with pool, forward-fill gaps, diff -> daily returns
-            combined = pd.concat([os_pool, target_series.to_frame()], axis=1).ffill()
+            # Combine target with pool, forward-fill gaps, diff -> daily returns.
+            # Use a synthetic target column so any stale cached column with the
+            # same alpha id cannot create duplicate labels.
+            target_col = f"__target__{alpha_id}"
+            combined = pd.concat([os_pool, target_series.rename(target_col).to_frame()], axis=1).ffill()
             rets = combined.diff()
             if rets.empty:
                 return {'max': 0.0, 'records': [], 'local_calculation': True, 'pool_size': os_pool.shape[1]}
@@ -2300,11 +2802,17 @@ class BrainApiClient:
             last_date = rets.index.max()
             rets = rets[rets.index > last_date - pd.DateOffset(years=4)]
 
-            corr_matrix = rets.corr()
-            if alpha_id not in corr_matrix.columns:
+            if target_col not in rets.columns:
                 return {'max': 0.0, 'records': [], 'local_calculation': True, 'pool_size': os_pool.shape[1]}
 
-            sc_series = corr_matrix[alpha_id].drop(alpha_id, errors='ignore').dropna()
+            target_rets = rets[target_col]
+            pool_rets = rets.drop(columns=[target_col], errors='ignore')
+            if pool_rets.empty:
+                return {'max': 0.0, 'records': [], 'local_calculation': True, 'pool_size': os_pool.shape[1]}
+
+            # Compute only target-vs-pool correlations instead of the full N x N
+            # matrix; this is the hot path when the OS pool is large.
+            sc_series = pool_rets.corrwith(target_rets).dropna()
             max_corr = float(sc_series.max()) if not sc_series.empty else 0.0
 
             records = [
@@ -2328,185 +2836,57 @@ class BrainApiClient:
             self.log(f"Failed to calculate self-correlation locally: {str(e)}", "ERROR")
             raise
 
-    async def get_platform_self_correlation(
-        self,
-        alpha_id: str,
-        max_wait_seconds: int = 600,
-        poll_interval: int = 15,
-    ) -> Dict[str, Any]:
-        """Fetch the platform-computed self-correlation from the BRAIN API.
-
-        Calls ``/alphas/{alpha_id}/correlations/self`` and polls while the
-        platform is still computing (empty body / HTTP 202). Returns the raw
-        response dict (typically ``{'max': ..., 'records': [...]}``) or
-        ``{'status': 'pending', ...}`` if the data never materialises within
-        ``max_wait_seconds``.
-        """
-        await self.ensure_authenticated()
-
-        start_time = time.time()
-        attempt = 0
-        consecutive_empty = 0
-        consecutive_network_failures = 0
-
-        while True:
-            elapsed = time.time() - start_time
-            if elapsed >= max_wait_seconds:
-                self.log(f"[SC平台] Timeout after {int(elapsed)}s for {alpha_id}", "WARNING")
-                return {
-                    'status': 'pending',
-                    'message': (
-                        f"Platform self-correlation for alpha {alpha_id} was not available "
-                        f"after {int(elapsed)}s of polling. Please retry later."
-                    ),
-                    'max': None,
-                    'records': [],
-                }
-
-            attempt += 1
-            try:
-                response = await self._request(
-                    'GET', f"{self.base_url}/alphas/{alpha_id}/correlations/self"
-                )
-                response.raise_for_status()
-
-                text = (response.text or "").strip()
-                if not text:
-                    consecutive_empty += 1
-                    await asyncio.sleep(poll_interval)
-                    continue
-
-                consecutive_empty = 0
-                try:
-                    data = response.json()
-                    if data and data.get('max') is not None:
-                        self.log(
-                            f"[SC平台] Alpha {alpha_id} max={data['max']} "
-                            f"(attempt {attempt}, {int(elapsed)}s)",
-                            "INFO",
-                        )
-                        return data
-                except json.JSONDecodeError:
-                    pass
-            except (requests.RequestException, ConnectionError, TimeoutError) as e:
-                consecutive_network_failures += 1
-                retry_delay = min(5 * consecutive_network_failures, poll_interval)
-                self.log(
-                    f"[SC平台] network failure {consecutive_network_failures} for {alpha_id}: {e}. "
-                    f"Retry in {retry_delay}s",
-                    "WARNING",
-                )
-                await asyncio.sleep(retry_delay)
-                continue
-
-            consecutive_network_failures = 0
-            await asyncio.sleep(poll_interval)
-
     async def check_self_correlation(
         self,
         alpha_id: str,
         threshold: float = 0.7,
-        tolerance: float = 0.05,
-        platform_max_wait_seconds: int = 600,
     ) -> Dict[str, Any]:
-        """Compute self-correlation locally AND fetch it from the BRAIN platform,
-        then cross-validate the two results.
+        """Compute self-correlation locally using the cached OS PnL pool.
 
         Args:
             alpha_id: Target alpha ID.
             threshold: Max-correlation threshold used for the pass/fail check.
-            tolerance: Absolute difference tolerance between local and platform
-                ``max`` considered "consistent".
-            platform_max_wait_seconds: How long to poll the platform endpoint
-                before giving up.
         """
         await self.ensure_authenticated()
 
-        # Run both computations concurrently.
-        local_task = asyncio.create_task(self.get_self_correlation(alpha_id))
-        platform_task = asyncio.create_task(
-            self.get_platform_self_correlation(
-                alpha_id, max_wait_seconds=platform_max_wait_seconds
-            )
-        )
-        local_res, platform_res = await asyncio.gather(
-            local_task, platform_task, return_exceptions=True
-        )
+        correlation_data = await self.get_self_correlation(alpha_id)
+        if not isinstance(correlation_data, dict) or not correlation_data:
+            return {
+                'alpha_id': alpha_id,
+                'threshold': threshold,
+                'max_correlation': None,
+                'passes_check': None,
+                'status': 'data_unavailable',
+                'message': 'Local self-correlation data is unavailable for this alpha.',
+                'correlation_data': correlation_data,
+            }
 
-        def _extract_max(res: Any) -> Tuple[Optional[float], Optional[str]]:
-            if isinstance(res, Exception):
-                return None, f"error: {res}"
-            if not isinstance(res, dict) or not res:
-                return None, "no_data"
-            if res.get('status') == 'pending':
-                return None, 'pending'
-            val = res.get('max')
-            if val is None:
-                return None, 'no_max'
-            try:
-                return float(val), None
-            except (TypeError, ValueError):
-                return None, 'invalid_max'
+        try:
+            max_correlation = float(correlation_data.get('max'))
+        except (TypeError, ValueError):
+            max_correlation = None
 
-        local_max, local_err = _extract_max(local_res)
-        platform_max, platform_err = _extract_max(platform_res)
-
-        local_passes = local_max is not None and local_max < threshold
-        platform_passes = platform_max is not None and platform_max < threshold
-
-        diff: Optional[float] = None
-        consistent: Optional[bool] = None
-        if local_max is not None and platform_max is not None:
-            diff = abs(local_max - platform_max)
-            consistent = diff <= tolerance
+        passes_check = max_correlation < threshold if max_correlation is not None else None
 
         return {
             'alpha_id': alpha_id,
             'threshold': threshold,
-            'tolerance': tolerance,
-            'local': {
-                'max': local_max,
-                'passes_check': local_passes if local_max is not None else None,
-                'error': local_err,
-                'data': None if isinstance(local_res, Exception) else local_res,
-            },
-            'platform': {
-                'max': platform_max,
-                'passes_check': platform_passes if platform_max is not None else None,
-                'error': platform_err,
-                'data': None if isinstance(platform_res, Exception) else platform_res,
-            },
-            'comparison': {
-                'abs_diff': diff,
-                'consistent': consistent,
-                'both_pass': (
-                    local_passes and platform_passes
-                    if (local_max is not None and platform_max is not None)
-                    else None
-                ),
-            },
+            'max_correlation': max_correlation,
+            'passes_check': passes_check,
+            'local_calculation': True,
+            'correlation_data': correlation_data,
         }
 
     async def check_correlation(self, alpha_id: str, correlation_type: str = "production", threshold: float = 0.7) -> Dict[str, Any]:
-        """ Only where all IS metrics PASS to Check alpha correlation, Check alpha correlation against production alphas, self alphas, or both."""
+        """ Only where all IS metrics PASS to Check alpha correlation, Check alpha correlation against production alphas, self alphas, or both.
+
+        Concurrency: production correlation hits BRAIN's per-account
+        single-concurrency endpoint. ``get_production_correlation`` uses a
+        fail-fast lock, so concurrent production checks return busy instead of
+        waiting. The ``self`` path is computed locally and is not gated here.
+        """
         await self.ensure_authenticated()
-        
-        if self.redis_client:
-            try:
-                lock_key = "rate_limit:check_correlation"
-                if not self.redis_client.set(lock_key, "locked", ex=180, nx=True):
-                    ttl = self.redis_client.ttl(lock_key)
-                    return {
-                        'alpha_id': alpha_id,
-                        'status': 'rate_limited',
-                        'message': f"Rate limit exceeded. Please wait {ttl} seconds before trying again.",
-                        'retry_after': ttl,
-                        'correlation_type': correlation_type,
-                        'threshold': threshold
-                    }
-            except Exception as e:
-                self.log(f"Rate limiting for check_correlation failed, proceeding without rate limit: {str(e)}", "WARNING")
-        
+
         try:
             results = {
                 'alpha_id': alpha_id,
@@ -2540,6 +2920,21 @@ class BrainApiClient:
                         results['all_passed'] = None
                         results['status'] = 'pending'
                         results['message'] = correlation_data.get('message', '')
+                        return results
+
+                    if correlation_data and correlation_data.get('status') == 'correlation_busy':
+                        results['checks'][check_type] = {
+                            'max_correlation': None,
+                            'passes_check': None,
+                            'status': 'correlation_busy',
+                            'message': correlation_data.get('message', ''),
+                            'retry_after': correlation_data.get('retry_after'),
+                            'correlation_data': correlation_data,
+                        }
+                        results['all_passed'] = None
+                        results['status'] = 'correlation_busy'
+                        results['message'] = correlation_data.get('message', '')
+                        results['retry_after'] = correlation_data.get('retry_after')
                         return results
 
                     if (
@@ -2582,17 +2977,12 @@ class BrainApiClient:
                     continue
                 
                 # Analyze correlation data (self-correlation path)
-                if (
-                    correlation_data
-                    and isinstance(correlation_data.get('records'), list)
-                    and len(correlation_data['records']) > 0
-                    and correlation_data.get('max') is not None
-                ):
+                if correlation_data and correlation_data.get('max') is not None:
                     max_correlation = correlation_data['max']
                     passes_check = max_correlation < threshold
                 else:
-                    max_correlation = 0
-                    passes_check = False
+                    max_correlation = None
+                    passes_check = None
                 
                 results['checks'][check_type] = {
                     'max_correlation': max_correlation,
@@ -2600,7 +2990,7 @@ class BrainApiClient:
                     'correlation_data': correlation_data
                 }
                 
-                if not passes_check:
+                if passes_check is not True:
                     all_passed = False
             
             results['all_passed'] = all_passed
@@ -2738,10 +3128,32 @@ class BrainApiClient:
                 params["startDate"] = start_date
             if end_date:
                 params["endDate"] = end_date
-                
-            response = await self._request('GET', f"{self.base_url}/users/self/activities/pyramid-alphas", params=params)
+
+            cache_key = self._generate_cache_key('pyramid_alphas', params)
+            cached_data = self._get_cached_data(cache_key)
+            if cached_data:
+                return {**cached_data, 'from_cache': True}
+
+            try:
+                timeout_seconds = max(
+                    5,
+                    int(os.environ.get("BRAIN_PYRAMID_ALPHAS_TIMEOUT_SECONDS", "15")),
+                )
+            except Exception:
+                timeout_seconds = 15
+
+            response = await self._request(
+                'GET',
+                f"{self.base_url}/users/self/activities/pyramid-alphas",
+                params=params,
+                timeout=timeout_seconds,
+            )
             response.raise_for_status()
-            return response.json()
+            data = response.json() if response.text else {}
+            if isinstance(data, dict):
+                data['from_cache'] = False
+                self._set_cached_data(cache_key, data, ttl=3600)
+            return data
         except Exception as e:
             self.log(f"Failed to get pyramid alphas: {str(e)}", "ERROR")
             raise
@@ -3670,36 +4082,25 @@ async def check_correlation(alpha_id: str) -> Dict[str, Any]:
 async def check_self_correlation(
     alpha_id: str,
     threshold: float = 0.7,
-    tolerance: float = 0.05,
-    platform_max_wait_seconds: int = 600,
 ) -> Dict[str, Any]:
-    """Validate self-correlation by running the local incremental-cache
-    calculation AND calling the BRAIN platform's /correlations/self endpoint,
-    then comparing the two max values.
+    """Validate self-correlation with the local incremental-cache calculation.
 
-    Use this to audit the locally-computed self-correlation (which relies on a
-    cached OS PnL pool) against the platform's authoritative value.
+    This does not call the BRAIN /correlations/self endpoint, so it does not
+    consume the platform correlation slot or use the correlation lock.
 
     Args:
         alpha_id: Target alpha ID.
         threshold: Pass/fail threshold applied to each max correlation
             (passes when max < threshold). Default 0.7.
-        tolerance: Absolute difference allowed between local and platform max
-            for the two results to be reported as ``consistent``. Default 0.05.
-        platform_max_wait_seconds: Upper bound on how long to poll the BRAIN
-            platform endpoint while it computes. Default 600s.
 
     Returns:
-        Dict with ``local``, ``platform``, and ``comparison`` sections; the
-        ``comparison.consistent`` flag indicates whether the two results agree
-        within ``tolerance``.
+        Dict with the local max self-correlation, pass/fail result, and top
+        correlated OS alpha records from the local cache.
     """
     try:
         return await brain_client.check_self_correlation(
             alpha_id,
             threshold=threshold,
-            tolerance=tolerance,
-            platform_max_wait_seconds=platform_max_wait_seconds,
         )
     except Exception as e:
         return {"error": str(e)}
@@ -3800,19 +4201,21 @@ async def recommend_datasets(
     top_n: int = 20,
 ) -> Dict[str, Any]:
     """
-    Recommend datasets for alpha construction based on three dimensions:
+    Recommend datasets for alpha construction with unlit pyramid priority:
     
-    1. **Pyramid lighting (点塔)**: Prioritizes data categories not yet lit (need 3 alphas per category
-       to light up). Encourages uniform coverage across all categories.
-    2. **Submission distribution**: Favors datasets with fewer submitted alphas this quarter,
-       encouraging diversification across different datasets.
-    3. **Dataset quality**: Ranks by OS/IS Sharpe ratio from historical aggregated data.
-       Higher Sharpe = better quality dataset.
+    1. **Pyramid lighting (点塔)**: Uses the pyramid-alphas and pyramid-multipliers
+       endpoints. Unlit pyramids (fewer than 3 alphas) are recommended first.
+    2. **Dataset quality**: Ranks datasets by OS/IS Sharpe within the same pyramid.
+    3. **Dataset popularity**: Favors datasets with more platform users and more
+       submitted alphas (dataset userCount and alphaCount).
+    4. **Randomness**: Adds a small random score so recommendations keep some variety.
     
-    Each dataset gets a score (0~100):
-    - Pyramid lighting: 0~40 pts (unlit categories get highest priority)
-    - Submission distribution: 0~30 pts (less-used datasets get priority)
-    - Dataset quality: 0~30 pts (higher OS/IS Sharpe = better)
+    Each dataset gets a score (0~95):
+    - Pyramid lighting: 0~40 pts
+    - Dataset quality: 0~30 pts
+    - Dataset users: 0~10 pts
+    - Dataset submissions: 0~10 pts
+    - Randomness: 0~5 pts
     
     Args:
         region: Market region (e.g., "USA", "CHN", "EUR", "ASI", "GLB")
@@ -3821,7 +4224,8 @@ async def recommend_datasets(
         top_n: Number of top recommendations to return (default 20)
     
     Returns:
-        Ranked dataset recommendations with scores and pyramid status summary
+        Ranked dataset recommendations with scores, pyramid status summary,
+        and neutralization options for the selected region/delay/universe.
     """
     try:
         return await brain_client.recommend_datasets(region, delay, universe, top_n)
