@@ -817,72 +817,79 @@ class BrainApiClient:
             
             self.log(f"Simulation created with ID: {simulation_id}", "SUCCESS")
 
-            start_time = time.time()
-            timeout_seconds = 1800  # 10 minutes
-            max_poll_retries = 5  # Max retries for transient connection errors during polling
-            poll_retry_delay = 3  # Initial delay between poll retries
+            # start_time = time.time()
+            # timeout_seconds = 1800  # 10 minutes
+            # max_poll_retries = 5  # Max retries for transient connection errors during polling
+            # poll_retry_delay = 3  # Initial delay between poll retries
 
-            simulation_progress = None
-            while True:
-                # Check for timeout
-                if time.time() - start_time > timeout_seconds:
-                    raise TimeoutError(f"Simulation {simulation_id} timed out after {timeout_seconds} seconds")
+            # simulation_progress = None
+            # while True:
+            #     # Check for timeout
+            #     if time.time() - start_time > timeout_seconds:
+            #         raise TimeoutError(f"Simulation {simulation_id} timed out after {timeout_seconds} seconds")
 
-                # Poll with retry logic for transient network errors
-                poll_error = None
-                for poll_attempt in range(max_poll_retries):
-                    try:
-                        simulation_progress = await self._request('GET', location_url)
-                        poll_error = None
-                        break  # Success, exit retry loop
-                    except (ConnectionError, TimeoutError) as e:
-                        poll_error = e
-                        if poll_attempt < max_poll_retries - 1:
-                            retry_wait = poll_retry_delay * (1.5 ** poll_attempt)
-                            self.log(f"⚠️ Polling connection error for {simulation_id} (attempt {poll_attempt + 1}/{max_poll_retries}), retrying in {retry_wait:.1f}s: {str(e)}", "WARNING")
-                            await asyncio.sleep(retry_wait)
-                        else:
-                            self.log(f"❌ Polling failed after {max_poll_retries} attempts for {simulation_id}: {str(e)}", "ERROR")
+            #     # Poll with retry logic for transient network errors
+            #     poll_error = None
+            #     for poll_attempt in range(max_poll_retries):
+            #         try:
+            #             simulation_progress = await self._request('GET', location_url)
+            #             poll_error = None
+            #             break  # Success, exit retry loop
+            #         except (ConnectionError, TimeoutError) as e:
+            #             poll_error = e
+            #             if poll_attempt < max_poll_retries - 1:
+            #                 retry_wait = poll_retry_delay * (1.5 ** poll_attempt)
+            #                 self.log(f"⚠️ Polling connection error for {simulation_id} (attempt {poll_attempt + 1}/{max_poll_retries}), retrying in {retry_wait:.1f}s: {str(e)}", "WARNING")
+            #                 await asyncio.sleep(retry_wait)
+            #             else:
+            #                 self.log(f"❌ Polling failed after {max_poll_retries} attempts for {simulation_id}: {str(e)}", "ERROR")
                 
-                if poll_error:
-                    raise poll_error
+            #     if poll_error:
+            #         raise poll_error
                 
-                # Check if we need to wait
-                retry_after = simulation_progress.headers.get("Retry-After")
+            #     # Check if we need to wait
+            #     retry_after = simulation_progress.headers.get("Retry-After")
                 
-                if not retry_after or float(retry_after) == 0:
-                    break
+            #     if not retry_after or float(retry_after) == 0:
+            #         break
                 
-                wait_time = float(retry_after)
-                # Use asyncio.sleep instead of time.sleep to avoid blocking
-                await asyncio.sleep(wait_time)
+            #     wait_time = float(retry_after)
+            #     # Use asyncio.sleep instead of time.sleep to avoid blocking
+            #     await asyncio.sleep(wait_time)
 
-            self.log("Alpha done simulating, getting alpha details", "INFO")
+            # self.log("Alpha done simulating, getting alpha details", "INFO")
             
-            progress_data = simulation_progress.json()
-            if "alpha" not in progress_data:
-                # Handle error case where alpha ID is missing
-                error_message = progress_data.get("message", "Unknown error")
-                raise Exception(f"Simulation failed or returned no alpha ID. Details: {error_message}")
+            # progress_data = simulation_progress.json()
+            # if "alpha" not in progress_data:
+            #     # Handle error case where alpha ID is missing
+            #     error_message = progress_data.get("message", "Unknown error")
+            #     raise Exception(f"Simulation failed or returned no alpha ID. Details: {error_message}")
                 
-            alpha_id = progress_data["alpha"]
+            # alpha_id = progress_data["alpha"]
             
-            # Fetch alpha details with retry logic
-            alpha_response = None
-            for alpha_attempt in range(max_poll_retries):
-                try:
-                    alpha_response = await self._request('GET', f"https://api.worldquantbrain.com/alphas/{alpha_id}")
-                    break
-                except (ConnectionError, TimeoutError) as e:
-                    if alpha_attempt < max_poll_retries - 1:
-                        retry_wait = poll_retry_delay * (1.5 ** alpha_attempt)
-                        self.log(f"⚠️ Failed to fetch alpha details (attempt {alpha_attempt + 1}/{max_poll_retries}), retrying in {retry_wait:.1f}s: {str(e)}", "WARNING")
-                        await asyncio.sleep(retry_wait)
-                    else:
-                        self.log(f"❌ Failed to fetch alpha details after {max_poll_retries} attempts: {str(e)}", "ERROR")
-                        raise
+            # # Fetch alpha details with retry logic
+            # alpha_response = None
+            # for alpha_attempt in range(max_poll_retries):
+            #     try:
+            #         alpha_response = await self._request('GET', f"https://api.worldquantbrain.com/alphas/{alpha_id}")
+            #         break
+            #     except (ConnectionError, TimeoutError) as e:
+            #         if alpha_attempt < max_poll_retries - 1:
+            #             retry_wait = poll_retry_delay * (1.5 ** alpha_attempt)
+            #             self.log(f"⚠️ Failed to fetch alpha details (attempt {alpha_attempt + 1}/{max_poll_retries}), retrying in {retry_wait:.1f}s: {str(e)}", "WARNING")
+            #             await asyncio.sleep(retry_wait)
+            #         else:
+            #             self.log(f"❌ Failed to fetch alpha details after {max_poll_retries} attempts: {str(e)}", "ERROR")
+            #             raise
             
-            return alpha_response.json()
+            # return alpha_response.json()
+
+            return {
+                "success": True,
+                "message": "Simulation submitted successfully. Use lookINTO_SimError_message to poll for completion.",
+                "id": simulation_id,
+                "location": location
+            }
             
         except Exception as e:
             self.log(f"❌ Failed to create simulation: {str(e)}", "ERROR")
@@ -4305,216 +4312,236 @@ async def get_documentation_page(page_id: str) -> Dict[str, Any]:
 
 @mcp.tool()
 async def create_multi_simulation(
-    alpha_expressions: List[str],
-    instrument_type: str = "EQUITY",
-    region: str = "USA",
-    universe: str = "TOP3000",
-    delay: int = 1,
-    decay: int = 4,
-    neutralization: str = "INDUSTRY",
-    truncation: float = 0.0,
-    test_period: str = "P0Y0M",
-    unit_handling: str = "VERIFY",
-    nan_handling: str = "OFF",
-    language: str = "FASTEXPR",
-    visualization: bool = False,
-    pasteurization: str = "ON",
-    max_trade: str = "OFF"
+    alpha_expressions_with_settings: Optional[List[SimulationData]] = None
 ) -> Dict[str, Any]:
     """
-    🚀 Create multiple regular alpha simulations on BRAIN platform in a single request.
-    
-    This tool creates a multisimulation with multiple regular alpha expressions,
-    waits for all simulations to complete, and returns detailed results for each alpha.
-    
-    ⏰ NOTE: Multisimulations can take 8+ minutes to complete. This tool will wait
-    for the entire process and return comprehensive results.
-    Call get_platform_setting_options to get the valid options for the simulation.
-    Args:
-        alpha_expressions: List of alpha expressions (2-8 expressions required)
-        instrument_type: Type of instruments (default: "EQUITY")
-        region: Market region (default: "USA")
-        universe: Universe of stocks (default: "TOP3000")
-        delay: Data delay (default: 1)
-        decay: Decay value (default: 4)
-        neutralization: Neutralization method (default: "NONE")
-        truncation: Truncation value (default: 0.0)
-        test_period: Test period (default: "P0Y0M")
-        unit_handling: Unit handling method (default: "VERIFY")
-        nan_handling: NaN handling method (default: "OFF")
-        language: Expression language (default: "FASTEXPR")
-        visualization: Enable visualization (default: False)
-        pasteurization: Pasteurization setting (default: "ON")
-        max_trade: Max trade setting (default: "OFF")
-    
-    Returns:
-        Dictionary containing multisimulation results and individual alpha details
-    """
+        🚀 Create multiple regular alpha simulations on BRAIN platform in a single request.
+
+        This tool creates a multisimulation with multiple regular alpha expressions.
+        It returns immediately after the multisimulation is submitted successfully.
+        Use lookINTO_SimError_message with the returned location (multi=True) to poll for completion.
+        Call get_platform_setting_options to get the valid options for the simulation.
+
+        Args:
+            alpha_expressions_with_settings: List of dicts, each representing one alpha simulation.
+                Each dict must contain exactly three keys:
+                - "type": Always "REGULAR"
+                - "settings": Dict of simulation settings (camelCase keys)
+                - "regular": Alpha expression string
+
+                The "settings" dict supports the following keys (all camelCase):
+                - instrumentType (str): Instrument type, e.g. "EQUITY"
+                - region (str): Market region, e.g. "USA", "EUR", "ASI", "CHN"
+                - universe (str): Stock universe, e.g. "TOP3000", "TOP500", "TOPCS1600"
+                - delay (int): Data delay, 0 or 1
+                - decay (float): Decay value, e.g. 0, 4, 6, 8, 10
+                - neutralization (str): Neutralization method, e.g. "NONE", "MARKET", "SUBINDUSTRY", "INDUSTRY", "SECTOR"
+                - truncation (float): Truncation value, e.g. 0.0, 0.01, 0.08
+                - unitHandling (str): "VERIFY" or "IGNORE"
+                - nanHandling (str): "ON" or "OFF"
+                - pasteurization (str): "ON" or "OFF"
+                - language (str): Expression language, e.g. "FASTEXPR"
+                - visualization (bool): Enable visualization
+                - testPeriod (str): Test period, e.g. "P0D", "P0Y0M"
+                - maxTrade (str): "ON" or "OFF"
+                - maxPosition (str): "ON" or "OFF"
+
+                Example:
+                    [
+                        {
+                            "type": "REGULAR",
+                            "settings": {
+                                "instrumentType": "EQUITY",
+                                "region": "EUR",
+                                "universe": "TOPCS1600",
+                                "delay": 1,
+                                "decay": 0,
+                                "neutralization": "MARKET",
+                                "truncation": 0.01,
+                                "unitHandling": "VERIFY",
+                                "nanHandling": "ON",
+                                "pasteurization": "ON",
+                                "language": "FASTEXPR",
+                                "visualization": true,
+                                "testPeriod": "P0D",
+                                "maxTrade": "ON",
+                                "maxPosition": "OFF"
+                            },
+                            "regular": "rank(ts_delta(close, 5))"
+                        }
+                    ]
+
+        Returns:
+            Dictionary containing multisimulation submission result with location and simulation_id
+        """
     try:
         # Validate input
-        if len(alpha_expressions) < 2:
+        if len(alpha_expressions_with_settings) < 2:
             return {"error": "At least 2 alpha expressions are required"}
-        if len(alpha_expressions) > 8:
+        if len(alpha_expressions_with_settings) > 8:
             return {"error": "Maximum 8 alpha expressions allowed per request"}
-        
-        # Create multisimulation data
-        multisimulation_data = []
-        for alpha_expr in alpha_expressions:
-            simulation_item = {
-                'type': 'REGULAR',
-                'settings': {
-                    'instrumentType': instrument_type,
-                    'region': region,
-                    'universe': universe,
-                    'delay': delay,
-                    'decay': decay,
-                    'neutralization': neutralization,
-                    'truncation': truncation,
-                    'pasteurization': pasteurization,
-                    'unitHandling': unit_handling,
-                    'nanHandling': nan_handling,
-                    'language': language,
-                    'visualization': visualization,
-                    'testPeriod': test_period,
-                    'maxTrade': max_trade 
-                },
-                'regular': alpha_expr
-            }
-            multisimulation_data.append(simulation_item)
-        
+        total_requested = len(alpha_expressions_with_settings)
+        await brain_client.ensure_authenticated()
+        # Convert Pydantic models to dicts for JSON serialization
+        payload = []
+        for item in alpha_expressions_with_settings:
+            if hasattr(item, 'model_dump'):
+                d = item.model_dump(by_alias=True)
+            elif hasattr(item, 'dict'):
+                d = item.dict(by_alias=True)
+            else:
+                d = item
+            # For REGULAR type, remove fields not allowed by BRAIN API
+            if d.get('type') == 'REGULAR':
+                settings = d.get('settings', {})
+                for key in ('selectionHandling', 'selectionLimit', 'componentActivation'):
+                    settings.pop(key, None)
+                d.pop('combo', None)
+                d.pop('selection', None)
+            payload.append(d)
         # Send multisimulation request
-        response = brain_client.session.post(f"{brain_client.base_url}/simulations", json=multisimulation_data)
+        print(f"Multisim payload[0]: {payload[0] if payload else 'empty'}", "DEBUG")
+        response = brain_client.session.post(f"{brain_client.base_url}/simulations", json=payload)
         
         if response.status_code != 201:
-            return {"error": f"Failed to create multisimulation. Status: {response.status_code}"}
+            try:
+                error_detail = response.json()
+            except Exception:
+                error_detail = response.text[:500]
+            return {"error": f"Failed to create multisimulation. Status: {response.status_code}, Detail: {error_detail}"}
         
         # Get multisimulation location
         location = response.headers.get('Location', '')
         if not location:
-            return {"error": "No location header in multisimulation response"}
+            return {"success": False, "message": "No location header in multisimulation response"}
         
-        # Wait for children to appear and get results
-        return await _wait_for_multisimulation_completion(location, len(alpha_expressions))
+        simulation_id = location.rstrip('/').split('/')[-1]
+        return {
+            "success": True,
+            "message": "Multisimulation submitted successfully. Use lookINTO_SimError_message to poll for completion.",
+            "id": simulation_id,
+            "location": location
+        }
         
     except Exception as e:
         return {"error": f"Error creating multisimulation: {str(e)}"}
 
-async def _wait_for_multisimulation_completion(location: str, expected_children: int) -> Dict[str, Any]:
-    """Wait for multisimulation to complete and return results"""
-    try:
-        # Simple progress indicator for users
-        print(f"Waiting for multisimulation to complete... (this may take several minutes)", file=sys.stderr)
-        print(f"Expected {expected_children} alpha simulations", file=sys.stderr)
-        print("", file=sys.stderr)
-        # Wait for children to appear - much more tolerant for 8+ minute multisimulations
-        children = []
-        max_wait_attempts = 200  # Increased significantly for 8+ minute multisimulations
-        wait_attempt = 0
+# async def _wait_for_multisimulation_completion(location: str, expected_children: int) -> Dict[str, Any]:
+#     """Wait for multisimulation to complete and return results"""
+#     try:
+#         # Simple progress indicator for users
+#         print(f"Waiting for multisimulation to complete... (this may take several minutes)", file=sys.stderr)
+#         print(f"Expected {expected_children} alpha simulations", file=sys.stderr)
+#         print("", file=sys.stderr)
+#         # Wait for children to appear - much more tolerant for 8+ minute multisimulations
+#         children = []
+#         max_wait_attempts = 200  # Increased significantly for 8+ minute multisimulations
+#         wait_attempt = 0
         
-        while wait_attempt < max_wait_attempts and len(children) == 0:
-            wait_attempt += 1
+#         while wait_attempt < max_wait_attempts and len(children) == 0:
+#             wait_attempt += 1
             
-            try:
-                multisim_response = await brain_client._request('GET', location)
-                if multisim_response.status_code == 200:
-                    multisim_data = multisim_response.json()
-                    children = multisim_data.get('children', [])
+#             try:
+#                 multisim_response = await brain_client._request('GET', location)
+#                 if multisim_response.status_code == 200:
+#                     multisim_data = multisim_response.json()
+#                     children = multisim_data.get('children', [])
                     
-                    if children:
-                        break
-                    else:
-                        # Wait before next attempt - use longer intervals for multisimulations
-                        retry_after = multisim_response.headers.get("Retry-After", 5)
-                        wait_time = float(retry_after)
-                        await asyncio.sleep(wait_time)
-            except Exception as e:
-                await asyncio.sleep(5)
+#                     if children:
+#                         break
+#                     else:
+#                         # Wait before next attempt - use longer intervals for multisimulations
+#                         retry_after = multisim_response.headers.get("Retry-After", 5)
+#                         wait_time = float(retry_after)
+#                         await asyncio.sleep(wait_time)
+#             except Exception as e:
+#                 await asyncio.sleep(5)
         
-        if not children:
-            return {"error": f"Children did not appear within {max_wait_attempts} attempts (multisimulation may still be processing)"}
+#         if not children:
+#             return {"error": f"Children did not appear within {max_wait_attempts} attempts (multisimulation may still be processing)"}
         
-        # Process each child to get alpha results
-        alpha_results = []
-        for i, child_id in enumerate(children):
-            try:
-                # The children are full URLs, not just IDs
-                child_url = child_id if child_id.startswith('http') else f"{brain_client.base_url}/simulations/{child_id}"
+#         # Process each child to get alpha results
+#         alpha_results = []
+#         for i, child_id in enumerate(children):
+#             try:
+#                 # The children are full URLs, not just IDs
+#                 child_url = child_id if child_id.startswith('http') else f"{brain_client.base_url}/simulations/{child_id}"
                 
-                # Wait for this alpha to complete - more tolerant timing
-                finished = False
-                max_alpha_attempts = 100  # Increased for longer alpha processing
-                alpha_attempt = 0
+#                 # Wait for this alpha to complete - more tolerant timing
+#                 finished = False
+#                 max_alpha_attempts = 100  # Increased for longer alpha processing
+#                 alpha_attempt = 0
                 
-                while not finished and alpha_attempt < max_alpha_attempts:
-                    alpha_attempt += 1
+#                 while not finished and alpha_attempt < max_alpha_attempts:
+#                     alpha_attempt += 1
                     
-                    try:
-                        alpha_progress = await brain_client._request('GET', child_url)
-                        if alpha_progress.status_code == 200:
-                            alpha_data = alpha_progress.json()
-                            retry_after = alpha_progress.headers.get("Retry-After", 0)
+#                     try:
+#                         alpha_progress = await brain_client._request('GET', child_url)
+#                         if alpha_progress.status_code == 200:
+#                             alpha_data = alpha_progress.json()
+#                             retry_after = alpha_progress.headers.get("Retry-After", 0)
                             
-                            if retry_after == 0:
-                                finished = True
-                                break
-                            else:
-                                wait_time = float(retry_after)
-                                await asyncio.sleep(wait_time)
-                        else:
-                            await asyncio.sleep(5)
-                    except Exception as e:
-                        await asyncio.sleep(5)
+#                             if retry_after == 0:
+#                                 finished = True
+#                                 break
+#                             else:
+#                                 wait_time = float(retry_after)
+#                                 await asyncio.sleep(wait_time)
+#                         else:
+#                             await asyncio.sleep(5)
+#                     except Exception as e:
+#                         await asyncio.sleep(5)
                 
-                if finished:
-                    # Get alpha details from the completed simulation
-                    alpha_id = alpha_data.get("alpha")
-                    if alpha_id:
-                        # Now get the actual alpha details from the alpha endpoint
-                        alpha_details = await brain_client._request('GET', f"{brain_client.base_url}/alphas/{alpha_id}")
-                        if alpha_details.status_code == 200:
-                            alpha_detail_data = alpha_details.json()
-                            alpha_results.append({
-                                'alpha_id': alpha_id,
-                                'location': child_url,
-                                'details': alpha_detail_data
-                            })
-                        else:
-                            alpha_results.append({
-                                'alpha_id': alpha_id,
-                                'location': child_url,
-                                'error': f'Failed to get alpha details: {alpha_details.status_code}'
-                            })
-                    else:
-                        alpha_results.append({
-                            'location': child_url,
-                            'error': 'No alpha ID found in completed simulation'
-                        })
-                else:
-                    alpha_results.append({
-                        'location': f"child_{i+1}",
-                        'error': f'Alpha simulation did not complete within {max_alpha_attempts} attempts'
-                    })
+#                 if finished:
+#                     # Get alpha details from the completed simulation
+#                     alpha_id = alpha_data.get("alpha")
+#                     if alpha_id:
+#                         # Now get the actual alpha details from the alpha endpoint
+#                         alpha_details = await brain_client._request('GET', f"{brain_client.base_url}/alphas/{alpha_id}")
+#                         if alpha_details.status_code == 200:
+#                             alpha_detail_data = alpha_details.json()
+#                             alpha_results.append({
+#                                 'alpha_id': alpha_id,
+#                                 'location': child_url,
+#                                 'details': alpha_detail_data
+#                             })
+#                         else:
+#                             alpha_results.append({
+#                                 'alpha_id': alpha_id,
+#                                 'location': child_url,
+#                                 'error': f'Failed to get alpha details: {alpha_details.status_code}'
+#                             })
+#                     else:
+#                         alpha_results.append({
+#                             'location': child_url,
+#                             'error': 'No alpha ID found in completed simulation'
+#                         })
+#                 else:
+#                     alpha_results.append({
+#                         'location': f"child_{i+1}",
+#                         'error': f'Alpha simulation did not complete within {max_alpha_attempts} attempts'
+#                     })
                     
-            except Exception as e:
-                alpha_results.append({
-                    'location': f"child_{i+1}",
-                    'error': str(e)
-                })
+#             except Exception as e:
+#                 alpha_results.append({
+#                     'location': f"child_{i+1}",
+#                     'error': str(e)
+#                 })
         
-        # Return comprehensive results
-        print(f"Multisimulation completed! Retrieved {len(alpha_results)} alpha results", file=sys.stderr)
-        return {
-            'success': True,
-            'message': f'Successfully created {expected_children} regular alpha simulations',
-            'total_requested': expected_children,
-            'total_created': len(alpha_results),
-            'multisimulation_id': location.split('/')[-1],
-            'multisimulation_location': location,
-            'alpha_results': alpha_results
-        }
+#         # Return comprehensive results
+#         print(f"Multisimulation completed! Retrieved {len(alpha_results)} alpha results", file=sys.stderr)
+#         return {
+#             'success': True,
+#             'message': f'Successfully created {expected_children} regular alpha simulations',
+#             'total_requested': expected_children,
+#             'total_created': len(alpha_results),
+#             'multisimulation_id': location.split('/')[-1],
+#             'multisimulation_location': location,
+#             'alpha_results': alpha_results
+#         }
         
-    except Exception as e:
-        return {"error": f"Error waiting for multisimulation completion: {str(e)}"}
+#     except Exception as e:
+#         return {"error": f"Error waiting for multisimulation completion: {str(e)}"}
 
 # --- Payment and Financial Tools ---
 
