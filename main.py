@@ -4409,7 +4409,6 @@ async def create_multi_simulation(
                 d.pop('selection', None)
             payload.append(d)
         # Send multisimulation request
-        self.log('DEBUG', f"Multisim payload[0]: {payload[0] if payload else 'empty'}", "DEBUG")
         response = brain_client.session.post(f"{brain_client.base_url}/simulations", json=payload)
         
         if response.status_code != 201:
