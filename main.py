@@ -39,6 +39,11 @@ from forum_functions import forum_client
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+def _log(level: str, message: str):
+    """Print log message with timestamp to stderr."""
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]
+    print(f"{timestamp} - {level} - {message}", file=sys.stderr)
+
 # Pydantic models for type safety
 class AuthCredentials(BaseModel):
     email: EmailStr
@@ -203,7 +208,7 @@ class BrainApiClient:
     
     def log(self, message: str, level: str = "INFO"):
         """Log messages to stderr to avoid MCP protocol interference."""
-        print(f"[{level}] {message}", file=sys.stderr)
+        _log(level, message)
     
     def _to_absolute_url(self, url: str) -> str:
         if not url:
@@ -886,7 +891,7 @@ class BrainApiClient:
 
             return {
                 "success": True,
-                "message": "Simulation submitted successfully. Use lookINTO_SimError_message to poll for completion.",
+                "message": "Simulation submitted successfully.  Backtest typically takes 3-15 minutes. Use lookINTO_SimError_message to poll for completion. Wait 3 minutes before first check, then poll every 15 seconds if not complete.",
                 "id": simulation_id,
                 "location": location
             }
@@ -2555,19 +2560,19 @@ class BrainApiClient:
 
     def _os_pnl_pool_path(
         self,
-        instrument_type: str,
+        # instrument_type: str,
         region: str,
-        universe: str,
-        delay: Union[int, str],
+        # universe: str,
+        # delay: Union[int, str],
     ) -> Path:
         """Return the on-disk cache path for a configuration-specific OS PnL pool."""
         cache_dir = Path(__file__).parent / 'downloads'
         cache_dir.mkdir(parents=True, exist_ok=True)
         safe_parts = [
-            str(instrument_type).strip().lower() or 'unknown',
+            # str(instrument_type).strip().lower() or 'unknown',
             str(region).strip().lower() or 'unknown',
-            str(universe).strip().lower() or 'unknown',
-            f"delay{delay}",
+            # str(universe).strip().lower() or 'unknown',
+            # f"delay{delay}",
         ]
         return cache_dir / f"os_pnl_pool_{'_'.join(safe_parts)}.pkl"
 
@@ -2589,10 +2594,7 @@ class BrainApiClient:
 
     async def _list_matching_os_alpha_ids(
         self,
-        instrument_type: str,
-        region: str,
-        universe: str,
-        delay: Union[int, str],
+        region: str
     ) -> List[str]:
         """Fetch OS alpha IDs that match the target alpha's market configuration.
 
@@ -2607,6 +2609,7 @@ class BrainApiClient:
         while True:
             params = {
                 'stage': 'OS',
+                'settings.region': region,
                 'limit': page_size,
                 'offset': offset,
                 'order': '-dateSubmitted',
@@ -2627,16 +2630,24 @@ class BrainApiClient:
             for alpha in results:
                 if not alpha.get('id'):
                     continue
-                settings = alpha.get('settings', {})
-                if settings.get('instrumentType') != instrument_type:
+                is_ppac = any(
+                    c.get('name') == 'Power Pool Alpha'
+                    for c in (alpha.get('classifications') or [])
+                )
+                if is_ppac:
                     continue
-                if settings.get('region') != region:
-                    continue
-                if settings.get('universe') != universe:
-                    continue
-                if str(settings.get('delay')) != str(delay):
-                    continue
+                # settings = alpha.get('settings', {})
+                # if settings.get('instrumentType') != instrument_type:
+                #     continue
+                # if settings.get('region') != region:
+                #     continue
+                # if settings.get('universe') != universe:
+                #     continue
+                # if str(settings.get('delay')) != str(delay):
+                #     continue
                 all_ids.append(alpha['id'])
+
+                
             if len(results) < page_size:
                 break
             offset += page_size
@@ -2644,10 +2655,10 @@ class BrainApiClient:
 
     async def sync_os_pnl_pool(
         self,
-        instrument_type: str,
+        # instrument_type: str,
         region: str,
-        universe: str,
-        delay: Union[int, str],
+        # universe: str,
+        # delay: Union[int, str],
         exclude_id: Optional[str] = None,
     ) -> pd.DataFrame:
         """Incrementally sync the matching OS alpha PnL pool cache on disk.
@@ -2660,7 +2671,7 @@ class BrainApiClient:
           (OS alpha PnL is effectively static, so old columns are reused).
         - Persist the merged pool back to disk and return it.
         """
-        pool_path = self._os_pnl_pool_path(instrument_type, region, universe, delay)
+        pool_path = self._os_pnl_pool_path(region)
         pool_lock = await self._get_os_pnl_pool_lock(pool_path)
         async with pool_lock:
             pool_key = str(pool_path)
@@ -2673,10 +2684,10 @@ class BrainApiClient:
 
             synced_pool = await self._sync_os_pnl_pool_unlocked(
                 pool_path=pool_path,
-                instrument_type=instrument_type,
+                # instrument_type=instrument_type,
                 region=region,
-                universe=universe,
-                delay=delay,
+                # universe=universe,
+                # delay=delay,
             )
             self._os_pnl_pool_last_sync[pool_key] = (time.time(), synced_pool)
             return self._exclude_os_pnl_target(synced_pool, exclude_id)
@@ -2684,14 +2695,12 @@ class BrainApiClient:
     async def _sync_os_pnl_pool_unlocked(
         self,
         pool_path: Path,
-        instrument_type: str,
+        # instrument_type: str,
         region: str,
-        universe: str,
-        delay: Union[int, str],
+        # universe: str,
+        # delay: Union[int, str],
     ) -> pd.DataFrame:
-        server_ids = await self._list_matching_os_alpha_ids(
-            instrument_type, region, universe, delay
-        )
+        server_ids = await self._list_matching_os_alpha_ids(region)
 
         # Load existing cache and drop removed alphas (closed-loop cleanup)
         local_pool = pd.DataFrame()
@@ -2773,11 +2782,11 @@ class BrainApiClient:
                 return {}
 
             target_settings = target_details.get('settings', {})
-            instrument_type = target_settings.get('instrumentType')
+            # instrument_type = target_settings.get('instrumentType')
             region = target_settings.get('region')
-            universe = target_settings.get('universe')
-            delay = target_settings.get('delay')
-            if not all([instrument_type, region, universe]) or delay is None:
+            # universe = target_settings.get('universe')
+            # delay = target_settings.get('delay')
+            if region is None:
                 self.log(
                     f"Missing target settings for self-correlation on {alpha_id}: {target_settings}",
                     "WARNING",
@@ -2786,10 +2795,10 @@ class BrainApiClient:
 
             # Sync only the OS pool matching the target alpha's market configuration.
             os_pool = await self.sync_os_pnl_pool(
-                instrument_type=instrument_type,
+                # instrument_type=instrument_type,
                 region=region,
-                universe=universe,
-                delay=delay,
+                # universe=universe,
+                # delay=delay,
                 exclude_id=alpha_id,
             )
 
@@ -4400,7 +4409,7 @@ async def create_multi_simulation(
                 d.pop('selection', None)
             payload.append(d)
         # Send multisimulation request
-        print(f"Multisim payload[0]: {payload[0] if payload else 'empty'}", "DEBUG")
+        self.log('DEBUG', f"Multisim payload[0]: {payload[0] if payload else 'empty'}", "DEBUG")
         response = brain_client.session.post(f"{brain_client.base_url}/simulations", json=payload)
         
         if response.status_code != 201:
@@ -4418,7 +4427,7 @@ async def create_multi_simulation(
         simulation_id = location.rstrip('/').split('/')[-1]
         return {
             "success": True,
-            "message": "Multisimulation submitted successfully. Use lookINTO_SimError_message to poll for completion.",
+            "message": "Multisimulation submitted successfully.  Backtest typically takes 3-15 minutes. Use lookINTO_SimError_message to poll for completion. Wait 3 minutes before first check, then poll every 15 seconds if not complete.",
             "id": simulation_id,
             "location": location
         }
@@ -4639,19 +4648,19 @@ async def lookINTO_SimError_message(locations: Sequence[str]) -> dict:
 
 # --- Main entry point ---
 if __name__ == "__main__":
-    print("running the server", file=sys.stderr)
+    _log("INFO", "Running the server")
     
     # Validate critical environment setup
     config = load_config()
     creds = config.get("credentials", {})
     if not creds.get("email") or not creds.get("password"):
-        print("[WARNING] No BRAIN credentials found in config. Authentication will fail until credentials are provided.", file=sys.stderr)
+        _log("WARNING", "No BRAIN credentials found in config. Authentication will fail until credentials are provided.")
     
     # Verify Redis connectivity
     if brain_client.redis_client:
-        print("[INFO] Redis connection established successfully", file=sys.stderr)
+        _log("INFO", "Redis connection established successfully")
     else:
-        print("[WARNING] Redis connection failed - caching disabled", file=sys.stderr)
+        _log("WARNING", "Redis connection failed - caching disabled")
     
     # Run using Streamable HTTP transport in container environment so the server remains
     # running and accessible over HTTP (not stdio which exits in non-interactive containers).
