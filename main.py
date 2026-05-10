@@ -4392,7 +4392,7 @@ async def create_multi_simulation(
         # All alphas type must be REGULAR
         if not all(item.get('type') == 'REGULAR' for item in alpha_expressions_with_settings):
             return {"error": "All alpha expressions must be of type REGULAR"}
-        # All alpha expressions must have the same delay
+        # All alpha expressions must have the same delay。
         if not all(item.get('settings', {}).get('delay') == alpha_expressions_with_settings[0].get('settings', {}).get('delay') for item in alpha_expressions_with_settings):
             return {"error": "All alpha expressions must have the same delay"}
         # Log debug info
