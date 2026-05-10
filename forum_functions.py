@@ -1,40 +1,56 @@
 #!/usr/bin/env python3
 """
-WorldQuant BRAIN Forum Functions - Python Version
-Comprehensive forum functionality including glossary, search, and post viewing using Playwright.
+WorldQuant BRAIN Forum Functions - Optimized Version
+Comprehensive forum functionality using BRAIN session for Zendesk SSO.
 """
 
+from __future__ import annotations
+
 import asyncio
+import os
 import re
 import sys
-import time
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Dict, List
 
-def log(message: str, level: str = "INFO"):
-    """Log message with timestamp."""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] [{level}] {message}", file=sys.stderr)
+# Constants
+ZENDESK_BASE_URL = "https://support.worldquantbrain.com"
+GLOSSARY_ARTICLE_ID = "4902349883927"
+SNIPPET_LENGTH = 300
 
-try:
-    from playwright.async_api import async_playwright
-except ImportError:
-    log("Playwright not installed. Please install it with: pip install playwright", "ERROR")
-    async_playwright = None
+# Navigation patterns (compiled once for performance)
+_NAVIGATION_PATTERNS = tuple(
+    re.compile(p) for p in [
+        r'^\d+ days? ago$',
+        r'~\d+ minute read',
+        r'^Follow$',
+        r'^Not yet followed$',
+        r'^Updated$',
+        r'^AS\d+$',
+        r'^[A-Z] - [A-Z] - [A-Z]',
+        r'^[A-Z]$',
+    ]
+)
+_DEFINITION_STARTERS = frozenset([
+    'the', 'a', 'an', 'this', 'that', 'it', 'is', 'are', 'was', 'were',
+    'for', 'to', 'in', 'on', 'at', 'by', 'with', 'of', 'from'
+])
 
-from bs4 import BeautifulSoup
-import requests
-import os
+def _log(level: str, message: str) -> None:
+    """Unified logging with timestamp matching main.py format."""
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]
+    print(f"{timestamp} - {level} - {message}", file=sys.stderr)
 
 
-_BROWSER_PATH_CACHE = None
-_BROWSER_PATH_CHECKED = False
-
-
+@lru_cache(maxsize=128)
 def _html_to_text(html: str) -> str:
-    """Convert forum HTML fragments to readable plain text."""
+    """Convert HTML to plain text with caching for repeated content."""
     if not html:
         return ""
+    # Delay import for performance
+    from bs4 import BeautifulSoup
     soup = BeautifulSoup(html, 'html.parser')
     text = soup.get_text(separator='\n')
     lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -42,221 +58,159 @@ def _html_to_text(html: str) -> str:
 
 
 def _extract_post_id(post_url_or_id: str) -> str:
-    """Extract numeric forum post id from a raw id, slug, or full URL."""
+    """Extract numeric forum post id from URL or raw id."""
     if not post_url_or_id:
         raise ValueError("Forum post id is required")
     match = re.search(r'/posts/(\d+)|^(\d+)', str(post_url_or_id))
-    post_id = next((group for group in match.groups() if group), None) if match else None
+    post_id = next((g for g in match.groups() if g), None) if match else None
     if not post_id:
         raise ValueError(f"Could not extract forum post id from: {post_url_or_id}")
     return post_id
 
 
 def _extract_locale(post_url_or_id: str, default: str = "zh-cn") -> str:
-    """Extract forum locale from URL when present."""
+    """Extract forum locale from URL."""
     if isinstance(post_url_or_id, str):
         match = re.search(r'/hc/([^/]+)/community/posts/', post_url_or_id)
         if match:
             return match.group(1)
     return default
 
-# 导入浏览器设置模块
-def get_browser_path():
-    """获取可用的浏览器路径"""
-    global _BROWSER_PATH_CACHE, _BROWSER_PATH_CHECKED
-    if _BROWSER_PATH_CHECKED:
-        return _BROWSER_PATH_CACHE
-    try:
-        # 尝试直接导入
-        import browser_setup
-        _BROWSER_PATH_CACHE = browser_setup.ensure_browser_available()
-        _BROWSER_PATH_CHECKED = True
-        return _BROWSER_PATH_CACHE
-    except ImportError:
-        # 如果直接导入失败，尝试从当前目录导入
-        try:
-            from pathlib import Path
-            current_dir = Path(__file__).parent
-            browser_setup_path = current_dir / "browser_setup.py"
-            if browser_setup_path.exists():
-                import sys
-                sys.path.insert(0, str(current_dir))
-                import browser_setup
-                _BROWSER_PATH_CACHE = browser_setup.ensure_browser_available()
-                _BROWSER_PATH_CHECKED = True
-                return _BROWSER_PATH_CACHE
-        except Exception:
-            # Fallback: simple .env parser
-            try:
-                from pathlib import Path as _Path
-                candidate = _Path(__file__).parent / ".env"
-                if candidate.exists():
-                    for _line in candidate.read_text().splitlines():
-                        _line = _line.strip()
-                        if not _line or _line.startswith('#') or '=' not in _line:
-                            continue
-                        _k, _v = _line.split('=', 1)
-                        _k = _k.strip()
-                        _v = _v.strip().strip('"').strip("'")
-                        os.environ.setdefault(_k, _v)
-            except Exception:
-                pass
-        
-        # 如果都失败了，返回None使用默认设置
-        log("未找到browser_setup模块，将使用默认Playwright浏览器", "WARNING")
-        _BROWSER_PATH_CHECKED = True
-        _BROWSER_PATH_CACHE = None
-        return None
-
-# --- Parsing Helper Functions (from playwright_forum_test.py) ---
 
 def _is_navigation_or_metadata(line: str) -> bool:
-    """Check if a line is navigation or metadata."""
-    navigation_patterns = [
-        r'^\d+ days? ago$',
-        r'~\d+ minute read',
-        r'^Follow',
-        r'^Not yet followed',
-        r'^Updated$',
-        r'^AS\d+$',
-        r'^[A-Z] - [A-Z] - [A-Z]',  # Letter navigation
-        r'^A$',
-        r'^B$',
-        r'^[A-Z]$'  # Single letters
-    ]
-    return any(re.match(pattern, line.strip()) for pattern in navigation_patterns)
+    """Check if line is navigation/metadata."""
+    stripped = line.strip()
+    return any(p.match(stripped) for p in _NAVIGATION_PATTERNS)
+
 
 def _looks_like_term(line: str) -> bool:
-    """Check if a line looks like a glossary term."""
-    if len(line) > 100:
+    """Check if line looks like a glossary term."""
+    if len(line) > 100 or len(line) < 2:
         return False
     if _is_navigation_or_metadata(line):
         return False
-    definition_starters = ['the', 'a', 'an', 'this', 'that', 'it', 'is', 'are', 'was', 'were', 'for', 'to', 'in', 'on', 'at', 'by', 'with']
-    first_word = line.lower().split(' ')[0] if line else ''
-    if first_word and first_word in definition_starters:
+    first_word = line.lower().split()[0] if line else ''
+    if first_word in _DEFINITION_STARTERS:
         return False
+    starts_capital = line[0].isupper() if line else False
     is_short = len(line) <= 80
-    starts_with_capital = bool(re.match(r'^[A-Z]', line))
-    has_all_caps = bool(re.match(r'^[A-Z\s\-\/\(\)]+$', line))
-    has_reasonable_length = len(line) >= 2
-    return is_short and has_reasonable_length and (starts_with_capital or has_all_caps)
+    has_all_caps = bool(re.match(r'^[A-Z\s\-/&()]+$', line))
+    return is_short and (starts_capital or has_all_caps)
+
 
 def _parse_glossary_terms(content: str) -> List[Dict[str, str]]:
-    """Parse glossary terms from HTML content."""
+    """Parse glossary terms from HTML."""
+    from bs4 import BeautifulSoup
     soup = BeautifulSoup(content, 'html.parser')
-    # Get text from the article body, which is more reliable than splitting the whole HTML
-    article_body = soup.select_one('.article-body')
-    if not article_body:
-        return []
-    
-    # Use .get_text with a separator to preserve line breaks, which is key for the logic below
+    article_body = soup.select_one('.article-body') or soup
     lines = article_body.get_text(separator='\n').split('\n')
-    
+
     terms = []
     current_term = None
     current_definition = []
-    
+
     for line in lines:
         line = line.strip()
         if not line:
             continue
-            
         if _looks_like_term(line):
             if current_term:
-                # Save the previous term
                 terms.append({
                     "term": current_term,
                     "definition": " ".join(current_definition).strip()
                 })
-            # Start a new term
             current_term = line
             current_definition = []
         elif current_term:
-            # Add to the current definition
             current_definition.append(line)
-            
-    # Add the last term
+
     if current_term:
         terms.append({
             "term": current_term,
             "definition": " ".join(current_definition).strip()
         })
-        
-    # Filter out invalid terms and improve quality
-    return [term for term in terms if 
-            len(term["term"]) > 0 and 
-            len(term["definition"]) > 10 and
-            not _is_navigation_or_metadata(term["term"]) and
-            "ago" not in term["definition"] and
-            "minute read" not in term["definition"]]
+
+    return [
+        t for t in terms
+        if t["term"] and len(t["definition"]) > 10
+        and not _is_navigation_or_metadata(t["term"])
+        and "ago" not in t["definition"]
+        and "minute read" not in t["definition"]
+    ]
+
+
+def _load_env_file() -> None:
+    """Load .env file if exists."""
+    try:
+        from dotenv import load_dotenv, find_dotenv
+        env_path = find_dotenv(usecwd=True)
+        if env_path:
+            load_dotenv(env_path, override=False)
+            return
+    except ImportError:
+        pass
+
+    # Fallback: manual .env parsing
+    env_file = Path(__file__).parent / ".env"
+    if env_file.exists():
+        try:
+            for line in env_file.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                key, value = line.split('=', 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                os.environ.setdefault(key, value)
+        except Exception as e:
+            _log("WARNING", f"Failed to parse .env: {e}")
+
 
 class ForumClient:
-    """Forum client for WorldQuant BRAIN support site, using Playwright."""
-    
-    def __init__(self):
-        # Load .env to allow overrides via environment
-        try:
-            from dotenv import load_dotenv, find_dotenv
-            env_path = find_dotenv(usecwd=True)
-            if env_path:
-                load_dotenv(env_path, override=False)
-            else:
-                from pathlib import Path as _Path
-                candidate = _Path(__file__).parent / ".env"
-                if candidate.exists():
-                    load_dotenv(candidate, override=False)
-        except Exception:
-            pass
+    """Forum client for WorldQuant BRAIN support site."""
 
-        self.base_url = os.getenv("FORUM_SETTINGS_BASE_URL", "https://support.worldquantbrain.com")
-        # timeouts: seconds in env -> milliseconds for playwright waits
-        try:
-            self.selector_timeout_ms = int(float(os.getenv("FORUM_SETTINGS_TIMEOUT", "15")) * 1000)
-        except Exception:
-            self.selector_timeout_ms = 15000
-        # headless setting
-        self.headless = str(os.getenv("FORUM_SETTINGS_HEADLESS", "true")).lower() in ("1","true","yes","on")
-        try:
-            self.max_concurrency = max(1, int(os.getenv("FORUM_MAX_CONCURRENCY", "1")))
-        except Exception:
-            self.max_concurrency = 1
-        self._forum_operation_semaphore = asyncio.Semaphore(self.max_concurrency)
-        # The session is mainly used for the initial authentication via brain_client
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
-        })
+    _HC_LOCALES = ("zh-cn", "en-us")
 
-    def _get_post_api_url(self, post_id: str) -> str:
+    def __init__(self) -> None:
+        _load_env_file()
+
+        self.base_url = os.getenv("FORUM_SETTINGS_BASE_URL", ZENDESK_BASE_URL)
+
+        # Parse timeout (seconds)
+        try:
+            self.timeout = float(os.getenv("FORUM_SETTINGS_TIMEOUT", "30"))
+        except ValueError:
+            self.timeout = 30.0
+
+        # Parse concurrency
+        try:
+            concurrency = int(os.getenv("FORUM_MAX_CONCURRENCY", "1"))
+            self._semaphore = asyncio.Semaphore(max(1, concurrency))
+        except ValueError:
+            self._semaphore = asyncio.Semaphore(1)
+
+    def _post_api_url(self, post_id: str) -> str:
         return f"{self.base_url}/api/v2/community/posts/{post_id}.json?include=users"
 
-    def _get_comments_api_url(self, post_id: str, page: int) -> str:
+    def _comments_api_url(self, post_id: str, page: int) -> str:
         return f"{self.base_url}/api/v2/community/posts/{post_id}/comments.json?page={page}&include=users"
 
-    async def _ensure_support_session(self, email: str, password: str, locale: str = "zh-cn", timeout_seconds: int = 30):
-        """Establish a Zendesk support session using the authenticated BRAIN session."""
+    async def _get_brain_client(self):
+        """Get brain_client with import handling."""
         try:
             from main import brain_client
+            return brain_client
         except ImportError:
-            import sys
-            from pathlib import Path
             current_dir = Path(__file__).parent
-            sys.path.insert(0, str(current_dir))
+            if str(current_dir) not in sys.path:
+                sys.path.insert(0, str(current_dir))
             from main import brain_client
+            return brain_client
 
-        try:
-            await asyncio.wait_for(brain_client.ensure_authenticated(), timeout=timeout_seconds)
-        except asyncio.TimeoutError:
-            log(f"Authentication check timed out after {timeout_seconds}s, proceeding anyway.", "WARNING")
-        except Exception:
-            log("Authenticating with BRAIN platform...", "INFO")
-            auth_result = await asyncio.wait_for(
-                brain_client.authenticate(email, password),
-                timeout=timeout_seconds
-            )
-            if auth_result.get('status') != 'authenticated':
-                raise Exception("BRAIN platform authentication failed.")
+    async def _ensure_session(self, locale: str = "zh-cn"):
+        """Ensure Zendesk session via BRAIN SSO."""
+        brain_client = await self._get_brain_client()
+        await brain_client.ensure_authenticated()
 
         access_url = (
             "https://worldquantbrain.zendesk.com/access"
@@ -264,422 +218,428 @@ class ForumClient:
             f"&return_to={self.base_url}/hc/{locale}"
         )
 
-        def establish_session():
+        def do_request():
             return brain_client.session.get(
                 access_url,
-                timeout=timeout_seconds,
+                timeout=int(self.timeout),
                 allow_redirects=True,
-                headers={
-                    'User-Agent': self.session.headers['User-Agent'],
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                },
+                headers={'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'},
             )
 
-        response = await asyncio.to_thread(establish_session)
-        log(
-            f"Support SSO handshake completed with status={response.status_code}, final_url={response.url}",
-            "INFO"
-        )
+        response = await asyncio.to_thread(do_request)
+        _log("INFO", f"SSO handshake: status={response.status_code}, url={response.url}")
         return brain_client.session
 
-    async def _get_support_json(self, session: requests.Session, url: str, timeout_seconds: int = 30) -> Dict[str, Any]:
-        """Fetch forum JSON using the Zendesk-authenticated session."""
+    async def _get_json(self, session, url: str) -> Dict[str, Any]:
+        """Fetch JSON from API."""
         def do_request():
-            response = session.get(
+            resp = session.get(
                 url,
-                timeout=timeout_seconds,
-                headers={
-                    'User-Agent': self.session.headers['User-Agent'],
-                    'Accept': 'application/json',
-                },
+                timeout=int(self.timeout),
+                headers={'Accept': 'application/json'},
             )
-            response.raise_for_status()
-            return response.json()
-
+            resp.raise_for_status()
+            return resp.json()
         return await asyncio.to_thread(do_request)
 
-    async def _get_browser_context(self, p: Any, email: str, password: str, timeout_seconds: int = 30):
-        """Authenticate and return a browser context with the session."""
-        # Import brain_client here to avoid circular dependency
-        try:
-            from main import brain_client
-        except ImportError:
-            # 尝试从当前目录导入
-            import sys
-            from pathlib import Path
-            current_dir = Path(__file__).parent
-            sys.path.insert(0, str(current_dir))
-            from main import brain_client
-        
-        # Avoid re-authenticating on every forum call: authenticate clears cookies and can
-        # disrupt other concurrent tools using the same session.
-        try:
-            await asyncio.wait_for(brain_client.ensure_authenticated(), timeout=timeout_seconds)
-        except asyncio.TimeoutError:
-            log(f"Authentication check timed out after {timeout_seconds}s, proceeding anyway.", "WARNING")
-        except Exception:
-            log("Authenticating with BRAIN platform...", "INFO")
-            try:
-                auth_result = await asyncio.wait_for(
-                    brain_client.authenticate(email, password),
-                    timeout=timeout_seconds
-                )
-                if auth_result.get('status') != 'authenticated':
-                    raise Exception("BRAIN platform authentication failed.")
-                log("Successfully authenticated with BRAIN platform.", "SUCCESS")
-            except asyncio.TimeoutError:
-                log(f"Authentication timed out after {timeout_seconds}s, continuing with partial session.", "WARNING")
-
-        # 获取可用的浏览器路径
-        browser_path = get_browser_path()
-        
-        # 设置浏览器启动参数 - 增强稳定性
-        browser_args = [
-            '--headless=new',
-            '--no-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-gpu',
-            '--disable-extensions',
-            '--disable-background-networking',
-            '--disable-sync',
-            '--no-first-run'
-        ]
-        
-        try:
-            if browser_path and os.path.exists(browser_path):
-                log(f"使用自定义浏览器路径: {browser_path}", "INFO")
-                browser = await asyncio.wait_for(
-                    p.chromium.launch(executable_path=browser_path, args=browser_args, timeout=timeout_seconds * 1000),
-                    timeout=timeout_seconds + 10
-                )
-            else:
-                log("使用默认Playwright浏览器", "INFO")
-                browser = await asyncio.wait_for(
-                    p.chromium.launch(headless=self.headless, args=browser_args, timeout=timeout_seconds * 1000),
-                    timeout=timeout_seconds + 10
-                )
-        except asyncio.TimeoutError:
-            raise Exception(f"Browser launch timed out after {timeout_seconds + 10}s")
-            
-        try:
-            context = await asyncio.wait_for(
-                browser.new_context(user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'),
-                timeout=timeout_seconds
+    async def _post_json(self, session, url: str, data: Dict) -> Any:
+        """Post JSON to API."""
+        def do_request():
+            resp = session.post(
+                url,
+                json=data,
+                timeout=int(self.timeout),
+                headers={'Content-Type': 'application/json'},
             )
-        except asyncio.TimeoutError:
-            await browser.close()
-            raise Exception("Browser context creation timed out")
+            if resp.status_code not in (200, 201, 204):
+                resp.raise_for_status()
+            return resp
+        return await asyncio.to_thread(do_request)
 
-        log("Transferring authentication session to browser...", "INFO")
-        try:
-            cookies = brain_client.session.cookies
-            playwright_cookies = []
-            for cookie in cookies:
-                cookie_dict = {
-                    'name': cookie.name,
-                    'value': cookie.value,
-                    'domain': cookie.domain if cookie.domain else '.worldquantbrain.com',
-                    'path': cookie.path if cookie.path else '/',
-                    'secure': cookie.secure if hasattr(cookie, 'secure') else True,
-                    'httpOnly': 'HttpOnly' in cookie._rest if hasattr(cookie, '_rest') else False,
-                    'sameSite': 'Lax'
-                }
-                if hasattr(cookie, 'expires') and cookie.expires:
-                    cookie_dict['expires'] = cookie.expires
-                playwright_cookies.append(cookie_dict)
-            
-            await asyncio.wait_for(context.add_cookies(playwright_cookies), timeout=10)
-            log("Session transferred.", "SUCCESS")
-        except Exception as e:
-            log(f"Cookie transfer warning (continuing): {str(e)}", "WARNING")
-        
-        return browser, context
+    async def _with_fallback(self, locale: str, url_builder, extractor, label: str) -> Dict[str, Any]:
+        """Try locale with fallback to alternative."""
+        alt_locale = "en-us" if locale == "zh-cn" else "zh-cn"
+        items = []
+        seen_ids = set()
+        last_error = None
 
-    async def get_glossary_terms(self, email: str, password: str) -> List[Dict[str, str]]:
-        """Extract glossary terms from the forum using Playwright."""
-        if async_playwright is None:
-            raise ImportError("Playwright not available. Please install it with: pip install playwright")
+        for loc in (alt_locale, locale):  # Primary locale last for priority
+            try:
+                session = await self._ensure_session(loc)
+                url = url_builder(loc)
+                while url and len(items) < 1000:  # Safety limit
+                    payload = await self._get_json(session, url)
+                    for item in extractor(payload):
+                        item_id = str(item.get("id", ""))
+                        if item_id and item_id not in seen_ids:
+                            seen_ids.add(item_id)
+                            items.append(item)
+                    url = payload.get("next_page")
+            except Exception as e:
+                last_error = e
+                _log("WARNING", f"{label} locale={loc}: {e}")
 
-        async with self._forum_operation_semaphore:
-            async with async_playwright() as p:
-                browser = None
-                try:
-                    log("Starting glossary extraction process with Playwright", "INFO")
-                    browser, context = await self._get_browser_context(p, email, password)
-                    
-                    page = await context.new_page()
-                    log("Navigating to BRAIN support forum glossary...", "INFO")
-                    await page.goto("https://support.worldquantbrain.com/hc/en-us/articles/4902349883927-Click-here-for-a-list-of-terms-and-their-definitions")
-                    
-                    log("Extracting glossary content...", "INFO")
-                    content = await page.content()
-                    
-                    terms = _parse_glossary_terms(content)
-                    
-                    log(f"Extracted {len(terms)} glossary terms", "SUCCESS")
-                    return terms
+        if not items and last_error:
+            raise last_error
 
-                except Exception as e:
-                    log(f"Glossary extraction failed: {str(e)}", "ERROR")
-                    # Re-raise to be handled by the MCP server wrapper
-                    raise
-                finally:
-                    if browser:
-                        await browser.close()
-                        log("Browser closed.", "INFO")
+        _log("SUCCESS", f"{label}: {len(items)} items")
+        return {"success": True, "items": items, "count": len(items)}
 
-    async def search_forum_posts(self, email: str, password: str, search_query: str, max_results: int = 50, locale: str = "zh-cn") -> Dict[str, Any]:
-        """Search for posts on the forum using Playwright, with pagination and timeout protection."""
-        if async_playwright is None:
-            raise ImportError("Playwright not available. Please install it with: pip install playwright")
-        
-        timeout_seconds = 30  # Per-operation timeout
-        overall_timeout = 120  # Overall timeout for entire search
-        browser = None
-        
-        async def _do_search():
-            nonlocal browser
-            async with self._forum_operation_semaphore:
-                async with async_playwright() as p:
-                    try:
-                        log(f"Starting forum search for '{search_query}'", "INFO")
-                        browser, context = await asyncio.wait_for(
-                            self._get_browser_context(p, email, password, timeout_seconds),
-                            timeout=timeout_seconds + 15
-                        )
+    # === Public API Methods ===
 
-                        page = await asyncio.wait_for(context.new_page(), timeout=timeout_seconds)
-                        page.set_default_timeout(timeout_seconds * 1000)
-                        page.set_default_navigation_timeout(timeout_seconds * 1000)
-                        
-                        search_results = []
-                        page_num = 1
-                        max_pages = 5  # Limit pages to prevent infinite loops
-                        
-                        while len(search_results) < max_results and page_num <= max_pages:
-                            search_url = f"{self.base_url}/hc/{locale}/search?page={page_num}&query={search_query}#results"
-                            log(f"Navigating to search page {page_num}: {search_url}", "INFO")
-                            
-                            try:
-                                response = await asyncio.wait_for(
-                                    page.goto(search_url, wait_until="domcontentloaded"),
-                                    timeout=timeout_seconds
-                                )
-                                if response and response.status == 404:
-                                    log(f"Page {page_num} not found. End of results.", "INFO")
-                                    break
-                                
-                                await asyncio.wait_for(
-                                    page.wait_for_selector('ul.search-results-list', timeout=self.selector_timeout_ms),
-                                    timeout=min(timeout_seconds, 15)
-                                )
-                            except asyncio.TimeoutError:
-                                log(f"Page {page_num} navigation timed out, stopping.", "WARNING")
-                                break
-                            except Exception as e:
-                                log(f"Could not load search results on page {page_num}: {e}", "WARNING")
-                                break
+    async def get_glossary_terms(self) -> List[Dict[str, str]]:
+        """Get glossary terms."""
+        async with self._semaphore:
+            session = await self._ensure_session("en-us")
+            payload = await self._get_json(
+                session,
+                f"{self.base_url}/api/v2/help_center/articles/{GLOSSARY_ARTICLE_ID}.json"
+            )
+            body = payload.get("article", {}).get("body", "")
+            if not body:
+                _log("WARNING", "Glossary article empty")
+                return []
+            terms = _parse_glossary_terms(body)
+            _log("SUCCESS", f"Extracted {len(terms)} glossary terms")
+            return terms
 
-                            try:
-                                content = await asyncio.wait_for(page.content(), timeout=10)
-                            except asyncio.TimeoutError:
-                                log(f"Page content retrieval timed out on page {page_num}", "WARNING")
-                                break
-                            
-                            soup = BeautifulSoup(content, 'html.parser')
-                            
-                            results_on_page = soup.select('li.search-result-list-item')
-                            if not results_on_page:
-                                log("No more search results found.", "INFO")
-                                break
+    async def read_forum_post(self, post_url_or_id: str, include_comments: bool = True) -> Dict[str, Any]:
+        """Read forum post with comments."""
+        async with self._semaphore:
+            post_id = _extract_post_id(post_url_or_id)
+            locale = _extract_locale(post_url_or_id)
+            session = await self._ensure_session(locale)
 
-                            for result in results_on_page:
-                                try:
-                                    title_element = result.select_one('h2.search-result-title a')
-                                    snippet_element = result.select_one('.search-results-description')
-                                    
-                                    if title_element:
-                                        title = title_element.get_text(strip=True)
-                                        link = title_element.get('href')
+            # Get post
+            post_data = await self._get_json(session, self._post_api_url(post_id))
+            post = post_data.get("post", {})
+            users = {u.get("id"): u.get("name") for u in post_data.get("users", []) if isinstance(u, dict)}
 
-                                        votes_element = result.select_one('.search-result-votes span[aria-hidden="true"]')
-                                        votes_text = votes_element.get_text(strip=True) if votes_element else '0'
-                                        votes_match = re.search(r'\d+', votes_text)
-                                        votes = int(votes_match.group()) if votes_match else 0
-
-                                        comments_element = result.select_one('.search-result-meta-count span[aria-hidden="true"]')
-                                        comments_text = comments_element.get_text(strip=True) if comments_element else '0'
-                                        comments_match = re.search(r'\d+', comments_text)
-                                        comments = int(comments_match.group()) if comments_match else 0
-
-                                        breadcrumbs_elements = result.select('ol.search-result-breadcrumbs li')
-                                        breadcrumbs = [bc.get_text(strip=True) for bc in breadcrumbs_elements]
-                                        
-                                        meta_group = result.select_one('ul.meta-group')
-                                        author = 'Unknown'
-                                        post_date = 'Unknown'
-                                        if meta_group:
-                                            meta_data_elements = meta_group.select('li.meta-data')
-                                            if len(meta_data_elements) > 0:
-                                                author = meta_data_elements[0].get_text(strip=True)
-                                            if len(meta_data_elements) > 1:
-                                                time_element = meta_data_elements[1].select_one('time')
-                                                if time_element:
-                                                    post_date = time_element.get('datetime', time_element.get_text(strip=True))
-
-                                        snippet = snippet_element.get_text(strip=True) if snippet_element else ''
-                                        
-                                        full_link = ''
-                                        if link and isinstance(link, str):
-                                            if link.startswith('http'):
-                                                full_link = link
-                                            else:
-                                                full_link = f"{self.base_url}{link}"
-                                        
-                                        search_results.append({
-                                            'title': title,
-                                            'link': full_link,
-                                            'snippet': snippet,
-                                            'votes': votes,
-                                            'comments': comments,
-                                            'author': author,
-                                            'date': post_date,
-                                            'breadcrumbs': breadcrumbs
-                                        })
-                                    
-                                    if len(search_results) >= max_results:
-                                        break
-                                except Exception as e:
-                                    log(f"Error parsing search result: {str(e)}", "DEBUG")
-                                    continue
-                            
-                            if len(search_results) >= max_results:
-                                break
-
-                            page_num += 1
-
-                        log(f"Found {len(search_results)} results for '{search_query}'", "SUCCESS")
-                        
-                        return {
-                            "success": True,
-                            "results": search_results,
-                            "total_found": len(search_results)
-                        }
-
-                    except Exception as e:
-                        log(f"Forum search failed: {str(e)}", "ERROR")
-                        return {
-                            "success": False,
-                            "results": [],
-                            "total_found": 0,
-                            "error": str(e)
-                        }
-                    finally:
-                        if browser:
-                            try:
-                                await asyncio.wait_for(browser.close(), timeout=5)
-                            except Exception:
-                                pass
-        
-        try:
-            return await asyncio.wait_for(_do_search(), timeout=overall_timeout)
-        except asyncio.TimeoutError:
-            log(f"Forum search overall timeout after {overall_timeout}s", "ERROR")
-            return {
-                "success": False,
-                "results": [],
-                "total_found": 0,
-                "error": f"Forum search timed out after {overall_timeout}s"
+            result = {
+                "success": True,
+                "post": {
+                    "title": post.get("title", "Unknown"),
+                    "author": users.get(post.get("author_id"), "Unknown"),
+                    "body": _html_to_text(post.get("details", "")),
+                    "votes": str(post.get("vote_sum", 0)),
+                    "date": post.get("created_at", ""),
+                    "url": post.get("html_url", ""),
+                },
+                "comments": [],
+                "total_comments": 0,
             }
 
-    async def read_full_forum_post(self, email: str, password: str, post_url_or_id: str, include_comments: bool = True) -> Dict[str, Any]:
-        """Read a complete forum post and its comments via Zendesk JSON API."""
-        try:
-            async with self._forum_operation_semaphore:
-                log("Starting forum post reading process via Zendesk API", "INFO")
+            # Get comments
+            if include_comments:
+                comments = []
+                page = 1
+                while True:
+                    try:
+                        cdata = await self._get_json(session, self._comments_api_url(post_id, page))
+                        cusers = {u.get("id"): u.get("name") for u in cdata.get("users", []) if isinstance(u, dict)}
+                        users.update(cusers)
 
-                post_id = _extract_post_id(post_url_or_id)
-                locale = _extract_locale(post_url_or_id)
-                session = await self._ensure_support_session(email, password, locale=locale)
+                        for c in cdata.get("comments", []):
+                            comments.append({
+                                "author": users.get(c.get("author_id"), "Unknown"),
+                                "body": _html_to_text(c.get("body", "")),
+                                "date": c.get("created_at", ""),
+                            })
 
-                post_payload = await self._get_support_json(session, self._get_post_api_url(post_id))
-                post_record = post_payload.get('post') or {}
-                user_map = {
-                    user.get('id'): user.get('name')
-                    for user in post_payload.get('users', [])
-                    if isinstance(user, dict)
-                }
-
-                post_data = {
-                    'title': post_record.get('title', 'Unknown Title'),
-                    'author': user_map.get(post_record.get('author_id'), 'Unknown Author'),
-                    'body': _html_to_text(post_record.get('details', '')) or 'Body not found',
-                    'details': {
-                        'votes': str(post_record.get('vote_sum', 0)),
-                        'date': post_record.get('created_at', 'Unknown Date') or 'Unknown Date',
-                        'url': post_record.get('html_url') or post_record.get('url')
-                    }
-                }
-
-                comments: List[Dict[str, Any]] = []
-                if include_comments:
-                    page_num = 1
-                    while True:
-                        comments_payload = await self._get_support_json(
-                            session,
-                            self._get_comments_api_url(post_id, page_num)
-                        )
-                        comment_records = comments_payload.get('comments') or []
-                        if not comment_records:
+                        if not cdata.get("next_page"):
                             break
+                        page += 1
+                    except Exception as e:
+                        _log("WARNING", f"Comment fetch stopped: {e}")
+                        break
 
-                        users = comments_payload.get('users') or []
-                        user_map.update({
-                            user.get('id'): user.get('name')
-                            for user in users
-                            if isinstance(user, dict)
-                        })
+                result["comments"] = comments
+                result["total_comments"] = len(comments)
 
-                        for comment_record in comment_records:
-                            comment_data = {
-                                'author': user_map.get(comment_record.get('author_id'), 'Unknown'),
-                                'body': _html_to_text(comment_record.get('body', '')),
-                                'date': comment_record.get('created_at', 'Unknown Date') or 'Unknown Date'
-                            }
-                            comments.append(comment_data)
+            _log("SUCCESS", f"Read post {post_id} with {result['total_comments']} comments")
+            return result
 
-                        if not comments_payload.get('next_page'):
-                            break
-                        page_num += 1
+    async def list_community_posts(self, sort_by: str = "recent_activity", limit: int = 50, locale: str = "zh-cn") -> Dict[str, Any]:
+        """List community posts."""
+        async with self._semaphore:
+            def url_builder(loc):
+                return f"{self.base_url}/api/v2/community/posts.json?sort_by={sort_by}&limit={min(limit, 100)}"
 
-                log(f"Extracted {len(comments)} comments in total.", "SUCCESS")
-                return {
-                    'success': True,
-                    'post': post_data,
-                    'comments': comments,
-                    'total_comments': len(comments)
-                }
+            def extractor(payload):
+                return [{
+                    "id": p["id"],
+                    "title": p["title"],
+                    "author": (p.get("author", {}) or {}).get("name", "?"),
+                    "votes": p.get("vote_sum", 0),
+                    "comment_count": p.get("comment_count", 0),
+                    "created_at": p.get("created_at"),
+                    "url": p.get("html_url", ""),
+                } for p in payload.get("posts", [])]
 
-        except Exception as e:
-            log(f"Failed to read forum post: {str(e)}", "ERROR")
-            raise
+            result = await self._with_fallback(locale, url_builder, extractor, "Community posts")
+            posts = result["items"][:limit]
+            return {
+                "success": True,
+                "posts": posts,
+                "count": len(posts),
+                "has_more": len(result["items"]) > limit,
+            }
 
-# Initialize forum client
+    async def list_community_topics(self, locale: str = "zh-cn") -> List[Dict[str, Any]]:
+        """List community topics."""
+        async with self._semaphore:
+            session = await self._ensure_session(locale)
+            payload = await self._get_json(session, f"{self.base_url}/api/v2/community/topics.json")
+            topics = [{
+                "id": t["id"],
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "post_count": t.get("post_count", 0),
+            } for t in payload.get("topics", [])]
+            _log("SUCCESS", f"Listed {len(topics)} topics")
+            return topics
+
+    async def get_topic_posts(self, topic_id: str, sort_by: str = "recent_activity", limit: int = 50, locale: str = "zh-cn") -> Dict[str, Any]:
+        """Get posts for a topic."""
+        async with self._semaphore:
+            def url_builder(loc):
+                return f"{self.base_url}/api/v2/community/topics/{topic_id}/posts.json?sort_by={sort_by}&limit={min(limit, 100)}"
+
+            def extractor(payload):
+                return [{
+                    "id": p["id"],
+                    "title": p["title"],
+                    "author": (p.get("author", {}) or {}).get("name", "?"),
+                    "votes": p.get("vote_sum", 0),
+                    "comment_count": p.get("comment_count", 0),
+                    "created_at": p.get("created_at"),
+                    "url": p.get("html_url", ""),
+                } for p in payload.get("posts", [])]
+
+            result = await self._with_fallback(locale, url_builder, extractor, f"Topic {topic_id} posts")
+            posts = result["items"][:limit]
+            return {
+                "success": True,
+                "topic_id": topic_id,
+                "posts": posts,
+                "count": len(posts),
+                "has_more": len(result["items"]) > limit,
+            }
+
+    async def search_forum_posts(self, search_query: str, locale: str = "zh-cn", max_results: int = 50) -> Dict[str, Any]:
+        """Search forum posts."""
+        async with self._semaphore:
+            def url_builder(loc):
+                return f"{self.base_url}/api/v2/community/search.json?query={search_query}&per_page={min(max_results, 100)}"
+
+            def extractor(payload):
+                return [{
+                    "id": r.get("id"),
+                    "title": r.get("title", r.get("name", "")),
+                    "author": (r.get("author", {}) or {}).get("name", "?"),
+                    "votes": r.get("vote_sum", 0),
+                    "comment_count": r.get("comment_count", 0),
+                    "created_at": r.get("created_at"),
+                    "url": r.get("html_url", ""),
+                    "snippet": (r.get("snippet") or r.get("details", ""))[:SNIPPET_LENGTH],
+                } for r in payload.get("results", [])]
+
+            result = await self._with_fallback(locale, url_builder, extractor, f"Search '{search_query}'")
+            items = result["items"][:max_results]
+            return {
+                "success": True,
+                "query": search_query,
+                "results": items,
+                "count": len(items),
+                "has_more": len(result["items"]) > max_results,
+            }
+
+    async def vote_post(self, post_id: str, direction: str = "up", locale: str = "zh-cn") -> Dict[str, Any]:
+        """Vote on a post."""
+        if direction not in ("up", "down"):
+            raise ValueError("direction must be 'up' or 'down'")
+
+        async with self._semaphore:
+            session = await self._ensure_session(locale)
+            url = f"{self.base_url}/api/v2/community/posts/{post_id}/vote.json"
+            resp = await self._post_json(session, url, {"vote": {"direction": direction}})
+            _log("SUCCESS", f"Voted {direction} on post {post_id}")
+            return {
+                "success": True,
+                "post_id": post_id,
+                "direction": direction,
+                "status_code": resp.status_code,
+            }
+
+    async def list_help_center_articles(self, locale: str = "zh-cn", section_id: str | None = None,
+                                        category_id: str | None = None, sort_by: str = "updated_at",
+                                        limit: int = 50) -> Dict[str, Any]:
+        """List Help Center articles."""
+        async with self._semaphore:
+            params = [f"sort_by={sort_by}", f"per_page={min(limit, 100)}"]
+            if section_id:
+                params.append(f"section_id={section_id}")
+            if category_id:
+                params.append(f"category_id={category_id}")
+            param_str = "&".join(params)
+
+            def url_builder(loc):
+                return f"{self.base_url}/api/v2/help_center/{loc}/articles.json?{param_str}"
+
+            def extractor(payload):
+                return [{
+                    "id": a["id"],
+                    "title": a["title"],
+                    "section_id": a.get("section_id"),
+                    "category_id": a.get("category_id"),
+                    "updated_at": a.get("updated_at"),
+                    "url": a.get("html_url", ""),
+                } for a in payload.get("articles", [])]
+
+            result = await self._with_fallback(locale, url_builder, extractor, "HC articles")
+            items = result["items"][:limit]
+            return {
+                "success": True,
+                "articles": items,
+                "count": len(items),
+                "has_more": len(result["items"]) > limit,
+            }
+
+    async def search_help_center_articles(self, query: str, locale: str = "zh-cn", limit: int = 50) -> Dict[str, Any]:
+        """Search Help Center articles."""
+        async with self._semaphore:
+            def url_builder(loc):
+                return f"{self.base_url}/api/v2/help_center/articles/search.json?query={query}&per_page={min(limit, 100)}"
+
+            def extractor(payload):
+                return [{
+                    "id": r["id"],
+                    "title": r.get("title", r.get("name", "")),
+                    "section_id": r.get("section_id"),
+                    "url": r.get("html_url", ""),
+                    "snippet": (r.get("snippet") or r.get("body", ""))[:SNIPPET_LENGTH],
+                } for r in payload.get("results", [])]
+
+            result = await self._with_fallback(locale, url_builder, extractor, f"HC search '{query}'")
+            items = result["items"][:limit]
+            return {
+                "success": True,
+                "query": query,
+                "results": items,
+                "count": len(items),
+                "has_more": len(result["items"]) > limit,
+            }
+
+    async def get_help_center_article(self, article_id: str, locale: str = "zh-cn") -> Dict[str, Any]:
+        """Get Help Center article."""
+        async with self._semaphore:
+            alt_locale = "en-us" if locale == "zh-cn" else "zh-cn"
+            last_error = None
+
+            for loc in (locale, alt_locale):
+                try:
+                    session = await self._ensure_session(loc)
+                    payload = await self._get_json(
+                        session,
+                        f"{self.base_url}/api/v2/help_center/articles/{article_id}.json"
+                    )
+                    article = payload.get("article", {})
+                    if article:
+                        return {
+                            "success": True,
+                            "id": article.get("id"),
+                            "title": article.get("title"),
+                            "body": _html_to_text(article.get("body", "")),
+                            "url": article.get("html_url", ""),
+                            "updated_at": article.get("updated_at"),
+                        }
+                except Exception as e:
+                    last_error = e
+                    _log("WARNING", f"Article {article_id} locale={loc}: {e}")
+
+            raise last_error or Exception(f"Article {article_id} not found")
+
+    async def list_help_center_sections(self, locale: str = "zh-cn") -> List[Dict[str, Any]]:
+        """List Help Center sections."""
+        async with self._semaphore:
+            def url_builder(loc):
+                return f"{self.base_url}/api/v2/help_center/{loc}/sections.json"
+
+            def extractor(payload):
+                return [{
+                    "id": s["id"],
+                    "name": s["name"],
+                    "description": s.get("description", ""),
+                    "category_id": s.get("category_id"),
+                } for s in payload.get("sections", [])]
+
+            result = await self._with_fallback(locale, url_builder, extractor, "HC sections")
+            return result["items"]
+
+    async def list_help_center_categories(self, locale: str = "zh-cn") -> List[Dict[str, Any]]:
+        """List Help Center categories."""
+        async with self._semaphore:
+            def url_builder(loc):
+                return f"{self.base_url}/api/v2/help_center/{loc}/categories.json"
+
+            def extractor(payload):
+                return [{
+                    "id": c["id"],
+                    "name": c["name"],
+                    "description": c.get("description", ""),
+                } for c in payload.get("categories", [])]
+
+            result = await self._with_fallback(locale, url_builder, extractor, "HC categories")
+            return result["items"]
+
+    async def get_article_comments(self, article_id: str, locale: str = "zh-cn") -> Dict[str, Any]:
+        """Get article comments."""
+        async with self._semaphore:
+            alt_locale = "en-us" if locale == "zh-cn" else "zh-cn"
+
+            for loc in (locale, alt_locale):
+                try:
+                    session = await self._ensure_session(loc)
+                    comments = []
+                    url = f"{self.base_url}/api/v2/help_center/articles/{article_id}/comments.json"
+
+                    while url:
+                        payload = await self._get_json(session, url)
+                        for c in payload.get("comments", []):
+                            comments.append({
+                                "id": c["id"],
+                                "author": (c.get("author", {}) or {}).get("name", "?"),
+                                "body": _html_to_text(c.get("body", "")),
+                                "created_at": c.get("created_at"),
+                            })
+                        url = payload.get("next_page")
+
+                    if comments:
+                        return {
+                            "success": True,
+                            "article_id": article_id,
+                            "comments": comments,
+                            "count": len(comments),
+                        }
+                except Exception as e:
+                    _log("WARNING", f"Comments {article_id} locale={loc}: {e}")
+
+            return {"success": True, "article_id": article_id, "comments": [], "count": 0}
+
+
+# Global instance
 forum_client = ForumClient()
 
-# The main block is for testing and won't be run by the MCP server.
+
 if __name__ == "__main__":
-    print("📚 WorldQuant BRAIN Forum Functions - This script provides the ForumClient class.", file=sys.stderr)
-    # Basic local smoke test if credentials are set via env.
+    print("WorldQuant BRAIN Forum Functions", file=sys.stderr)
     email = os.getenv("CREDENTIALS_EMAIL")
     password = os.getenv("CREDENTIALS_PASSWORD")
     if email and password:
-        # Example article id; adjust if needed
-        article_id = "36371597455127-示例文章"
         try:
-            result = asyncio.run(forum_client.read_full_forum_post(email, password, article_id))
+            result = asyncio.run(forum_client.read_forum_post("36371597455127"))
             print(result)
         except Exception as e:
-            log(f"Local test failed: {e}", "ERROR")
+            _log("ERROR", f"Test failed: {e}")
     else:
-        log("Set CREDENTIALS_EMAIL and CREDENTIALS_PASSWORD in environment to run local test.", "INFO")
+        _log("INFO", "Set CREDENTIALS_EMAIL and CREDENTIALS_PASSWORD for testing")
