@@ -4389,13 +4389,24 @@ async def create_multi_simulation(
             return {"error": "At least 2 alpha expressions are required"}
         if len(alpha_expressions_with_settings) > 8:
             return {"error": "Maximum 8 alpha expressions allowed per request"}
+        # All alphas type must be REGULAR
+        if not all(item.get('type') == 'REGULAR' for item in alpha_expressions_with_settings):
+            return {"error": "All alpha expressions must be of type REGULAR"}
+        # All alpha expressions must have the same delay
+        if not all(item.get('settings', {}).get('delay') == alpha_expressions_with_settings[0].get('settings', {}).get('delay') for item in alpha_expressions_with_settings):
+            return {"error": "All alpha expressions must have the same delay"}
+        # Log debug info
+        _log('DEBUG', f"Multisim payload[0]: {payload[0] if payload else 'empty'}")
+        # Send multisimulation request
+        response = brain_client.session.post(f"{brain_client.base_url}/simulations", json=payload)
+        
         total_requested = len(alpha_expressions_with_settings)
         await brain_client.ensure_authenticated()
         # Convert Pydantic models to dicts for JSON serialization
         payload = []
         for item in alpha_expressions_with_settings:
             if hasattr(item, 'model_dump'):
-                d = item.model_dump(by_alias=True)
+                d = item.model_dump(by_alias=True
             elif hasattr(item, 'dict'):
                 d = item.dict(by_alias=True)
             else:
