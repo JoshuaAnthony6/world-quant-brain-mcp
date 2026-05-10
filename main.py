@@ -2330,16 +2330,15 @@ class BrainApiClient:
             self.log(f"Failed to get messages: {str(e)}", "ERROR")
             raise
 
-    async def get_glossary_terms(self, email: str, password: str) -> List[Dict[str, str]]:
+    async def get_glossary_terms(self) -> List[Dict[str, str]]:
         """Get glossary terms from forum."""
         try:
-            return await forum_client.get_glossary_terms(email, password)
+            return await forum_client.get_glossary_terms()
         except Exception as e:
             self.log(f"Failed to get glossary terms: {str(e)}", "ERROR")
             raise
 
-    async def search_forum_posts(self, email: str, password: str, search_query: str, 
-                                 max_results: int = 50) -> Dict[str, Any]:
+    async def search_forum_posts(self, search_query: str, max_results: int = 50) -> Dict[str, Any]:
         """Search forum posts."""
         try:
             rate_limited = await self._rate_limit_forum_op("search_forum_posts")
@@ -2350,14 +2349,12 @@ class BrainApiClient:
                     'search_query': search_query,
                     'max_results': max_results,
                 }
-            return await forum_client.search_forum_posts(email, password, search_query, max_results)
+            return await forum_client.search_forum_posts(search_query, max_results=max_results)
         except Exception as e:
             self.log(f"Failed to search forum posts: {str(e)}", "ERROR")
             raise
 
-
-    async def read_forum_post(self, email: str, password: str, article_id: str, 
-                              include_comments: bool = True) -> Dict[str, Any]:
+    async def read_forum_post(self, article_id: str, include_comments: bool = True) -> Dict[str, Any]:
         """Get forum post."""
         try:
             rate_limited = await self._rate_limit_forum_op("read_forum_post")
@@ -2368,7 +2365,7 @@ class BrainApiClient:
                     'article_id': article_id,
                     'include_comments': include_comments,
                 }
-            return await forum_client.read_full_forum_post(email, password, article_id, include_comments)
+            return await forum_client.read_forum_post(article_id, include_comments)
         except Exception as e:
             self.log(f"Failed to read forum post: {str(e)}", "ERROR")
             raise
@@ -3993,86 +3990,50 @@ async def get_messages(limit: Optional[int] = None, offset: int = 0) -> Dict[str
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def get_glossary_terms(email: str = "", password: str = "") -> List[Dict[str, str]]:
+async def get_glossary_terms() -> List[Dict[str, str]]:
     """
     Get glossary terms from WorldQuant BRAIN forum.
-    
-    Note: This uses Playwright and is implemented in forum_functions.py
-    
-    Args:
-        email: Your BRAIN platform email address (optional if in config)
-        password: Your BRAIN platform password (optional if in config)
     
     Returns:
         A list of glossary terms with definitions
     """
     try:
-        config = load_config()
-        credentials = config.get("credentials", {})
-        email = email or credentials.get("email")
-        password = password or credentials.get("password")
-        if not email or not password:
-            raise ValueError("Authentication credentials not provided or found in config.")
-        
-        return await brain_client.get_glossary_terms(email, password)
+        return await brain_client.get_glossary_terms()
     except Exception as e:
         logger.error(f"Error in get_glossary_terms tool: {e}")
         return [{"error": str(e)}]
 
 @mcp.tool()
-async def search_forum_posts(search_query: str, email: str = "", password: str = "", 
-                             max_results: int = 50) -> Dict[str, Any]:
+async def search_forum_posts(search_query: str, max_results: int = 50) -> Dict[str, Any]:
     """
     Search forum posts on WorldQuant BRAIN support site.
     
-    Note: This uses Playwright and is implemented in forum_functions.py
-    
     Args:
         search_query: Search term or phrase
-        email: Your BRAIN platform email address (optional if in config)
-        password: Your BRAIN platform password (optional if in config)
         max_results: Maximum number of results to return (default: 50)
     
     Returns:
         Search results with analysis
     """
     try:
-        config = load_config()
-        credentials = config.get("credentials", {})
-        email = email or credentials.get("email")
-        password = password or credentials.get("password")
-        if not email or not password:
-            return {"error": "Authentication credentials not provided or found in config."}
-            
-        return await brain_client.search_forum_posts(email, password, search_query, max_results)
+        return await brain_client.search_forum_posts(search_query, max_results=max_results)
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def read_forum_post(article_id: str, email: str = "", password: str = "", 
-                          include_comments: bool = True) -> Dict[str, Any]:
+async def read_forum_post(article_id: str, include_comments: bool = True) -> Dict[str, Any]:
     """
     Get a specific forum post by article ID.
     
-    Note: This uses Zendesk support SSO plus JSON APIs and is implemented in forum_functions.py
-    
     Args:
         article_id: The article ID to retrieve (e.g., "32984819083415-新人求模板")
-        email: Your BRAIN platform email address (optional if in config)
-        password: Your BRAIN platform password (optional if in config)
+        include_comments: Whether to include comments (default: True)
     
     Returns:
         Forum post content with comments
     """
     try:
-        config = load_config()
-        credentials = config.get("credentials", {})
-        email = email or credentials.get("email")
-        password = password or credentials.get("password")
-        if not email or not password:
-            return {"error": "Authentication credentials not provided or found in config."}
-
-        return await brain_client.read_forum_post(email, password, article_id, include_comments)
+        return await brain_client.read_forum_post(article_id, include_comments)
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
@@ -4389,24 +4350,12 @@ async def create_multi_simulation(
             return {"error": "At least 2 alpha expressions are required"}
         if len(alpha_expressions_with_settings) > 8:
             return {"error": "Maximum 8 alpha expressions allowed per request"}
-        # All alphas type must be REGULAR
-        if not all(item.get('type') == 'REGULAR' for item in alpha_expressions_with_settings):
-            return {"error": "All alpha expressions must be of type REGULAR"}
-        # All alpha expressions must have the same delay。
-        if not all(item.get('settings', {}).get('delay') == alpha_expressions_with_settings[0].get('settings', {}).get('delay') for item in alpha_expressions_with_settings):
-            return {"error": "All alpha expressions must have the same delay"}
-        # Log debug info
-        _log('DEBUG', f"Multisim payload[0]: {payload[0] if payload else 'empty'}")
-        # Send multisimulation request
-        response = brain_client.session.post(f"{brain_client.base_url}/simulations", json=payload)
         
-        total_requested = len(alpha_expressions_with_settings)
-        await brain_client.ensure_authenticated()
-        # Convert Pydantic models to dicts for JSON serialization
+        # Convert Pydantic models to dicts first for validation and processing
         payload = []
         for item in alpha_expressions_with_settings:
             if hasattr(item, 'model_dump'):
-                d = item.model_dump(by_alias=True
+                d = item.model_dump(by_alias=True)
             elif hasattr(item, 'dict'):
                 d = item.dict(by_alias=True)
             else:
@@ -4419,6 +4368,20 @@ async def create_multi_simulation(
                 d.pop('combo', None)
                 d.pop('selection', None)
             payload.append(d)
+        
+        # All alphas type must be REGULAR
+        if not all(item.get('type') == 'REGULAR' for item in payload):
+            return {"error": "All alpha expressions must be of type REGULAR"}
+        # All alpha expressions must have the same delay。
+        if not all(item.get('settings', {}).get('delay') == payload[0].get('settings', {}).get('delay') for item in payload):
+            return {"error": "All alpha expressions must have the same delay"}
+        
+        total_requested = len(alpha_expressions_with_settings)
+        await brain_client.ensure_authenticated()
+        
+        # Log debug info
+        _log('DEBUG', f"Multisim payload[0]: {payload[0] if payload else 'empty'}")
+        
         # Send multisimulation request
         response = brain_client.session.post(f"{brain_client.base_url}/simulations", json=payload)
         
