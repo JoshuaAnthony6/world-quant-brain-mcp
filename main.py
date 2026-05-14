@@ -3473,6 +3473,26 @@ async def health_check(context: Context):
 
 _RA_2Y_NAMES = ("LOW_2Y_SHARPE", "IS_LADDER_SHARPE")
 
+# WebDataScope-0.10.20/src/scripts/background.js :: getAlphaCheckStates — canonical RA / PPA check names.
+_RA_CHECK_NAMES = frozenset([
+    "HIGH_TURNOVER", "LOW_TURNOVER", "LOW_FITNESS", "LOW_RETURNS", "LOW_SHARPE",
+    "LOW_GLB_AMER_SHARPE", "LOW_GLB_APAC_SHARPE", "LOW_GLB_EMEA_SHARPE", "LOW_ASI_JPN_SHARPE",
+    "IS_LADDER_SHARPE",  # ATOM-exempt but still counted in the RA gate
+    "LOW_2Y_SHARPE", "LOW_SUB_UNIVERSE_SHARPE", "LOW_ROBUST_UNIVERSE_SHARPE",
+    "LOW_AFTER_COST_ILLIQUID_UNIVERSE_SHARPE", "LOW_INVESTABILITY_CONSTRAINED_SHARPE",
+    "LOW_ROBUST_UNIVERSE_RETURNS", "CONCENTRATED_WEIGHT",
+])
+_PPA_CHECK_NAMES = frozenset([
+    "LOW_TURNOVER", "HIGH_TURNOVER", "LOW_SUB_UNIVERSE_SHARPE", "LOW_ROBUST_UNIVERSE_SHARPE",
+    "LOW_ROBUST_UNIVERSE_SHARPE.WITH_RATIO", "LOW_ROBUST_UNIVERSE_RETURNS",
+    "LOW_INVESTABILITY_CONSTRAINED_SHARPE",
+])
+
+
+def _ra_bad(result):
+    # WebDataScope rule: a check counts as failing the RA/PPA gate iff result != "PASS" and result != "PENDING"
+    return result != "PASS" and result != "PENDING"
+
 
 def _truncate(s, n=160):
     if not isinstance(s, str):
@@ -3497,27 +3517,41 @@ def _is_error(payload):
 
 
 def _slim_checks(checks):
-    """Compress an is.checks[] array into fail/warning/pass/pending buckets + pyramid info + headline values."""
+    """Compress an is.checks[] array into fail/warning/pass/pending buckets + pyramid info + headline values
+    + precomputed RA/PPA failure counts (WebDataScope getAlphaCheckStates). Returns (buckets, pyramids, extracted, ra)."""
     out = {"fail": [], "warning": [], "pass": [], "pending": []}
     pyramids = None
     extracted = {}
     rename = {"LOW_ROBUST_UNIVERSE_SHARPE": "robust_universe_sharpe",
               "LOW_SUB_UNIVERSE_SHARPE": "sub_universe_sharpe"}
+    failed_ra = 0
+    failed_ppa = 0
+    ra_failed_names = []
+    ppa_failed_names = []
     for c in checks or []:
         if not isinstance(c, dict):
             continue
         name = c.get("name")
         res = c.get("result")
+        val = c.get("value")
         if name == "MATCHES_PYRAMID":
             pyramids = {"effective": c.get("effective"),
                         "list": [{"name": p.get("name"), "multiplier": p.get("multiplier")}
                                  for p in (c.get("pyramids") or []) if isinstance(p, dict)]}
-        if name in rename and c.get("value") is not None:
-            extracted[rename[name]] = c.get("value")
-        if name in _RA_2Y_NAMES and c.get("value") is not None:
-            extracted["two_year_sharpe"] = c.get("value")
+        if name in rename and val is not None:
+            extracted[rename[name]] = val
+        if name in _RA_2Y_NAMES and val is not None:
+            extracted["two_year_sharpe"] = val
             if c.get("year") is not None:
                 extracted["two_year_ladder_window"] = c.get("year")
+        # --- RA / PPA failure counting (verbatim port of background.js getAlphaCheckStates) ---
+        if name in _RA_CHECK_NAMES and _ra_bad(res):
+            failed_ra += 1
+            ra_failed_names.append(name)
+        if (name in _PPA_CHECK_NAMES and _ra_bad(res)) or (name == "LOW_SHARPE" and isinstance(val, (int, float)) and val < 1):
+            failed_ppa += 1
+            ppa_failed_names.append(name)
+        # --- buckets ---
         if res == "FAIL":
             out["fail"].append({k: c.get(k) for k in ("name", "value", "limit", "year", "message", "date")
                                 if c.get(k) is not None})
@@ -3530,7 +3564,17 @@ def _slim_checks(checks):
             out["pass"].append(name)
         else:
             out["pass"].append(f"{name}:{res}")
-    return out, pyramids, extracted
+    ra = {"failed_ra_count": failed_ra, "failed_ppa_count": failed_ppa,
+          "ra_failed": failed_ra > 0, "ppa_failed": failed_ppa > 0}
+    if ra_failed_names:
+        ra["ra_failed_checks"] = ra_failed_names
+    if ppa_failed_names:
+        ra["ppa_failed_checks"] = ppa_failed_names
+    if pyramids and pyramids.get("list"):
+        # WQPPYS: the pyramid leaf names joined, e.g. "sentiment/analyst"
+        ra["pyramid_short"] = "/".join((p.get("name") or "").split("/")[-1].lower()
+                                       for p in pyramids["list"] if p.get("name"))
+    return out, pyramids, extracted, ra
 
 
 def _slim_alpha(a):
@@ -3540,10 +3584,15 @@ def _slim_alpha(a):
     isd = a.get("is") or {}
     inv = isd.get("investabilityConstrained") or {}
     rn = isd.get("riskNeutralized") or {}
-    checks, pyramids, extracted = _slim_checks(isd.get("checks"))
+    checks, pyramids, extracted, ra = _slim_checks(isd.get("checks"))
     metrics = {k: isd.get(k) for k in ("sharpe", "fitness", "turnover", "returns", "drawdown",
-                                       "margin", "longCount", "shortCount", "pnl", "bookSize", "startDate")
+                                       "margin", "longCount", "shortCount", "pnl", "bookSize", "startDate",
+                                       "sharpe_se", "sharpe_t_stat", "selfCorrelation", "prodCorrelation")
                if isd.get(k) is not None}
+    # also keep any other small scalar metric the platform may add later (excludes the big sub-dicts/checks)
+    for k, v in isd.items():
+        if k not in metrics and k not in ("checks", "investabilityConstrained", "riskNeutralized") and isinstance(v, (int, float)):
+            metrics[k] = v
     metrics.update(extracted)
     if inv.get("sharpe") is not None:
         metrics["investability_sharpe"] = inv.get("sharpe")
@@ -3561,6 +3610,7 @@ def _slim_alpha(a):
         "dateSubmitted": a.get("dateSubmitted"),
         "settings": a.get("settings"),
         "metrics": metrics or None,
+        "ra": ra,                 # precomputed Failed RA / Failed PPA (WebDataScope getAlphaCheckStates) — read this instead of recounting checks
         "checks": checks,
         "pyramids": pyramids,
     }
