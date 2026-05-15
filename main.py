@@ -2200,9 +2200,9 @@ class BrainApiClient:
         try:
             selection_data = {
                 "selection": selection,
-                "instrumentType": instrument_type,
-                "region": region,
-                "delay": delay,
+                "settings.instrumentType": instrument_type,
+                "settings.region": region,
+                "settings.delay": delay,
                 "selectionLimit": selection_limit,
                 "selectionHandling": selection_handling
             }
