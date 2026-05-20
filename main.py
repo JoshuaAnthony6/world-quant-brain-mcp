@@ -39,6 +39,28 @@ from forum_functions import forum_client
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# 1. 定义需要校验的RA检查项名称（自动去重，避免重复统计）
+RA_CHECK_NAMES = [
+    "HIGH_TURNOVER", "LOW_TURNOVER",
+    "LOW_FITNESS", "LOW_RETURNS", "LOW_SHARPE", 
+    'LOW_GLB_AMER_SHARPE', 'LOW_GLB_APAC_SHARPE', 'LOW_GLB_EMEA_SHARPE', 'LOW_ASI_JPN_SHARPE',
+    "IS_LADDER_SHARPE",
+    "LOW_2Y_SHARPE",  "LOW_SUB_UNIVERSE_SHARPE",  "LOW_ROBUST_UNIVERSE_SHARPE", 
+    "LOW_AFTER_COST_ILLIQUID_UNIVERSE_SHARPE", 'LOW_INVESTABILITY_CONSTRAINED_SHARPE',
+    "LOW_ROBUST_UNIVERSE_RETURNS", 
+    "CONCENTRATED_WEIGHT",  
+    "OLD_SIMULATION"                        
+]
+PPPA_CHECK_NAMES = [
+    'LOW_TURNOVER',
+    'HIGH_TURNOVER',
+    'LOW_SUB_UNIVERSE_SHARPE', 
+    'LOW_ROBUST_UNIVERSE_SHARPE', 
+    'LOW_ROBUST_UNIVERSE_SHARPE.WITH_RATIO',
+    "LOW_ROBUST_UNIVERSE_RETURNS",
+    'LOW_INVESTABILITY_CONSTRAINED_SHARPE'
+]
+
 def _log(level: str, message: str):
     """Print log message with timestamp to stderr."""
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]
@@ -3626,7 +3648,75 @@ async def get_alpha_details(alpha_id: str) -> Dict[str, Any]:
         Detailed alpha information
     """
     try:
-        return await brain_client.get_alpha_details(alpha_id)
+        data =  await brain_client.get_alpha_details(alpha_id)
+        is_data = data.get('is', {})
+        checks_data = is_data.get('checks', [])
+        result = {
+            'id': data.get('id', ''),
+            'settings': data.get('settings', {}),
+            'regular.code': data.get('regular', {}).get('code', ''),
+            'selection.code': data.get('selection', {}).get('code', ''),
+            'combo.code': data.get('combo', {}).get('code', ''),
+            'sharpe': is_data.get('sharpe', 0),
+            'fitness': is_data.get('fitness', 0),
+            'turnover': is_data.get('turnover', 0),
+            'margin': is_data.get('margin', 0),
+            'returns': is_data.get('returns', 0),
+            'name': data.get('name', ''),
+            'color': data.get('color', ''),
+            'status': data.get('status', ''),
+
+        }
+        # 剔除掉PASS及PENDING的检查项
+        filtered_checks = [check for check in checks_data if check.get('result') not in ['PASS', 'PENDING']]
+        
+        # 检查FAIL项
+        fail_checks = [check for check in filtered_checks if check.get('result') == 'FAIL']
+        if fail_checks:
+            result['atom.passed'] = False
+            fail_messages = []
+            for check in fail_checks:
+                name = check.get('name', '')
+                value = check.get('value', 0)
+                limit = check.get('limit', 0)
+                fail_messages.append(f"{name}: FAIL({value:.6f}>{limit})")
+            result['is.checks_message'] = "; ".join(fail_messages)
+            return result
+
+        # 检查是否存在RA_CHECK_NAMES中WARNING的项（name在RA_CHECK_NAMES中且result=WARNING）
+        # 若存在，则设置raPassed为False，并将所有WARNING项以以下格式输出到message中
+        # 检查项名称：检查项结果(检查项值<>限制值)
+        # 检查项格式：{"name": "CONCENTRATED_WEIGHT","result": "WARNING","date": "2016-10-28","limit": 0.1,"value": 0.108229}
+        warning_checks = [check for check in filtered_checks 
+                        if check.get('result') == 'WARNING' and check.get('name') in RA_CHECK_NAMES]
+        if warning_checks:
+            result['raPassed'] = False
+            warning_messages = []
+            for check in warning_checks:
+                name = check.get('name', '')
+                value = check.get('value', 0)
+                limit = check.get('limit', 0)
+                warning_messages.append(f"{name}: WARNING({value:.6f}<>{limit})")
+            result['checks_message'] = "; ".join(warning_messages)
+            # 检查是否存在PPA_CHECK_NAMES中PASS的项（name在PPA_CHECK_NAMES中且result=PASS）
+            pass_checks = [check for check in filtered_checks 
+                            if check.get('result') == 'PASS' and check.get('name') in PPA_CHECK_NAMES]
+            if pass_checks:
+                result['ppaPassed'] = False
+                pass_messages = []
+                for check in pass_checks:
+                    name = check.get('name', '')
+                    value = check.get('value', 0)
+                    limit = check.get('limit', 0)
+                    pass_messages.append(f"{name}: PASS({value:.6f}<>{limit})")
+                result['checks_message'] = "; ".join(pass_messages)
+                return result
+            result['ppaPassed'] = True
+            return result
+        
+        result['raPassed'] = True
+
+        return result
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
@@ -4088,7 +4178,7 @@ async def set_alpha_properties(alpha_id: str, name: Optional[str] = None,
       Args:
         color: may be one of `RED` `GREEN` `YELLOW` `BLUE` `PURPLE`；
         name: 使用生产相关性命名，不能带空格；建议基于 production correlation
-        的最大值命名，例如 `0.6534` 表示 prod correlation = 0.6534；
+        的最大值命名，例如 `PC0.6534` 表示 prod correlation = 0.6534；`SC0.6534` 表示 self correlation = 0.6534；
         tags 至少包含 `PowerPoolSelected`；
         descriptions: Write in English, <=100 words. The three sections MUST be separated by
         actual newline characters (i.e. use the JSON escape sequence \\n\\n between sections,
