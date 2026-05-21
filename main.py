@@ -3673,19 +3673,20 @@ async def get_alpha_details(alpha_id: str) -> Dict[str, Any]:
         # 检查FAIL项
         fail_checks = [check for check in filtered_checks if check.get('result') == 'FAIL']
         if fail_checks:
-            result['atom.passed'] = False
+            result['raPassed'] = False
             fail_messages = []
             for check in fail_checks:
                 name = check.get('name', '')
                 value = check.get('value', 0)
                 limit = check.get('limit', 0)
-                fail_messages.append(f"{name}: FAIL({value:.6f}>{limit})")
+                operator = '>' if value > limit else '<'
+                fail_messages.append(f"{name}: FAIL({value:.6f}{operator}{limit})")
             result['is.checks_message'] = "; ".join(fail_messages)
             return result
 
         # 检查是否存在RA_CHECK_NAMES中WARNING的项（name在RA_CHECK_NAMES中且result=WARNING）
         # 若存在，则设置raPassed为False，并将所有WARNING项以以下格式输出到message中
-        # 检查项名称：检查项结果(检查项值<>限制值)
+        # 检查项名称：检查项值>限制值（如果限制值<检查项值，描述应该为检查项值>限制值，否则为检查项值<限制值）
         # 检查项格式：{"name": "CONCENTRATED_WEIGHT","result": "WARNING","date": "2016-10-28","limit": 0.1,"value": 0.108229}
         warning_checks = [check for check in filtered_checks 
                         if check.get('result') == 'WARNING' and check.get('name') in RA_CHECK_NAMES]
@@ -3696,7 +3697,8 @@ async def get_alpha_details(alpha_id: str) -> Dict[str, Any]:
                 name = check.get('name', '')
                 value = check.get('value', 0)
                 limit = check.get('limit', 0)
-                warning_messages.append(f"{name}: WARNING({value:.6f}<>{limit})")
+                operator = '>' if value > limit else '<'
+                warning_messages.append(f"{name}: WARNING({value:.6f}{operator}{limit})")
             result['checks_message'] = "; ".join(warning_messages)
             # 检查是否存在PPA_CHECK_NAMES中PASS的项（name在PPA_CHECK_NAMES中且result=PASS）
             pass_checks = [check for check in filtered_checks 
@@ -3708,7 +3710,8 @@ async def get_alpha_details(alpha_id: str) -> Dict[str, Any]:
                     name = check.get('name', '')
                     value = check.get('value', 0)
                     limit = check.get('limit', 0)
-                    pass_messages.append(f"{name}: PASS({value:.6f}<>{limit})")
+                    operator = '>' if value > limit else '<'
+                    pass_messages.append(f"{name}: PASS({value:.6f}{operator}{limit})")
                 result['checks_message'] = "; ".join(pass_messages)
                 return result
             result['ppaPassed'] = True
