@@ -53,9 +53,10 @@ class SimulationSettings(BaseModel):
     neutralization: str = "NONE"
     truncation: float = 0.0
     pasteurization: str = "ON"
-    unitHandling: str = "VERIFY"
-    nanHandling: str = "OFF"
+    unitHandling: Optional[str] = "VERIFY"
+    nanHandling: Optional[str] = "OFF"
     language: str = "FASTEXPR"
+    lookback: Optional[int] = None
     visualization: bool = True
     testPeriod: str = "P0Y0M"
     selectionHandling: str = "POSITIVE"
@@ -3877,7 +3878,10 @@ async def create_simulation(
     neutralization: str = "SUBINDUSTRY",
     truncation: float = 0.08,
     test_period: str = "P0Y0M",
+    language: str = "FASTEXPR",
+    unit_handling: str = "VERIFY",
     nan_handling: str = "ON",
+    lookback: Optional[int] = None,
     alpha_expression: Optional[str] = None,
     combo: Optional[str] = None,
     selection: Optional[str] = None,
@@ -3901,7 +3905,10 @@ async def create_simulation(
         neutralization: Neutralization method
         truncation: Truncation value
         test_period: Test period (e.g., "P0Y0M" for 1 year 6 months)
+        language: Expression language ("FASTEXPR" or "PYTHON")
+        unit_handling: Unit handling method. Used for FASTEXPR simulations.
         nan_handling: NaN handling method
+        lookback: Historical lookback window. Only used for PYTHON simulations; defaults to 256 for PYTHON.
         alpha_expression: Alpha expression code (for REGULAR type)
         combo: Combo code (for SUPER type)
         selection: Selection code (for SUPER type). For USA SUPER simulations,
@@ -3910,29 +3917,38 @@ async def create_simulation(
     Returns:
         Simulation creation result with ID and location
     """
-    unit_handling = "VERIFY"
     instrument_type = "EQUITY"
     visualization = False
-    language = "FASTEXPR"
     try:
+        normalized_language = language.upper()
+        settings_kwargs = {
+            "instrumentType": instrument_type,
+            "region": region,
+            "universe": universe,
+            "delay": delay,
+            "decay": decay,
+            "neutralization": neutralization,
+            "truncation": truncation,
+            "testPeriod": test_period,
+            "language": normalized_language,
+            "visualization": visualization,
+            "pasteurization": pasteurization,
+            "maxTrade": max_trade,
+            "selectionHandling": selection_handling,
+            "selectionLimit": selection_limit,
+            "componentActivation": component_activation,
+        }
+
+        if normalized_language == "PYTHON":
+            settings_kwargs["lookback"] = 256 if lookback is None else lookback
+            settings_kwargs["unitHandling"] = None
+            settings_kwargs["nanHandling"] = None
+        else:
+            settings_kwargs["unitHandling"] = unit_handling
+            settings_kwargs["nanHandling"] = nan_handling
+
         settings = SimulationSettings(
-            instrumentType=instrument_type,
-            region=region,
-            universe=universe,
-            delay=delay,
-            decay=decay,
-            neutralization=neutralization,
-            truncation=truncation,
-            testPeriod=test_period,
-            unitHandling=unit_handling,
-            nanHandling=nan_handling,
-            language=language,
-            visualization=visualization,
-            pasteurization=pasteurization,
-            maxTrade=max_trade, 
-            selectionHandling=selection_handling,
-            selectionLimit=selection_limit,
-            componentActivation=component_activation,
+            **settings_kwargs
         )
         
         sim_data = SimulationData(
