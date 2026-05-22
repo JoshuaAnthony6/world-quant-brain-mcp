@@ -4679,6 +4679,7 @@ async def create_multi_simulation(
     unit_handling: str = "VERIFY",
     nan_handling: str = "OFF",
     language: str = "FASTEXPR",
+    lookback: Optional[int] = None,
     visualization: bool = False,
     pasteurization: str = "ON",
     max_trade: str = "OFF"
@@ -4693,7 +4694,7 @@ async def create_multi_simulation(
     for the entire process and return comprehensive results.
     Call get_platform_setting_options to get the valid options for the simulation.
     Args:
-        alpha_expressions: List of alpha expressions (2-8 expressions required)
+        alpha_expressions: List of alpha expressions/code strings (2-10 expressions required)
         instrument_type: Type of instruments (default: "EQUITY")
         region: Market region (default: "USA")
         universe: Universe of stocks (default: "TOP3000")
@@ -4702,9 +4703,10 @@ async def create_multi_simulation(
         neutralization: Neutralization method (default: "NONE")
         truncation: Truncation value (default: 0.0)
         test_period: Test period (default: "P0Y0M")
-        unit_handling: Unit handling method (default: "VERIFY")
-        nan_handling: NaN handling method (default: "OFF")
-        language: Expression language (default: "FASTEXPR")
+        unit_handling: Unit handling method. Used for FASTEXPR simulations.
+        nan_handling: NaN handling method. Used for FASTEXPR simulations.
+        language: Expression language ("FASTEXPR" or "PYTHON")
+        lookback: Historical lookback window. Only used for PYTHON simulations; defaults to 256 for PYTHON.
         visualization: Enable visualization (default: False)
         pasteurization: Pasteurization setting (default: "ON")
         max_trade: Max trade setting (default: "OFF")
@@ -4716,39 +4718,51 @@ async def create_multi_simulation(
         # Validate input
         if len(alpha_expressions) < 2:
             return {"error": "At least 2 alpha expressions are required"}
-        if len(alpha_expressions) > 8:
-            return {"error": "Maximum 8 alpha expressions allowed per request"}
+        if len(alpha_expressions) > 10:
+            return {"error": "Maximum 10 alpha expressions allowed per request"}
+
+        await brain_client.ensure_authenticated()
+        normalized_language = language.upper()
         
         # Create multisimulation data
         multisimulation_data = []
         for alpha_expr in alpha_expressions:
+            settings = {
+                'instrumentType': instrument_type,
+                'region': region,
+                'universe': universe,
+                'delay': delay,
+                'decay': decay,
+                'neutralization': neutralization,
+                'truncation': truncation,
+                'pasteurization': pasteurization,
+                'language': normalized_language,
+                'visualization': visualization,
+                'testPeriod': test_period,
+                'maxTrade': max_trade
+            }
+
+            if normalized_language == "PYTHON":
+                settings['lookback'] = 256 if lookback is None else lookback
+            else:
+                settings['unitHandling'] = unit_handling
+                settings['nanHandling'] = nan_handling
+
             simulation_item = {
                 'type': 'REGULAR',
-                'settings': {
-                    'instrumentType': instrument_type,
-                    'region': region,
-                    'universe': universe,
-                    'delay': delay,
-                    'decay': decay,
-                    'neutralization': neutralization,
-                    'truncation': truncation,
-                    'pasteurization': pasteurization,
-                    'unitHandling': unit_handling,
-                    'nanHandling': nan_handling,
-                    'language': language,
-                    'visualization': visualization,
-                    'testPeriod': test_period,
-                    'maxTrade': max_trade 
-                },
+                'settings': settings,
                 'regular': alpha_expr
             }
             multisimulation_data.append(simulation_item)
         
         # Send multisimulation request
-        response = brain_client.session.post(f"{brain_client.base_url}/simulations", json=multisimulation_data)
+        response = await brain_client._request('POST', f"{brain_client.base_url}/simulations", json=multisimulation_data)
         
         if response.status_code != 201:
-            return {"error": f"Failed to create multisimulation. Status: {response.status_code}"}
+            return {
+                "error": f"Failed to create multisimulation. Status: {response.status_code}",
+                "details": response.text,
+            }
         
         # Get multisimulation location
         location = response.headers.get('Location', '')
