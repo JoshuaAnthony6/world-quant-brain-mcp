@@ -88,6 +88,8 @@ class SimulationSettings(BaseModel):
     selectionHandling: str = "POSITIVE"
     selectionLimit: int = 1000
     maxTrade: str = "OFF"
+    maxPosition: str = "OFF"
+    lookback: int = 0
     componentActivation: str = "IS"
 
 class SimulationData(BaseModel):
@@ -812,6 +814,11 @@ class BrainApiClient:
                 settings_dict.pop('selectionHandling', None)
                 settings_dict.pop('selectionLimit', None)
                 settings_dict.pop('componentActivation', None)
+
+            # if language is PYTHON, remove unitHandling and nanHandling
+            if simulation_data.settings.language == "PYTHON":
+                settings_dict.pop('unitHandling', None)
+                settings_dict.pop('nanHandling', None)
             
             # Filter out None values from settings
             settings_dict = {k: v for k, v in settings_dict.items() if v is not None}
@@ -3550,87 +3557,51 @@ async def manage_config(action: str = "get", settings: Optional[Dict[str, Any]] 
 # --- Simulation Tools ---
 
 @mcp.tool()
-async def create_simulation(
-    type: str = "REGULAR",
-    region: str = "USA",
-    universe: str = "TOP3000",
-    delay: int = 1,
-    decay: int = 4,
-    neutralization: str = "SUBINDUSTRY",
-    truncation: float = 0.08,
-    test_period: str = "P0Y0M",
-    nan_handling: str = "ON",
-    alpha_expression: Optional[str] = None,
-    combo: Optional[str] = None,
-    selection: Optional[str] = None,
-    pasteurization: str = "ON",
-    max_trade: str = "OFF",
-    selection_handling: str = "POSITIVE",
-    selection_limit: int = 1000,
-    component_activation: str = "IS",
-) -> Dict[str, Any]:
+async def create_simulation(simulation_data: SimulationData) -> Dict[str, Any]:
     """
     Create a new simulation on BRAIN platform.
     
     This tool creates and starts a simulation with your alpha code. Use this after you have your alpha formula ready.
-    if field type=VECTOR should deal with vec_ suffer vec_*(FIELD)
+    If field type=VECTOR should deal with vec_ prefix, e.g., vec_*(FIELD)
+    
     Args:
-        type: Simulation type ("REGULAR" or "SUPER")
-        region: Market region (e.g., "USA")
-        universe: Universe of stocks (e.g., "TOP3000")
-        delay: Data delay (0 or 1)
-        decay: Decay value for the simulation
-        neutralization: Neutralization method
-        truncation: Truncation value
-        test_period: Test period (e.g., "P0Y0M" for 1 year 6 months)
-        nan_handling: NaN handling method
-        alpha_expression: Alpha expression code (for REGULAR type)
-        combo: Combo code (for SUPER type)
-        selection: Selection code (for SUPER type). For USA SUPER simulations,
-            this must include (prod_correlation > 0)
+        simulation_data: SimulationData object containing:
+            - type: Simulation type ("REGULAR" or "SUPER")
+            - settings: SimulationSettings object with fields:
+                - instrumentType: Instrument type, e.g., "EQUITY"
+                - region: Market region, e.g., "USA", "EUR", "ASI", "CHN"
+                - universe: Stock universe, e.g., "TOP3000", "TOP500", "TOPCS1600"
+                - delay: Data delay, 0 or 1
+                - decay: Decay value, e.g., 0, 4, 6, 8, 10
+                - neutralization: Neutralization method, e.g., "NONE", "MARKET", "SUBINDUSTRY", "INDUSTRY", "SECTOR"
+                - truncation: Truncation value, e.g., 0.0, 0.01, 0.08
+                - pasteurization: "ON" or "OFF"
+                - unitHandling: "VERIFY" or "IGNORE"
+                - nanHandling: "ON" or "OFF"
+                - language: Expression language, e.g., "FASTEXPR"
+                - visualization: Enable visualization, true or false
+                - testPeriod: Test period, e.g., "P0D", "P0Y0M"
+                - selectionHandling: "POSITIVE" or other
+                - selectionLimit: Selection limit, e.g., 1000
+                - maxTrade: "ON" or "OFF"
+                - maxPosition: "ON" or "OFF" - Limit position sizes (actual sim)
+                - lookback: Extra history rows, window = lookback + 1, e.g., 0, 5, 21, 63
+                - componentActivation: "IS" or other
+            - regular: Alpha expression code (for REGULAR type)
+            - combo: Combo code (for SUPER type)
+            - selection: Selection code (for SUPER type). For USA SUPER simulations,
+                this must include (prod_correlation > 0)
     
     Returns:
         Simulation creation result with ID and location
     """
-    unit_handling = "VERIFY"
-    instrument_type = "EQUITY"
-    visualization = False
-    language = "FASTEXPR"
     try:
-        settings = SimulationSettings(
-            instrumentType=instrument_type,
-            region=region,
-            universe=universe,
-            delay=delay,
-            decay=decay,
-            neutralization=neutralization,
-            truncation=truncation,
-            testPeriod=test_period,
-            unitHandling=unit_handling,
-            nanHandling=nan_handling,
-            language=language,
-            visualization=visualization,
-            pasteurization=pasteurization,
-            maxTrade=max_trade, 
-            selectionHandling=selection_handling,
-            selectionLimit=selection_limit,
-            componentActivation=component_activation,
-        )
-        
-        sim_data = SimulationData(
-            type=type,
-            settings=settings,
-            regular=alpha_expression,
-            combo=combo,
-            selection=selection
-        )
-        
-        return await brain_client.create_simulation(sim_data)
+        return await brain_client.create_simulation(simulation_data)
     except Exception as e:
         extra_info = ""
         error_msg = str(e)
         if error_msg and "does not support event inputs" in error_msg:
-            extra_info = "If fields is vector type  should use vec_* operator with event input"
+            extra_info = "If fields is vector type should use vec_* operator with event input"
             return {"error": f"An unexpected error occurred: {str(e)}. {extra_info}"}
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
@@ -4400,7 +4371,8 @@ async def create_multi_simulation(
                 - visualization (bool): Enable visualization
                 - testPeriod (str): Test period, e.g. "P0D", "P0Y0M"
                 - maxTrade (str): "ON" or "OFF"
-                - maxPosition (str): "ON" or "OFF"
+                - maxPosition (str): "ON" or "OFF" - Limit position sizes (actual sim)
+                - lookback (int): Extra history rows, window = lookback + 1, e.g. 0, 5, 21, 63
 
                 Example:
                     [
