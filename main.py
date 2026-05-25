@@ -213,6 +213,46 @@ class BrainApiClient:
             return url
         return urljoin(self.base_url, url)
 
+    def _response_payload(self, response: requests.Response) -> Any:
+        """Return JSON when possible, otherwise response text for diagnostics."""
+        try:
+            return response.json()
+        except ValueError:
+            return response.text
+
+    def _simulation_error_message(self, data: Any) -> str:
+        """Extract the most useful error text from a simulation progress payload."""
+        if not isinstance(data, dict):
+            return str(data) if data is not None else "Unknown error"
+
+        for key in ("error", "message", "detail", "details", "statusMessage", "status"):
+            value = data.get(key)
+            if value:
+                if isinstance(value, (dict, list)):
+                    return json.dumps(value, ensure_ascii=False)
+                return str(value)
+
+        collected: list[str] = []
+
+        def visit(node: Any) -> None:
+            if len(collected) >= 8:
+                return
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    lower = str(key).lower()
+                    if any(token in lower for token in ("error", "message", "exception", "traceback")) and value:
+                        if isinstance(value, (dict, list)):
+                            collected.append(json.dumps(value, ensure_ascii=False))
+                        else:
+                            collected.append(str(value))
+                    visit(value)
+            elif isinstance(node, list):
+                for item in node:
+                    visit(item)
+
+        visit(data)
+        return " | ".join(collected) if collected else "Unknown error"
+
     def _generate_cache_key(self, prefix: str, params: dict) -> str:
         """Generate a cache key from prefix and parameters."""
         # Sort params to ensure consistent key generation
@@ -810,7 +850,19 @@ class BrainApiClient:
             payload = {k: v for k, v in payload.items() if v is not None}
             
             response = await self._request('POST', f"{self.base_url}/simulations", json=payload)
-            response.raise_for_status()
+            if response.status_code >= 400:
+                return {
+                    "error": "Failed to create simulation",
+                    "status_code": response.status_code,
+                    "response": self._response_payload(response),
+                    "request": {
+                        "type": simulation_data.type,
+                        "settings": settings_dict,
+                        "has_regular": bool(simulation_data.regular),
+                        "has_combo": bool(simulation_data.combo),
+                        "has_selection": bool(simulation_data.selection),
+                    },
+                }
             
             location = response.headers.get('Location', '')
             location_url = self._to_absolute_url(location)
@@ -861,10 +913,23 @@ class BrainApiClient:
             self.log("Alpha done simulating, getting alpha details", "INFO")
             
             progress_data = simulation_progress.json()
-            if "alpha" not in progress_data:
-                # Handle error case where alpha ID is missing
-                error_message = progress_data.get("message", "Unknown error")
-                raise Exception(f"Simulation failed or returned no alpha ID. Details: {error_message}")
+            if not progress_data.get("alpha"):
+                return {
+                    "error": "Simulation failed or returned no alpha ID",
+                    "message": self._simulation_error_message(progress_data),
+                    "simulation_id": simulation_id,
+                    "location": location,
+                    "location_url": location_url,
+                    "status": progress_data.get("status"),
+                    "progress": progress_data,
+                    "request": {
+                        "type": simulation_data.type,
+                        "settings": settings_dict,
+                        "has_regular": bool(simulation_data.regular),
+                        "has_combo": bool(simulation_data.combo),
+                        "has_selection": bool(simulation_data.selection),
+                    },
+                }
                 
             alpha_id = progress_data["alpha"]
             
@@ -4959,22 +5024,26 @@ async def lookINTO_SimError_message(locations: Sequence[str]) -> dict:
             if resp.status_code != 200:
                 results.append({
                     "location": loc,
+                    "location_url": brain_client._to_absolute_url(loc),
                     "error": f"HTTP {resp.status_code}",
-                    "raw": resp.text
+                    "status_code": resp.status_code,
+                    "raw": brain_client._response_payload(resp)
                 })
                 continue
             data = resp.json() if resp.text else {}
-            # Try to extract error message or status
-            error_msg = data.get("error") or data.get("message")
+            error_msg = brain_client._simulation_error_message(data)
             # If alpha ID is missing, include that info
-            if not data.get("alpha"):
-                error_msg = error_msg or "Simulation did not get through, if you are running a multisimulation, check the other children location in your request"
+            if not data.get("alpha") and error_msg == "Unknown error":
+                error_msg = "Simulation did not get through; inspect raw/status for the platform response."
             extra_info = ""
             if error_msg and "does not support event inputs" in error_msg:
                 extra_info = "Operator xxx does not support event inputs : If fields is vector type  should use vec_* operator with event input"
             results.append({
                 "location": loc,
+                "location_url": brain_client._to_absolute_url(loc),
                 "error": error_msg,
+                "status": data.get("status"),
+                "alpha": data.get("alpha"),
                 "raw": data,
                 "extra_info": extra_info
             })
