@@ -902,21 +902,8 @@ class BrainApiClient:
             alpha_id = progress_data["alpha"]
             
             # Fetch alpha details with retry logic
-            alpha_response = None
-            for alpha_attempt in range(max_poll_retries):
-                try:
-                    alpha_response = await self._request('GET', f"https://api.worldquantbrain.com/alphas/{alpha_id}")
-                    break
-                except (ConnectionError, TimeoutError) as e:
-                    if alpha_attempt < max_poll_retries - 1:
-                        retry_wait = poll_retry_delay * (1.5 ** alpha_attempt)
-                        self.log(f"⚠️ Failed to fetch alpha details (attempt {alpha_attempt + 1}/{max_poll_retries}), retrying in {retry_wait:.1f}s: {str(e)}", "WARNING")
-                        await asyncio.sleep(retry_wait)
-                    else:
-                        self.log(f"❌ Failed to fetch alpha details after {max_poll_retries} attempts: {str(e)}", "ERROR")
-                        raise
-            
-            return alpha_response.json()
+            alpha_response = await self.get_alpha_details(alpha_id)
+            return self.parse_alpha_details(alpha_response)
             
         except Exception as e:
             self.log(f"❌ Failed to create simulation: {str(e)}", "ERROR")
@@ -935,6 +922,85 @@ class BrainApiClient:
         except Exception as e:
             self.log(f"Failed to get alpha details: {str(e)}", "ERROR")
             raise
+    
+    def parse_alpha_details(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Parse alpha details and check validation results.
+        
+        Args:
+            data: Raw alpha details data from API
+            
+        Returns:
+            Parsed alpha information with validation results
+        """
+        is_data = data.get('is', {})
+        checks_data = is_data.get('checks', [])
+        result = {
+            'id': data.get('id', ''),
+            'settings': data.get('settings', {}),
+            'regular.code': data.get('regular', {}).get('code', ''),
+            'selection.code': data.get('selection', {}).get('code', ''),
+            'combo.code': data.get('combo', {}).get('code', ''),
+            'sharpe': is_data.get('sharpe', 0),
+            'fitness': is_data.get('fitness', 0),
+            'turnover': is_data.get('turnover', 0),
+            'margin': is_data.get('margin', 0),
+            'returns': is_data.get('returns', 0),
+            'name': data.get('name', ''),
+            'color': data.get('color', ''),
+            'status': data.get('status', ''),
+        }
+        # 剔除掉PASS及PENDING的检查项
+        filtered_checks = [check for check in checks_data if check.get('result') not in ['PASS', 'PENDING']]
+        
+        # 检查FAIL项
+        fail_checks = [check for check in filtered_checks if check.get('result') == 'FAIL']
+        if fail_checks:
+            result['raPassed'] = False
+            fail_messages = []
+            for check in fail_checks:
+                name = check.get('name', '')
+                value = check.get('value', 0)
+                limit = check.get('limit', 0)
+                operator = '>' if value > limit else '<'
+                fail_messages.append(f"{name}: FAIL({value:.6f}{operator}{limit})")
+            result['is.checks_message'] = "; ".join(fail_messages)
+            return result
+
+        # 检查是否存在RA_CHECK_NAMES中WARNING的项（name在RA_CHECK_NAMES中且result=WARNING）
+        # 若存在，则设置raPassed为False，并将所有WARNING项以以下格式输出到message中
+        # 检查项名称：检查项值>限制值（如果限制值<检查项值，描述应该为检查项值>限制值，否则为检查项值<限制值）
+        # 检查项格式：{"name": "CONCENTRATED_WEIGHT","result": "WARNING","date": "2016-10-28","limit": 0.1,"value": 0.108229}
+        warning_checks = [check for check in filtered_checks 
+                        if check.get('result') == 'WARNING' and check.get('name') in RA_CHECK_NAMES]
+        if warning_checks:
+            result['raPassed'] = False
+            warning_messages = []
+            for check in warning_checks:
+                name = check.get('name', '')
+                value = check.get('value', 0)
+                limit = check.get('limit', 0)
+                operator = '>' if value > limit else '<'
+                warning_messages.append(f"{name}: WARNING({value:.6f}{operator}{limit})")
+            result['checks_message'] = "; ".join(warning_messages)
+            # 检查是否存在PPA_CHECK_NAMES中PASS的项（name在PPA_CHECK_NAMES中且result=PASS）
+            pass_checks = [check for check in filtered_checks 
+                            if check.get('result') == 'PASS' and check.get('name') in PPA_CHECK_NAMES]
+            if pass_checks:
+                result['ppaPassed'] = False
+                pass_messages = []
+                for check in pass_checks:
+                    name = check.get('name', '')
+                    value = check.get('value', 0)
+                    limit = check.get('limit', 0)
+                    operator = '>' if value > limit else '<'
+                    pass_messages.append(f"{name}: PASS({value:.6f}{operator}{limit})")
+                result['checks_message'] = "; ".join(pass_messages)
+                return result
+            result['ppaPassed'] = True
+            return result
+        
+        result['raPassed'] = True
+        return result
     
     async def get_datasets(self, category: Optional[str] = None, region: str = "USA",
                           delay: int = 1, universe: str = "TOP3000", theme: str = "false", search: Optional[str] = None) -> Dict[str, Any]:
@@ -3557,7 +3623,31 @@ async def manage_config(action: str = "get", settings: Optional[Dict[str, Any]] 
 # --- Simulation Tools ---
 
 @mcp.tool()
-async def create_simulation(simulation_data: SimulationData) -> Dict[str, Any]:
+async def create_simulation(
+    type: str = "REGULAR",
+    instrumentType: str = "EQUITY",
+    region: str = "USA",
+    universe: str = "TOP3000",
+    delay: int = 1,
+    decay: float = 0.0,
+    neutralization: str = "NONE",
+    truncation: float = 0.0,
+    pasteurization: str = "ON",
+    unitHandling: str = "VERIFY",
+    nanHandling: str = "OFF",
+    language: str = "FASTEXPR",
+    visualization: bool = True,
+    testPeriod: str = "P0Y0M",
+    selectionHandling: str = "POSITIVE",
+    selectionLimit: int = 1000,
+    maxTrade: str = "OFF",
+    maxPosition: str = "OFF",
+    lookback: int = 0,
+    componentActivation: str = "IS",
+    regular: Optional[str] = None,
+    combo: Optional[str] = None,
+    selection: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Create a new simulation on BRAIN platform.
     
@@ -3565,37 +3655,63 @@ async def create_simulation(simulation_data: SimulationData) -> Dict[str, Any]:
     If field type=VECTOR should deal with vec_ prefix, e.g., vec_*(FIELD)
     
     Args:
-        simulation_data: SimulationData object containing:
-            - type: Simulation type ("REGULAR" or "SUPER")
-            - settings: SimulationSettings object with fields:
-                - instrumentType: Instrument type, e.g., "EQUITY"
-                - region: Market region, e.g., "USA", "EUR", "ASI", "CHN"
-                - universe: Stock universe, e.g., "TOP3000", "TOP500", "TOPCS1600"
-                - delay: Data delay, 0 or 1
-                - decay: Decay value, e.g., 0, 4, 6, 8, 10
-                - neutralization: Neutralization method, e.g., "NONE", "MARKET", "SUBINDUSTRY", "INDUSTRY", "SECTOR"
-                - truncation: Truncation value, e.g., 0.0, 0.01, 0.08
-                - pasteurization: "ON" or "OFF"
-                - unitHandling: "VERIFY" or "IGNORE"
-                - nanHandling: "ON" or "OFF"
-                - language: Expression language, e.g., "FASTEXPR"
-                - visualization: Enable visualization, true or false
-                - testPeriod: Test period, e.g., "P0D", "P0Y0M"
-                - selectionHandling: "POSITIVE" or other
-                - selectionLimit: Selection limit, e.g., 1000
-                - maxTrade: "ON" or "OFF"
-                - maxPosition: "ON" or "OFF" - Limit position sizes (actual sim)
-                - lookback: Extra history rows, window = lookback + 1, e.g., 0, 5, 21, 63
-                - componentActivation: "IS" or other
-            - regular: Alpha expression code (for REGULAR type)
-            - combo: Combo code (for SUPER type)
-            - selection: Selection code (for SUPER type). For USA SUPER simulations,
-                this must include (prod_correlation > 0)
+        type: Simulation type ("REGULAR" or "SUPER")
+        instrumentType: Instrument type, e.g., "EQUITY"
+        region: Market region, e.g., "USA", "EUR", "ASI", "CHN"
+        universe: Stock universe, e.g., "TOP3000", "TOP500", "TOPCS1600"
+        delay: Data delay, 0 or 1
+        decay: Decay value, e.g., 0, 4, 6, 8, 10
+        neutralization: Neutralization method, e.g., "NONE", "MARKET", "SUBINDUSTRY", "INDUSTRY", "SECTOR"
+        truncation: Truncation value, e.g., 0.0, 0.01, 0.08
+        pasteurization: "ON" or "OFF"
+        unitHandling: "VERIFY" or "IGNORE"
+        nanHandling: "ON" or "OFF"
+        language: Expression language, e.g., "FASTEXPR"
+        visualization: Enable visualization, true or false
+        testPeriod: Test period, e.g., "P0D", "P0Y0M"
+        selectionHandling: "POSITIVE" or other
+        selectionLimit: Selection limit, e.g., 1000
+        maxTrade: "ON" or "OFF"
+        maxPosition: "ON" or "OFF" - Limit position sizes (actual sim)
+        lookback: Extra history rows, window = lookback + 1, e.g., 0, 5, 21, 63
+        componentActivation: "IS" or other
+        regular: Alpha expression code (for REGULAR type)
+        combo: Combo code (for SUPER type)
+        selection: Selection code (for SUPER type). For USA SUPER simulations,
+            this must include (prod_correlation > 0)
     
     Returns:
         Simulation creation result with ID and location
     """
     try:
+        settings = SimulationSettings(
+            instrumentType=instrumentType,
+            region=region,
+            universe=universe,
+            delay=delay,
+            decay=decay,
+            neutralization=neutralization,
+            truncation=truncation,
+            pasteurization=pasteurization,
+            unitHandling=unitHandling,
+            nanHandling=nanHandling,
+            language=language,
+            visualization=visualization,
+            testPeriod=testPeriod,
+            selectionHandling=selectionHandling,
+            selectionLimit=selectionLimit,
+            maxTrade=maxTrade,
+            maxPosition=maxPosition,
+            lookback=lookback,
+            componentActivation=componentActivation,
+        )
+        simulation_data = SimulationData(
+            type=type,
+            settings=settings,
+            regular=regular,
+            combo=combo,
+            selection=selection,
+        )
         return await brain_client.create_simulation(simulation_data)
     except Exception as e:
         extra_info = ""
@@ -3619,78 +3735,8 @@ async def get_alpha_details(alpha_id: str) -> Dict[str, Any]:
         Detailed alpha information
     """
     try:
-        data =  await brain_client.get_alpha_details(alpha_id)
-        is_data = data.get('is', {})
-        checks_data = is_data.get('checks', [])
-        result = {
-            'id': data.get('id', ''),
-            'settings': data.get('settings', {}),
-            'regular.code': data.get('regular', {}).get('code', ''),
-            'selection.code': data.get('selection', {}).get('code', ''),
-            'combo.code': data.get('combo', {}).get('code', ''),
-            'sharpe': is_data.get('sharpe', 0),
-            'fitness': is_data.get('fitness', 0),
-            'turnover': is_data.get('turnover', 0),
-            'margin': is_data.get('margin', 0),
-            'returns': is_data.get('returns', 0),
-            'name': data.get('name', ''),
-            'color': data.get('color', ''),
-            'status': data.get('status', ''),
-
-        }
-        # 剔除掉PASS及PENDING的检查项
-        filtered_checks = [check for check in checks_data if check.get('result') not in ['PASS', 'PENDING']]
-        
-        # 检查FAIL项
-        fail_checks = [check for check in filtered_checks if check.get('result') == 'FAIL']
-        if fail_checks:
-            result['raPassed'] = False
-            fail_messages = []
-            for check in fail_checks:
-                name = check.get('name', '')
-                value = check.get('value', 0)
-                limit = check.get('limit', 0)
-                operator = '>' if value > limit else '<'
-                fail_messages.append(f"{name}: FAIL({value:.6f}{operator}{limit})")
-            result['is.checks_message'] = "; ".join(fail_messages)
-            return result
-
-        # 检查是否存在RA_CHECK_NAMES中WARNING的项（name在RA_CHECK_NAMES中且result=WARNING）
-        # 若存在，则设置raPassed为False，并将所有WARNING项以以下格式输出到message中
-        # 检查项名称：检查项值>限制值（如果限制值<检查项值，描述应该为检查项值>限制值，否则为检查项值<限制值）
-        # 检查项格式：{"name": "CONCENTRATED_WEIGHT","result": "WARNING","date": "2016-10-28","limit": 0.1,"value": 0.108229}
-        warning_checks = [check for check in filtered_checks 
-                        if check.get('result') == 'WARNING' and check.get('name') in RA_CHECK_NAMES]
-        if warning_checks:
-            result['raPassed'] = False
-            warning_messages = []
-            for check in warning_checks:
-                name = check.get('name', '')
-                value = check.get('value', 0)
-                limit = check.get('limit', 0)
-                operator = '>' if value > limit else '<'
-                warning_messages.append(f"{name}: WARNING({value:.6f}{operator}{limit})")
-            result['checks_message'] = "; ".join(warning_messages)
-            # 检查是否存在PPA_CHECK_NAMES中PASS的项（name在PPA_CHECK_NAMES中且result=PASS）
-            pass_checks = [check for check in filtered_checks 
-                            if check.get('result') == 'PASS' and check.get('name') in PPA_CHECK_NAMES]
-            if pass_checks:
-                result['ppaPassed'] = False
-                pass_messages = []
-                for check in pass_checks:
-                    name = check.get('name', '')
-                    value = check.get('value', 0)
-                    limit = check.get('limit', 0)
-                    operator = '>' if value > limit else '<'
-                    pass_messages.append(f"{name}: PASS({value:.6f}{operator}{limit})")
-                result['checks_message'] = "; ".join(pass_messages)
-                return result
-            result['ppaPassed'] = True
-            return result
-        
-        result['raPassed'] = True
-
-        return result
+        data = await brain_client.get_alpha_details(alpha_id)
+        return brain_client.parse_alpha_details(data)
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
@@ -4531,18 +4577,15 @@ async def _wait_for_multisimulation_completion(location: str, expected_children:
                     if alpha_id:
                         # Now get the actual alpha details from the alpha endpoint
                         alpha_details = await brain_client._request('GET', f"{brain_client.base_url}/alphas/{alpha_id}")
-                        if alpha_details.status_code == 200:
-                            alpha_detail_data = alpha_details.json()
+                        try:
+                            alpha_response = await self.get_alpha_details(alpha_id)
+                            alpha_detail_data = self.parse_alpha_details(alpha_response)
+                            alpha_results.append(alpha_results)
+                        except Exception as e:
                             alpha_results.append({
                                 'alpha_id': alpha_id,
                                 'location': child_url,
-                                'details': alpha_detail_data
-                            })
-                        else:
-                            alpha_results.append({
-                                'alpha_id': alpha_id,
-                                'location': child_url,
-                                'error': f'Failed to get alpha details: {alpha_details.status_code}'
+                                'error': f'Failed to parse alpha details: {str(e)}'
                             })
                     else:
                         alpha_results.append({
