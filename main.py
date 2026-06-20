@@ -35,6 +35,9 @@ from pydantic import BaseModel, Field, EmailStr, model_validator
 # Import the new forum client
 from forum_functions import forum_client
 
+# Import the BRAIN Labs client (Playwright sign-in + single-concurrency lock)
+from labs_functions import labs_client
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -3351,18 +3354,29 @@ class BrainApiClient:
             self.log(f"Failed to get instrument options: {str(e)}", "ERROR")
             raise
             
-    async def performance_comparison(self, alpha_id: str, team_id: Optional[str] = None, 
-                                     competition: Optional[str] = None) -> Dict[str, Any]:
-        """Get performance comparison data for an alpha."""
+    async def performance_comparison(self, alpha_id: str, competition: Optional[str] = None,
+                                     team_id: Optional[str] = None) -> Dict[str, Any]:
+        """Get before-and-after performance comparison data for an alpha.
+
+        If a competition is provided, the competition-scoped endpoint is used;
+        otherwise the user's own (self) alpha endpoint is used.
+        """
         await self.ensure_authenticated()
-        
+
         try:
-            params = {"teamId": team_id, "competition": competition}
+            params = {"teamId": team_id}
             params = {k: v for k, v in params.items() if v is not None}
-            
-            response = await self._request('GET', f"{self.base_url}/alphas/{alpha_id}/performance-comparison", params=params)
-            response.raise_for_status()
-            return response.json()
+
+            if competition:
+                url = f"{self.base_url}/competitions/{competition}/alphas/{alpha_id}/before-and-after-performance"
+            else:
+                url = f"{self.base_url}/users/self/alphas/{alpha_id}/before-and-after-performance"
+
+            # The endpoint returns an empty body with a Retry-After header while
+            # the comparison is being computed, then JSON once it is ready.
+            return await self._request_json_with_retries(
+                'GET', url, params=params, op_name="performance_comparison"
+            )
         except Exception as e:
             self.log(f"Failed to get performance comparison: {str(e)}", "ERROR")
             raise
@@ -3903,6 +3917,78 @@ async def authenticate() -> Dict[str, Any]:
         return auth_result
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
+
+@mcp.tool()
+async def authenticate_brainlabs() -> Dict[str, Any]:
+    """
+    Sign in to BRAIN Labs and return the live AWS WorkSpaces deepLink session URL.
+
+    BRAIN Labs is delivered as an AWS WorkSpaces Web pixel-stream, so it cannot be
+    code-driven headlessly; this tool performs the two-step sign-in (platform +
+    Labs password) via Playwright and hands back the WorkSpaces URL to open, plus
+    the decoded internal labs URL/token. Serialized through a single-concurrency
+    lock (LABS_MAX_CONCURRENCY, default 1) because a Labs account has exactly one
+    interactive session.
+
+    Returns:
+        {status, workspaces_url, labs_url, token, note} or {error}.
+    """
+    try:
+        config = load_config()
+        credentials = config.get("credentials", {})
+        email = credentials.get("email")
+        password = credentials.get("password")
+        if not email or not password:
+            return {"error": "No BRAIN credentials configured (CREDENTIALS_EMAIL / CREDENTIALS_PASSWORD)."}
+        return await labs_client.open_labs_session(email, password)
+    except Exception as e:
+        return {"error": f"BRAIN Labs sign-in failed: {str(e)}"}
+
+@mcp.tool()
+async def emit_labs_script(
+    dataset_id: str,
+    fields: List[str],
+    region: str = "USA",
+    universe: str = "TOP3000",
+    delay: int = 1,
+    labs_output: str = "/tmp/labs_data_analysis_result.json",
+) -> Dict[str, Any]:
+    """
+    Generate the pasteable BRAIN Labs data-analysis script for a dataset's MATRIX fields.
+
+    Raw panel data is only available inside Labs (`from brain import Brain`), so the
+    emitted script must be run in the Labs JupyterLab. Requires the LABS_AGENT_SCRIPT
+    env var to point at labs_data_analysis_agent.py. Serialized by the Labs lock.
+
+    Args:
+        dataset_id: Dataset id to analyze.
+        fields: MATRIX field ids (at most two for downstream Python alpha design).
+        region/universe/delay: Simulation target context.
+        labs_output: Path the in-Labs script writes its JSON result to.
+    """
+    try:
+        return await labs_client.emit_labs_script(
+            dataset_id=dataset_id,
+            fields=fields,
+            region=region,
+            universe=universe,
+            delay=delay,
+            labs_output=labs_output,
+        )
+    except Exception as e:
+        return {"error": f"emit_labs_script failed: {str(e)}"}
+
+@mcp.tool()
+async def ingest_labs_result(result_json: str) -> Dict[str, Any]:
+    """
+    Parse a BRAIN Labs data-analysis result (a JSON string or a file path) and return it.
+
+    Use after running the emit_labs_script output inside Labs. Serialized by the Labs lock.
+    """
+    try:
+        return await labs_client.ingest_labs_result(result_json)
+    except Exception as e:
+        return {"error": f"ingest_labs_result failed: {str(e)}"}
 
 @mcp.tool()
 async def manage_config(action: str = "get", settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -4700,11 +4786,18 @@ async def get_platform_setting_options() -> Dict[str, Any]:
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def performance_comparison(alpha_id: str, team_id: Optional[str] = None, 
-                                 competition: Optional[str] = None) -> Dict[str, Any]:
-    """Get performance comparison data for an alpha."""
+async def performance_comparison(alpha_id: str, competition: Optional[str] = None,
+                                 team_id: Optional[str] = None) -> Dict[str, Any]:
+    """Get before-and-after performance comparison data for an alpha.
+
+    Args:
+        alpha_id: The alpha ID (e.g. "A1wYQ2xd" or "XgpEr77l").
+        competition: Optional competition ID (e.g. "PAC2026"). If omitted,
+            the user's own (self) alpha endpoint is used.
+        team_id: Optional team ID.
+    """
     try:
-        return await brain_client.performance_comparison(alpha_id, team_id, competition)
+        return await brain_client.performance_comparison(alpha_id, competition, team_id)
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
         

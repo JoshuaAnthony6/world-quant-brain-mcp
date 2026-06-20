@@ -208,3 +208,6 @@ __marimo__/
 
 # 论坛文章
 results/
+
+# Node deps for host_labs
+host_labs/node_modules/
