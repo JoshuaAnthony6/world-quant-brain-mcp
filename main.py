@@ -1002,11 +1002,20 @@ class BrainApiClient:
         result['raPassed'] = True
         return result
     
-    async def get_datasets(self, category: Optional[str] = None, region: str = "USA",
-                          delay: int = 1, universe: str = "TOP3000", theme: str = "false", search: Optional[str] = None) -> Dict[str, Any]:
+    async def get_datasets(
+            self
+            , category: Optional[str] = None
+            , region: str = "USA"
+            , delay: int = 1
+            , universe: str = "TOP3000"
+            , theme: str = "false"
+            , dateUpdated: Optional[str] = None
+            , search: Optional[str] = None
+        ) -> Dict[str, Any]:
         """Get available datasets with Redis caching (1 day TTL) and fetch all data at once."""
         await self.ensure_authenticated()
         
+        url = f"{self.base_url}/data-sets" if not dateUpdated else f"{self.base_url}/data-sets?dateUpdated>={dateUpdated}T00:00:00-04:00"
         try:
             # Generate cache key from parameters (excluding search for cache key)
             cache_params = {
@@ -1016,7 +1025,8 @@ class BrainApiClient:
                 'universe': universe,
                 'theme': theme
             }
-            cache_key = self._generate_cache_key('datasets', cache_params)
+
+            cache_key = self._generate_cache_key(f"datasets#{dateUpdated}", cache_params)
             
             # Try to get from cache
             cached_data = self._get_cached_data(cache_key)
@@ -1054,7 +1064,7 @@ class BrainApiClient:
                 
                 data = await self._request_json_with_retries(
                     'GET',
-                    f"{self.base_url}/data-sets",
+                    url,
                     params=params,
                     op_name=f"get_datasets(offset={offset})",
                 )
@@ -1100,6 +1110,7 @@ class BrainApiClient:
     async def get_datafields(self, instrument_type: str = "EQUITY", region: str = "USA",
                             delay: int = 1, universe: str = "TOP3000", theme: str = "false",
                             dataset_id: Optional[str] = None, data_type: str = "",
+                            dateUpdated: Optional[str] = None,
                             search: Optional[str] = None,
                             filter_sharpe: bool = True) -> Dict[str, Any]:
         """Get available data fields with Redis caching (1 day TTL) and fetch all data at once.
@@ -1200,7 +1211,8 @@ class BrainApiClient:
                 'dataset_id': dataset_id,
                 'data_type': data_type
             }
-            cache_key = self._generate_cache_key('datafields', cache_params)
+            url = f"{self.base_url}/data-fields" if not dateUpdated else f"{self.base_url}/data-fields?dateUpdated>={dateUpdated}T00:00:00-04:00"
+            cache_key = self._generate_cache_key(f'datafields#{dateUpdated}', cache_params)
             
             def sharpe_filter(items: list, rgn: str, dly: int) -> tuple:
                 """Filter out datafields with OS/IS sharpe < 0. Returns (filtered_items, removed_count, applied)."""
@@ -1273,7 +1285,7 @@ class BrainApiClient:
                 
                 data = await self._request_json_with_retries(
                     'GET',
-                    f"{self.base_url}/data-fields",
+                    url,
                     params=params,
                     op_name=f"get_datafields(offset={offset})",
                 )
@@ -3747,6 +3759,7 @@ async def get_datasets(
     delay: int = 1,
     universe: str = "TOP3000",
     theme: str = "false",
+    dateUpdated: Optional[str] = None,
     search: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
@@ -3760,12 +3773,14 @@ async def get_datasets(
         delay: Data delay (0 or 1)
         universe: Universe of stocks (e.g., "TOP3000")
         theme: Theme filter
+        dateUpdated: Date when the dataset was last updated
+        search: Search term to filter datasets
     
     Returns:
         Available datasets
     """
     try:
-        return await brain_client.get_datasets(category, region, delay, universe, theme, search)
+        return await brain_client.get_datasets(category, region, delay, universe, theme, dateUpdated, search)
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
@@ -3774,8 +3789,10 @@ async def get_datafields(
     region: str,
     dataset_id: Optional[str],
     universe: str,
+    theme: str = "false",
     delay: int = 1,
     data_type: str = "",
+    dateUpdated: Optional[str] = None,
     search: Optional[str] = None,
     filter_sharpe: bool = True,
 ) -> Dict[str, Any]:
@@ -3793,6 +3810,7 @@ async def get_datafields(
         data_type: Type of data (e.g., "MATRIX",'VECTOR','GROUP')
         search: Search term to filter fields
         filter_sharpe: Filter out fields with OS/IS Sharpe < 0 (default: True)
+        dateUpdated: Date when the data fields were last updated
     
     Returns:
         Available data fields
@@ -3800,7 +3818,7 @@ async def get_datafields(
     instrument_type = "EQUITY"
     theme = "false"
     try:
-        return await brain_client.get_datafields(instrument_type, region, delay, universe, theme, dataset_id, data_type, search, filter_sharpe)
+        return await brain_client.get_datafields(instrument_type, region, delay, universe, theme, dataset_id, data_type, dateUpdated, search, filter_sharpe)
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
