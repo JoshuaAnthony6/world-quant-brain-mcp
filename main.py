@@ -1756,6 +1756,199 @@ class BrainApiClient:
             self.log(f"Failed to get leaderboard: {str(e)}", "ERROR")
             raise
 
+    # --- SPC (Systematic Predictions Challenge) ---
+
+    SPC_MODELS = ("gpt", "claude", "gemini", "deepseek", "kimi", "qwen", "glm", "llama", "minimax", "mistral")
+    SPC_FREQUENCIES = ("daily", "weekly", "monthly", "quarterly")
+    _SPC_ISIN_MIC_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}[0-9]\|[A-Z0-9]{4}$")
+
+    @staticmethod
+    def _spc_isin_checksum_valid(isin: str) -> bool:
+        expanded = ""
+        for char in isin:
+            if char.isdigit():
+                expanded += char
+            elif "A" <= char <= "Z":
+                expanded += str(ord(char) - ord("A") + 10)
+            else:
+                return False
+        total = 0
+        double = False
+        for digit_char in reversed(expanded):
+            digit = int(digit_char)
+            if double:
+                digit *= 2
+            total += digit // 10 + digit % 10
+            double = not double
+        return total % 10 == 0
+
+    def _validate_spc_sample_output(self, sample_output: str) -> List[str]:
+        """Validate an SPC sample output string against the competition contract.
+
+        Checks: parseable JSON object, ISIN|MIC key format, ISIN checksum,
+        numeric confidence scores within [-1, 1]. Returns a list of error strings.
+        """
+        errors: List[str] = []
+        stripped = (sample_output or "").strip()
+        if not stripped:
+            return ["sample_output is empty"]
+        if stripped.startswith("```") or stripped.endswith("```"):
+            errors.append("sample_output contains markdown code fences; must be pure JSON")
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            errors.append(f"sample_output is not valid JSON: {exc.msg} at line {exc.lineno}, column {exc.colno}")
+            return errors
+        if not isinstance(data, dict):
+            errors.append("sample_output top-level value must be a JSON object")
+            return errors
+        if not data:
+            errors.append("sample_output object must not be empty")
+        for key, value in data.items():
+            if not self._SPC_ISIN_MIC_RE.match(str(key)):
+                errors.append(f"invalid key format, expected ISIN|MIC: {key!r}")
+                continue
+            isin = str(key).split("|", 1)[0]
+            if not self._spc_isin_checksum_valid(isin):
+                errors.append(f"invalid ISIN checksum: {isin}")
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                errors.append(f"confidence score must be numeric for {key!r}")
+            elif not math.isfinite(value):
+                errors.append(f"confidence score must be finite for {key!r}")
+            elif value < -1.0 or value > 1.0:
+                errors.append(f"confidence score out of [-1, 1] for {key!r}: {value}")
+        return errors
+
+    def _validate_spc_fields(
+        self,
+        name: Optional[str] = None,
+        prompt: Optional[str] = None,
+        model: Optional[str] = None,
+        weight: Optional[float] = None,
+        update_frequency: Optional[str] = None,
+    ) -> List[str]:
+        """Validate SPC submission metadata fields. Only non-None fields are checked."""
+        errors: List[str] = []
+        if name is not None and len(name) > 200:
+            errors.append(f"name exceeds 200 characters ({len(name)})")
+        if prompt is not None:
+            if not prompt.strip():
+                errors.append("prompt is empty")
+            if len(prompt) > 10000:
+                errors.append(f"prompt exceeds 10000 characters ({len(prompt)})")
+        if model is not None and model not in self.SPC_MODELS:
+            errors.append(f"model must be one of {list(self.SPC_MODELS)}, got {model!r}")
+        if update_frequency is not None and update_frequency not in self.SPC_FREQUENCIES:
+            errors.append(f"update_frequency must be one of {list(self.SPC_FREQUENCIES)}, got {update_frequency!r}")
+        if weight is not None and not (0.0 <= float(weight) <= 1.0):
+            errors.append(f"weight must be between 0 and 1, got {weight}")
+        return errors
+
+    async def get_spc_submissions(self, limit: int = 50, offset: int = 0) -> Dict[str, Any]:
+        """List the current user's SPC prompt submissions."""
+        await self.ensure_authenticated()
+        try:
+            response = await self._request(
+                'GET',
+                f"{self.base_url}/competitions/spc/submissions",
+                params={"limit": limit, "offset": offset},
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            self.log(f"Failed to get SPC submissions: {str(e)}", "ERROR")
+            raise
+
+    async def create_spc_submission(
+        self,
+        name: str,
+        prompt: str,
+        sample_output: str,
+        model: str,
+        model_version: str,
+        weight: float,
+        update_frequency: str,
+        skip_validation: bool = False,
+    ) -> Dict[str, Any]:
+        """Create a new SPC prompt submission."""
+        await self.ensure_authenticated()
+        if not skip_validation:
+            errors = self._validate_spc_fields(name, prompt, model, weight, update_frequency)
+            errors += self._validate_spc_sample_output(sample_output)
+            if errors:
+                return {
+                    "error": "Local validation failed; nothing was submitted",
+                    "validation_errors": errors,
+                    "hint": "Fix the errors or pass skip_validation=true to submit anyway",
+                }
+        payload = {
+            "name": name,
+            "prompt": prompt,
+            "sampleOutput": sample_output,
+            "model": model,
+            "modelVersion": model_version,
+            "weight": round(float(weight), 2),
+            "updateFrequency": update_frequency,
+        }
+        try:
+            response = await self._request(
+                'POST', f"{self.base_url}/competitions/spc/submissions", json=payload
+            )
+            if response.status_code == 400:
+                return {"error": "Server rejected the submission", "details": self._response_payload(response)}
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            self.log(f"Failed to create SPC submission: {str(e)}", "ERROR")
+            raise
+
+    async def set_spc_submission_weight(self, submission_id: str, weight: float) -> Dict[str, Any]:
+        """Set the weight of an existing SPC submission. weight=0 withdraws the prompt.
+
+        The API only allows changing weight after creation; all other fields are
+        immutable. To change a prompt's content, create a new submission and set
+        the old one's weight to 0.
+        """
+        await self.ensure_authenticated()
+        errors = self._validate_spc_fields(weight=weight)
+        if errors:
+            return {"error": "Local validation failed; nothing was updated", "validation_errors": errors}
+        try:
+            response = await self._request(
+                'PATCH',
+                f"{self.base_url}/competitions/spc/submissions/{submission_id}",
+                json={"weight": round(float(weight), 2)},
+            )
+            if response.status_code == 400:
+                return {"error": "Server rejected the update", "details": self._response_payload(response)}
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            self.log(f"Failed to update SPC submission {submission_id}: {str(e)}", "ERROR")
+            raise
+
+    async def get_spc_leaderboard(
+        self,
+        board: Optional[str] = None,
+        limit: int = 30,
+        offset: int = 0,
+        aggregate: str = "user",
+    ) -> Dict[str, Any]:
+        """Get the SPC leaderboard. board is a month key like '202607' (defaults to current month server-side)."""
+        await self.ensure_authenticated()
+        params: Dict[str, Any] = {"limit": limit, "offset": offset, "aggregate": aggregate}
+        if board:
+            params["board"] = board
+        try:
+            response = await self._request(
+                'GET', f"{self.base_url}/consultant/boards/spc", params=params
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            self.log(f"Failed to get SPC leaderboard: {str(e)}", "ERROR")
+            raise
+
     def _is_atom(self, detail: Optional[Dict[str, Any]]) -> bool:
         """Match atom detection used in extract_regular_alphas.py:
         - Primary signal: 'classifications' entries containing 'SINGLE_DATA_SET'
@@ -2633,6 +2826,42 @@ class BrainApiClient:
         ]
         return cache_dir / f"os_pnl_pool_{'_'.join(safe_parts)}.pkl"
 
+    def _os_ppac_ids_path(
+        self,
+        instrument_type: str,
+        region: str,
+        universe: str,
+        delay: Union[int, str],
+    ) -> Path:
+        """Sidecar file holding the Power-Pool-Alpha id set for a configuration.
+
+        BRAIN reports two distinct correlations that partition the same OS pool
+        by each alpha's ``classifications``:
+          * "Self Correlation"       -> pool EXCLUDING Power Pool Alphas
+          * "Power Pool Correlation" -> pool of ONLY Power Pool Alphas
+        We persist which OS ids are classified 'Power Pool Alpha' so the local
+        self-correlation can exclude them (matching the platform).
+        """
+        return self._os_pnl_pool_path(
+            instrument_type, region, universe, delay
+        ).with_suffix('.ppac.json')
+
+    def _load_ppac_ids(
+        self,
+        instrument_type: str,
+        region: str,
+        universe: str,
+        delay: Union[int, str],
+    ) -> set:
+        """Load the cached Power-Pool-Alpha id set (empty set if unavailable)."""
+        try:
+            p = self._os_ppac_ids_path(instrument_type, region, universe, delay)
+            if p.exists():
+                return set(json.loads(p.read_text()))
+        except Exception as e:
+            self.log(f"[SC cache] Failed to load ppac ids sidecar: {e}", "WARNING")
+        return set()
+
     async def _get_os_pnl_pool_lock(self, pool_path: Path) -> asyncio.Lock:
         """Return the in-process lock for one configuration-specific OS PnL cache."""
         pool_key = str(pool_path)
@@ -2664,6 +2893,7 @@ class BrainApiClient:
         configuration keeps the local calculation aligned with those semantics.
         """
         all_ids: List[str] = []
+        ppac_ids: List[str] = []
         offset = 0
         page_size = 100
         while True:
@@ -2699,9 +2929,34 @@ class BrainApiClient:
                 if str(settings.get('delay')) != str(delay):
                     continue
                 all_ids.append(alpha['id'])
+                # A Power Pool Alpha is identified by its classifications, e.g.
+                # {"id": "POWER_POOL_ALPHA", "name": "Power Pool Alpha"}. The
+                # platform's "Self Correlation" EXCLUDES these; "Power Pool
+                # Correlation" uses only these. Match on id OR name (as the atom
+                # detector does) to be robust to the key the API returns.
+                classifications = alpha.get('classifications') or []
+                for c in classifications:
+                    if not isinstance(c, dict):
+                        continue
+                    cid = c.get('id') or c.get('name') or ''
+                    cname = c.get('name') or ''
+                    if (isinstance(cid, str) and 'POWER_POOL' in cid.upper()) or \
+                       (isinstance(cname, str) and cname.strip() == 'Power Pool Alpha'):
+                        ppac_ids.append(alpha['id'])
+                        break
             if len(results) < page_size:
                 break
             offset += page_size
+
+        # Persist the Power-Pool-Alpha id set so get_self_correlation can
+        # exclude/select them without re-listing (survives the sync debounce
+        # cache and process restarts).
+        try:
+            sidecar = self._os_ppac_ids_path(instrument_type, region, universe, delay)
+            sidecar.write_text(json.dumps(sorted(set(ppac_ids))))
+        except Exception as e:
+            self.log(f"[SC cache] Failed to persist ppac ids sidecar: {e}", "WARNING")
+
         return all_ids
 
     async def sync_os_pnl_pool(
@@ -2809,7 +3064,7 @@ class BrainApiClient:
 
         return local_pool
 
-    async def get_self_correlation(self, alpha_id: str) -> Dict[str, Any]:
+    async def get_self_correlation(self, alpha_id: str, correlation_type: str = 'self') -> Dict[str, Any]:
         """Calculate self-correlation locally using an incrementally-cached OS PnL pool.
 
         - OS alpha PnL is considered static and cached on disk
@@ -2819,6 +3074,15 @@ class BrainApiClient:
           IS and may change between calls).
         - Correlation is computed on the last 4 years of daily returns, matching
           the reference ``calculate_sc_locally`` semantics.
+
+        correlation_type partitions the OS pool the same way the BRAIN platform
+        does, via each alpha's ``classifications``:
+          * 'self'      -> "Self Correlation": pool EXCLUDING Power Pool Alphas.
+          * 'powerpool' -> "Power Pool Correlation": ONLY Power Pool Alphas.
+          * 'all'       -> legacy behaviour (whole OS pool, no partition).
+        Default is 'self' so the number matches the platform's Self Correlation
+        (previously the whole pool was used, which mixed in Power Pool Alphas and
+        over-reported the max).
         """
         await self.ensure_authenticated()
 
@@ -2876,8 +3140,35 @@ class BrainApiClient:
 
             target_rets = rets[target_col]
             pool_rets = rets.drop(columns=[target_col], errors='ignore')
+
+            # Partition the OS pool by Power-Pool-Alpha classification to match
+            # the platform's Self vs Power Pool correlation semantics. Excluding
+            # Power Pool Alphas is what makes the local number line up with the
+            # platform's "Self Correlation" (the previous code used the whole
+            # pool and could over-report the max).
+            ppac_ids = self._load_ppac_ids(instrument_type, region, universe, delay)
+            ctype = (correlation_type or 'self').lower()
+            full_pool_size = int(pool_rets.shape[1])
+            if ctype in ('self', 'selfcorr'):
+                drop_cols = [c for c in pool_rets.columns if c in ppac_ids]
+                pool_rets = pool_rets.drop(columns=drop_cols, errors='ignore')
+            elif ctype in ('powerpool', 'ppac', 'ppa'):
+                keep_cols = [c for c in pool_rets.columns if c in ppac_ids]
+                pool_rets = pool_rets[keep_cols]
+            # ctype == 'all' -> legacy whole-pool behaviour (no partition)
+            partitioned_pool_size = int(pool_rets.shape[1])
+
             if pool_rets.empty:
-                return {'max': 0.0, 'records': [], 'local_calculation': True, 'pool_size': os_pool.shape[1]}
+                return {
+                    'max': 0.0,
+                    'records': [],
+                    'local_calculation': True,
+                    'pool_size': partitioned_pool_size,
+                    'correlation_type': ctype,
+                    'full_os_pool_size': full_pool_size,
+                    'ppac_ids_cached': len(ppac_ids),
+                    'excluded_power_pool_count': full_pool_size - partitioned_pool_size if ctype in ('self', 'selfcorr') else None,
+                }
 
             # Compute only target-vs-pool correlations instead of the full N x N
             # matrix; this is the hot path when the OS pool is large.
@@ -2890,39 +3181,172 @@ class BrainApiClient:
             ]
 
             self.log(
-                f"[SC本地] Alpha {alpha_id}: max_self_corr={max_corr:.4f} "
-                f"(pool={os_pool.shape[1]} OS alphas, incremental cache)",
+                f"[SC本地] Alpha {alpha_id}: max_{ctype}_corr={max_corr:.4f} "
+                f"(pool={partitioned_pool_size}/{full_pool_size} OS alphas after "
+                f"'{ctype}' partition; {len(ppac_ids)} power-pool ids cached)",
                 "INFO",
             )
             return {
                 'max': max_corr,
                 'records': records,
                 'local_calculation': True,
-                'pool_size': int(os_pool.shape[1]),
+                'pool_size': partitioned_pool_size,
+                'correlation_type': ctype,
+                'full_os_pool_size': full_pool_size,
+                'ppac_ids_cached': len(ppac_ids),
+                'excluded_power_pool_count': (full_pool_size - partitioned_pool_size) if ctype in ('self', 'selfcorr') else None,
             }
 
         except Exception as e:
             self.log(f"Failed to calculate self-correlation locally: {str(e)}", "ERROR")
             raise
 
+    async def get_mutual_correlation(
+        self,
+        alpha_ids: List[str],
+        threshold: float = 0.5,
+        years: int = 4,
+    ) -> Dict[str, Any]:
+        """Pairwise ("mutual") correlation AMONG a caller-supplied set of alphas.
+
+        Unlike check_self_correlation (target-vs-OS-pool) and check_correlation
+        (target-vs-production), this computes the full NxN correlation matrix
+        among the given alphas' own daily returns — the check needed when
+        selecting a set of alphas that must be mutually decorrelated (e.g. a
+        submission basket with a max-pairwise-correlation rule).
+
+        Correlation convention matches the local self-correlation: daily returns
+        = diff of cumulative PnL (ffill gaps), restricted to the last ``years``.
+
+        Returns the matrix, the single most-correlated pair, every pair at/above
+        ``threshold``, whether all pairs are below it, and a greedy maximal
+        subset whose members are all mutually below ``threshold``.
+        """
+        await self.ensure_authenticated()
+
+        # De-duplicate while preserving order.
+        ids = list(dict.fromkeys([a for a in (alpha_ids or []) if a]))
+        if len(ids) < 2:
+            return {'error': 'Provide at least 2 distinct alpha ids.', 'alpha_ids': ids}
+
+        fetch_sem = asyncio.Semaphore(5)
+
+        async def fetch_one(oid: str):
+            async with fetch_sem:
+                try:
+                    data = await self.get_alpha_pnl(oid)
+                    return oid, self._pnl_response_to_series(oid, data)
+                except Exception as e:
+                    self.log(f"[mutual-corr] Skip {oid}: PnL fetch failed ({e})", "WARNING")
+                    return oid, None
+
+        fetched = await asyncio.gather(*[fetch_one(o) for o in ids])
+        series = {oid: s for oid, s in fetched if s is not None}
+        missing = [oid for oid, s in fetched if s is None]
+        if len(series) < 2:
+            return {
+                'error': 'Fewer than 2 alphas had usable PnL.',
+                'missing_pnl': missing,
+                'alpha_ids': ids,
+            }
+
+        present = [oid for oid in ids if oid in series]
+        combined = pd.concat([series[oid].rename(oid).to_frame() for oid in present], axis=1).ffill()
+        rets = combined.diff()
+        if not rets.empty:
+            last_date = rets.index.max()
+            rets = rets[rets.index > last_date - pd.DateOffset(years=years)]
+        rets = rets.dropna(how='all')
+        if rets.shape[0] < 2:
+            return {'error': 'Insufficient overlapping PnL history.', 'missing_pnl': missing, 'alpha_ids': ids}
+
+        corr = rets.corr()
+        cols = [c for c in present if c in corr.columns]
+
+        def cval(a: str, b: str) -> float:
+            try:
+                v = float(corr.loc[a, b])
+                return v if v == v else 0.0  # NaN -> 0
+            except Exception:
+                return 0.0
+
+        pairs = []
+        for i in range(len(cols)):
+            for j in range(i + 1, len(cols)):
+                pairs.append((cols[i], cols[j], cval(cols[i], cols[j])))
+        pairs.sort(key=lambda x: -abs(x[2]))
+
+        over = [{'a': a, 'b': b, 'correlation': round(c, 4)} for a, b, c in pairs if abs(c) >= threshold]
+        max_pair = (
+            {'a': pairs[0][0], 'b': pairs[0][1], 'correlation': round(pairs[0][2], 4)}
+            if pairs else None
+        )
+
+        # Greedy maximal mutually-below-threshold subset: consider nodes in
+        # ascending order of average |correlation| (least entangled first), keep
+        # a node only if it is < threshold vs every already-kept node. This is a
+        # heuristic (max independent set is NP-hard) but gives a good basket.
+        if len(cols) > 1:
+            avg_abs = {
+                o: sum(abs(cval(o, p)) for p in cols if p != o) / (len(cols) - 1)
+                for o in cols
+            }
+        else:
+            avg_abs = {cols[0]: 0.0} if cols else {}
+        order = sorted(cols, key=lambda o: avg_abs.get(o, 0.0))
+        kept: List[str] = []
+        for oid in order:
+            if all(abs(cval(oid, k)) < threshold for k in kept):
+                kept.append(oid)
+
+        matrix = {a: {b: round(cval(a, b), 4) for b in cols} for a in cols}
+
+        self.log(
+            f"[mutual-corr] {len(cols)} alphas: max pair "
+            f"{max_pair['correlation'] if max_pair else 'n/a'}, "
+            f"{len(over)} pair(s) >= {threshold}, max mutually-<{threshold} subset size {len(kept)}",
+            "INFO",
+        )
+
+        return {
+            'alpha_ids': cols,
+            'threshold': threshold,
+            'years': years,
+            'num_points': int(rets.shape[0]),
+            'matrix': matrix,
+            'max_pair': max_pair,
+            'pairs_over_threshold': over,
+            'all_below_threshold': len(over) == 0,
+            'max_mutually_below_subset': kept,
+            'max_mutually_below_subset_size': len(kept),
+            'missing_pnl': missing,
+            'local_calculation': True,
+        }
+
     async def check_self_correlation(
         self,
         alpha_id: str,
         threshold: float = 0.7,
+        correlation_type: str = 'self',
     ) -> Dict[str, Any]:
         """Compute self-correlation locally using the cached OS PnL pool.
 
         Args:
             alpha_id: Target alpha ID.
             threshold: Max-correlation threshold used for the pass/fail check.
+            correlation_type: 'self' (default; pool EXCLUDES Power Pool Alphas,
+                matching the platform's "Self Correlation"), 'powerpool' (only
+                Power Pool Alphas, matching "Power Pool Correlation"), or 'all'
+                (legacy whole-pool behaviour).
         """
         await self.ensure_authenticated()
 
-        correlation_data = await self.get_self_correlation(alpha_id)
+        correlation_data = await self.get_self_correlation(alpha_id, correlation_type=correlation_type)
         if not isinstance(correlation_data, dict) or not correlation_data:
             return {
                 'alpha_id': alpha_id,
                 'threshold': threshold,
+                'correlation_type': correlation_type,
                 'max_correlation': None,
                 'passes_check': None,
                 'status': 'data_unavailable',
@@ -2940,6 +3364,7 @@ class BrainApiClient:
         return {
             'alpha_id': alpha_id,
             'threshold': threshold,
+            'correlation_type': correlation_type,
             'max_correlation': max_correlation,
             'passes_check': passes_check,
             'local_calculation': True,
@@ -3828,6 +4253,10 @@ def _slim_correlation_block(b):
         out["top_correlated"] = recs[:5]
         if cd.get("pool_size") is not None:
             out["pool_size"] = cd.get("pool_size")
+    # Surface the Self/PowerPool pool-partition metadata (local self-correlation).
+    for k in ("correlation_type", "full_os_pool_size", "excluded_power_pool_count", "ppac_ids_cached"):
+        if cd.get(k) is not None:
+            out[k] = cd.get(k)
     return out
 
 
@@ -3837,7 +4266,7 @@ def _slim_check_correlation(obj):
         return obj
     # check_self_correlation top-level shape: {alpha_id, threshold, max_correlation, passes_check, correlation_data, ...}
     if "max_correlation" in payload and "checks" not in payload:
-        out = {k: payload.get(k) for k in ("alpha_id", "threshold", "passes_check", "local_calculation")
+        out = {k: payload.get(k) for k in ("alpha_id", "threshold", "correlation_type", "passes_check", "local_calculation")
                if k in payload}
         out.update(_slim_correlation_block(payload))
         return _rewrap(out, w)
@@ -4393,6 +4822,112 @@ async def get_leaderboard(user_id: Optional[str] = None) -> Dict[str, Any]:
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
 
+# --- SPC (Systematic Predictions Challenge) Tools ---
+
+@mcp.tool()
+async def get_spc_submissions(limit: int = 50, offset: int = 0) -> Dict[str, Any]:
+    """
+    List the current user's SPC (Systematic Predictions Challenge) prompt submissions.
+
+    Args:
+        limit: Maximum number of submissions to return (default: 50)
+        offset: Pagination offset (default: 0)
+
+    Returns:
+        Paginated list of submissions with id, name, prompt, sampleOutput, model,
+        modelVersion, weight, updateFrequency, lastModified, and status
+    """
+    try:
+        return await brain_client.get_spc_submissions(limit, offset)
+    except Exception as e:
+        return {"error": f"An unexpected error occurred: {str(e)}"}
+
+@mcp.tool()
+async def create_spc_submission(
+    name: str,
+    prompt: str,
+    sample_output: str,
+    model: str,
+    model_version: str,
+    weight: float,
+    update_frequency: str,
+    skip_validation: bool = False,
+) -> Dict[str, Any]:
+    """
+    Create a new SPC (Systematic Predictions Challenge) prompt submission.
+
+    The prompt is run periodically by the platform on the chosen model; its JSON
+    output (ISIN|MIC keys, confidence scores in [-1, 1]) forms a long/short
+    portfolio whose PnL is scored. Local validation of the sample output
+    (JSON shape, ISIN|MIC format, ISIN checksum, score range) runs before
+    submitting; failures are returned without submitting.
+
+    Args:
+        name: Submission name (max 200 characters)
+        prompt: English prompt text sent to the model (max 10000 characters)
+        sample_output: Sample JSON output produced by the prompt, as a string.
+            Must be a pure JSON object mapping "ISIN|MIC" to numeric scores in [-1, 1]
+        model: One of gpt, claude, gemini, deepseek, kimi, qwen, glm, llama, minimax, mistral
+        model_version: Model version string, e.g. "5" or "4.8" (max 100 characters)
+        weight: Prompt weight between 0 and 1 (two decimals). 0 means the prompt does not run
+        update_frequency: One of daily, weekly, monthly, quarterly
+        skip_validation: Submit even if local validation fails (default: False)
+
+    Returns:
+        The created submission (including its id), or validation errors
+    """
+    try:
+        return await brain_client.create_spc_submission(
+            name, prompt, sample_output, model, model_version, weight, update_frequency, skip_validation
+        )
+    except Exception as e:
+        return {"error": f"An unexpected error occurred: {str(e)}"}
+
+@mcp.tool()
+async def set_spc_submission_weight(submission_id: str, weight: float) -> Dict[str, Any]:
+    """
+    Set the weight of an existing SPC submission. Setting weight to 0 withdraws it.
+
+    Weight is the ONLY field the platform allows changing after creation; there
+    is no DELETE, and prompt text, model, and frequency are immutable. To change
+    a prompt's content, create a new submission with create_spc_submission and
+    set the old one's weight to 0. Use get_spc_submissions to find ids.
+
+    Args:
+        submission_id: Id of the submission to update (e.g. "V45nl1y")
+        weight: New weight between 0 and 1 (two decimals); 0 withdraws the prompt
+
+    Returns:
+        The updated submission, or validation errors
+    """
+    try:
+        return await brain_client.set_spc_submission_weight(submission_id, weight)
+    except Exception as e:
+        return {"error": f"An unexpected error occurred: {str(e)}"}
+
+@mcp.tool()
+async def get_spc_leaderboard(
+    board: Optional[str] = None,
+    limit: int = 30,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    """
+    Get the SPC (Systematic Predictions Challenge) monthly leaderboard.
+
+    Args:
+        board: Month key like "202607" (default: current month, chosen server-side)
+        limit: Maximum number of entries to return (default: 30)
+        offset: Pagination offset (default: 0)
+
+    Returns:
+        Leaderboard entries aggregated by user
+    """
+    try:
+        return await brain_client.get_spc_leaderboard(board, limit, offset)
+    except Exception as e:
+        return {"error": f"An unexpected error occurred: {str(e)}"}
+
+
 # --- Forum Tools ---
 
 @mcp.tool()
@@ -4595,26 +5130,78 @@ async def check_correlation(alpha_id: str) -> Dict[str, Any]:
 async def check_self_correlation(
     alpha_id: str,
     threshold: float = 0.7,
+    correlation_type: str = 'self',
 ) -> Dict[str, Any]:
     """Validate self-correlation with the local incremental-cache calculation.
 
     This does not call the BRAIN /correlations/self endpoint, so it does not
     consume the platform correlation slot or use the correlation lock.
 
+    The OS pool is partitioned by each alpha's ``classifications`` to match the
+    platform exactly (the platform reports two numbers from the same pool):
+      * correlation_type='self' (default) -> "Self Correlation": pool EXCLUDES
+        Power Pool Alphas. Use this to mirror the submission "Self Correlation".
+      * correlation_type='powerpool' -> "Power Pool Correlation": pool is ONLY
+        Power Pool Alphas.
+      * correlation_type='all' -> legacy whole-pool behaviour (mixes both;
+        can over-report vs the platform's Self Correlation).
+
     Args:
         alpha_id: Target alpha ID.
         threshold: Pass/fail threshold applied to each max correlation
             (passes when max < threshold). Default 0.7.
+        correlation_type: 'self' | 'powerpool' | 'all'. Default 'self'.
 
     Returns:
-        Dict with the local max self-correlation, pass/fail result, and top
-        correlated OS alpha records from the local cache.
+        Dict with the local max self-correlation, pass/fail result, top
+        correlated OS alpha records, and pool-partition metadata
+        (full_os_pool_size, excluded_power_pool_count, correlation_type).
     """
     try:
         return _slim_check_correlation(await brain_client.check_self_correlation(
             alpha_id,
             threshold=threshold,
+            correlation_type=correlation_type,
         ))
+    except Exception as e:
+        return {"error": str(e)}
+
+@mcp.tool()
+async def compute_mutual_correlation(
+    alpha_ids: List[str],
+    threshold: float = 0.5,
+    years: int = 4,
+) -> Dict[str, Any]:
+    """Compute pairwise ("mutual") correlation AMONG a given set of your alphas.
+
+    Use this to vet a submission basket that must be mutually decorrelated
+    (e.g. a "no two alphas may correlate above 0.5" rule). It is fully local —
+    it fetches each alpha's PnL and correlates their daily returns; it does NOT
+    call the BRAIN correlation endpoint or consume the correlation slot.
+
+    Distinct from the other two correlation tools:
+      * check_correlation      -> target vs the PRODUCTION pool.
+      * check_self_correlation -> target vs your submitted-OS pool
+                                  (Self excl. Power Pool Alphas / Power Pool only).
+      * compute_mutual_correlation (this) -> the full NxN matrix AMONG the
+                                  supplied alphas themselves.
+
+    Correlation is on the last ``years`` of daily returns (diff of cumulative
+    PnL), matching the local self-correlation convention.
+
+    Args:
+        alpha_ids: 2+ alpha IDs to correlate against each other.
+        threshold: Max acceptable pairwise correlation (default 0.5).
+        years: Trailing window of daily returns to use (default 4).
+
+    Returns:
+        Dict with: matrix (NxN), max_pair (most-correlated pair),
+        pairs_over_threshold, all_below_threshold (bool), and
+        max_mutually_below_subset (a greedy maximal basket whose members are all
+        mutually below threshold), plus missing_pnl for any unfetchable ids.
+    """
+    try:
+        return await brain_client.get_mutual_correlation(alpha_ids, threshold=threshold, years=years)
     except Exception as e:
         return {"error": str(e)}
 
