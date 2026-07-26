@@ -2717,6 +2717,72 @@ class BrainApiClient:
         finally:
             await self._release_brain_correlation_lock(lock_info, op_name)
 
+    @staticmethod
+    def _correlation_retry_after(response, default: float) -> float:
+        """Seconds to wait before re-polling, from the Retry-After header when present."""
+        try:
+            value = float(response.headers.get('Retry-After'))
+        except (TypeError, ValueError):
+            return default
+        # Clamp: the header is authoritative but must not stall or busy-spin.
+        return max(0.5, min(value, default))
+
+    @staticmethod
+    def _ensure_correlation_extrema(corr_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Derive scalar 'max'/'min' from BRAIN's correlation HISTOGRAM payload.
+
+        BRAIN returns {"schema": {"properties": [{"name": "min"}, {"name": "max"},
+        {"name": "alphas"}]}, "records": [[lo, hi, count], ...]} — a histogram of how
+        many production alphas fall in each 0.1-wide correlation bucket. There is no
+        top-level scalar. The max correlation is the upper edge of the highest bucket
+        with a NON-ZERO count (empty trailing buckets must be ignored, otherwise every
+        alpha reports max == 1.0).
+
+        Mutates and returns corr_data. A payload that already carries scalars, or that
+        is not a histogram (e.g. the local self-correlation shape, whose records are
+        dicts), is left untouched.
+        """
+        if not isinstance(corr_data, dict):
+            return corr_data
+        if corr_data.get('max') is not None and corr_data.get('min') is not None:
+            return corr_data
+
+        records = corr_data.get('records')
+        if not isinstance(records, list) or not records:
+            return corr_data
+
+        props = [p.get('name') for p in (corr_data.get('schema') or {}).get('properties', [])
+                 if isinstance(p, dict)]
+        try:
+            i_lo, i_hi, i_n = props.index('min'), props.index('max'), props.index('alphas')
+        except ValueError:
+            # Unknown schema — assume the documented [lo, hi, count] ordering.
+            i_lo, i_hi, i_n = 0, 1, 2
+
+        los, his = [], []
+        for rec in records:
+            if not isinstance(rec, (list, tuple)) or len(rec) <= max(i_lo, i_hi, i_n):
+                continue
+            try:
+                count = float(rec[i_n])
+            except (TypeError, ValueError):
+                continue
+            if count <= 0:
+                continue                      # empty bucket carries no alpha
+            try:
+                los.append(float(rec[i_lo]))
+                his.append(float(rec[i_hi]))
+            except (TypeError, ValueError):
+                continue
+
+        if not his:
+            return corr_data
+        if corr_data.get('max') is None:
+            corr_data['max'] = max(his)
+        if corr_data.get('min') is None:
+            corr_data['min'] = min(los)
+        return corr_data
+
     async def _poll_production_correlation(self, alpha_id: str) -> Dict[str, Any]:
         max_wait_seconds = 3600  # 1 hour total
         poll_interval = 30       # 30 seconds per attempt (matches reference implementation)
@@ -2759,18 +2825,28 @@ class BrainApiClient:
                             "平台正在计算中，通常需要 1-5 分钟，请耐心等待...",
                             "INFO"
                         )
-                    await asyncio.sleep(poll_interval)
+                    # BRAIN answers 200 + EMPTY BODY while it computes, and tells us how
+                    # long to wait via Retry-After (typically 1s). Honour it instead of
+                    # sleeping a flat 30s — that alone turns a multi-minute poll into
+                    # a few seconds and makes bulk screening practical.
+                    await asyncio.sleep(self._correlation_retry_after(response, poll_interval))
                     continue
-                
+
                 # Got a non-empty response — reset empty counter
                 consecutive_empty = 0
                 try:
                     corr_data = response.json()
-                    if corr_data and corr_data.get('max') is not None:
+                except json.JSONDecodeError:
+                    corr_data = None
+                if corr_data:
+                    # The payload is a HISTOGRAM, not a scalar: schema properties are
+                    # [min, max, alphas] and each record is [bucket_lo, bucket_hi, count].
+                    # There is NO top-level 'max' key, so deriving it here is what makes
+                    # the poller terminate at all.
+                    self._ensure_correlation_extrema(corr_data)
+                    if corr_data.get('max') is not None:
                         self.log(f"[PC成功] Alpha {alpha_id} PC={corr_data['max']} (第 {attempt} 次查询, 耗时 {int(elapsed)}s)", "INFO")
                         return corr_data
-                except json.JSONDecodeError:
-                    pass
                     
             except (requests.RequestException, ConnectionError, TimeoutError) as e:
                 consecutive_network_failures += 1
