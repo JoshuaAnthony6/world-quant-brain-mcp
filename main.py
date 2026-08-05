@@ -38,6 +38,9 @@ from forum_functions import forum_client
 # Import the BRAIN Labs client (Playwright sign-in + single-concurrency lock)
 from labs_functions import labs_client
 
+# Candidate-pool management (submission queue + pyramid coverage + correlation safety)
+import candidate_pool as cpool
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -1048,9 +1051,13 @@ class BrainApiClient:
                 'from_cache': False
             }
             
-            # Cache the complete data (1 week TTL)
-            self._set_cached_data(cache_key, complete_data, ttl=604800)
-            
+            # Cache the complete data (1 week TTL). Never cache empty result
+            # sets: newly launched regions (e.g. GBR) can transiently return
+            # count=0 from /data-sets while the platform index catches up, and
+            # caching that makes the emptiness sticky for the whole TTL.
+            if all_results:
+                self._set_cached_data(cache_key, complete_data, ttl=604800)
+
             # Apply search filter if needed
             if search:
                 filtered_results = [
@@ -1269,9 +1276,11 @@ class BrainApiClient:
                 'from_cache': False
             }
             
-            # Cache the complete data (1 day TTL)
-            self._set_cached_data(cache_key, complete_data, ttl=604800)
-            
+            # Cache the complete data (1 week TTL). Never cache empty result
+            # sets (new-region index lag would otherwise stick for the TTL).
+            if all_results:
+                self._set_cached_data(cache_key, complete_data, ttl=604800)
+
             # Apply fuzzy search filter if needed
             if search:
                 filtered_results = [
@@ -3602,6 +3611,7 @@ class BrainApiClient:
         await self.ensure_authenticated()
         
         try:
+            # todo: ra_failed_count 是否为0
             payload = {
                 "color": color,
                 "name": name,
@@ -5368,6 +5378,187 @@ async def get_pyramid_alphas(start_date: Optional[str] = None,
         return _slim_pyramids(await brain_client.get_pyramid_alphas(start_date, end_date), "alphas")
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
+
+
+# --- Candidate pool ------------------------------------------------------- #
+# BRAIN accepts only ~4 regular-alpha submissions per day, so qualified alphas
+# queue in a local pool. Two facts make the pool more than a list:
+#   1. Pyramid planning must count submitted + pooled together.
+#   2. Submitting one alpha RAISES every other candidate's production and self
+#      correlation, because the submitted alpha joins the pool they are measured
+#      against:  projected_corr(B) = max(corr_now(B), |corr(B, submitted)|).
+# The pool therefore enforces pairwise |corr| < prod threshold at admission —
+# the only moment when acting on it is still cheap.
+
+@mcp.tool()
+async def pool_check(
+    alpha_id: str,
+    prod_threshold: float = 0.70,
+    self_threshold: float = 0.70,
+    mutual_threshold: float = 0.40,
+    refresh_prod: bool = True,
+) -> Dict[str, Any]:
+    """Dry-run: may this alpha join the candidate pool? Does NOT modify the pool.
+
+    Checks four things and reports every violation rather than stopping at the
+    first: the alpha's own production correlation, its own self correlation, its
+    pairwise correlation against each pooled candidate versus ``prod_threshold``
+    (SAFETY — a pair at/above this means submitting either one pushes the other
+    past the production gate), and versus ``mutual_threshold`` (DIVERSITY, the
+    basket rule).
+
+    Pairwise correlations are computed locally from PnL and consume no BRAIN
+    correlation slot; only the alpha's own production correlation hits the
+    rate-limited endpoint (skip it with refresh_prod=false when cached).
+    """
+    try:
+        return await cpool.evaluate_candidate(
+            brain_client, alpha_id, cpool.load_pool(),
+            prod_threshold=prod_threshold,
+            self_threshold=self_threshold,
+            mutual_threshold=mutual_threshold,
+            refresh_prod=refresh_prod,
+        )
+    except Exception as e:
+        return {"error": f"An unexpected error occurred: {str(e)}"}
+
+
+@mcp.tool()
+async def pool_add(
+    alpha_id: str,
+    note: Optional[str] = None,
+    force: bool = False,
+    allow_diversity_fail: bool = False,
+    prod_threshold: float = 0.70,
+    self_threshold: float = 0.70,
+    mutual_threshold: float = 0.40,
+    refresh_prod: bool = True,
+) -> Dict[str, Any]:
+    """Admit an alpha to the candidate pool after running the pool_check gates.
+
+    Rejected candidates are reported with reasons and NOT stored. ``force=true``
+    admits anyway and records ``forced_reasons`` on the entry so the compromise
+    stays visible in later planning. ``allow_diversity_fail=true`` waives only
+    the mutual-correlation basket rule, never the production-safety rule.
+
+    This never submits anything.
+    """
+    try:
+        return await cpool.add_candidate(
+            brain_client, alpha_id,
+            note=note, force=force, allow_diversity_fail=allow_diversity_fail,
+            prod_threshold=prod_threshold,
+            self_threshold=self_threshold,
+            mutual_threshold=mutual_threshold,
+            refresh_prod=refresh_prod,
+        )
+    except Exception as e:
+        return {"error": f"An unexpected error occurred: {str(e)}"}
+
+
+@mcp.tool()
+async def pool_remove(alpha_ids: List[str]) -> Dict[str, Any]:
+    """Drop alphas from the candidate pool (e.g. after manual submission)."""
+    try:
+        return cpool.remove_candidates(alpha_ids)
+    except Exception as e:
+        return {"error": f"An unexpected error occurred: {str(e)}"}
+
+
+@mcp.tool()
+async def pool_list(region: Optional[str] = None,
+                    pyramid: Optional[str] = None) -> Dict[str, Any]:
+    """List pooled candidates with metrics and correlations, newest gates first."""
+    try:
+        return cpool.list_pool(region=region, pyramid=pyramid)
+    except Exception as e:
+        return {"error": f"An unexpected error occurred: {str(e)}"}
+
+
+@mcp.tool()
+async def pool_pyramid_coverage(
+    region: Optional[str] = None,
+    delay: Optional[int] = None,
+    target: int = 3,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> Dict[str, Any]:
+    """True pyramid coverage: submitted alphas AND pooled candidates, per pyramid.
+
+    A pyramid lights on SUBMITTED alphas only (``target`` of them, default 3).
+    The pool column is the queue that can get it there, so each row reports
+    ``needed_submissions`` and whether the pool can cover it:
+      OS_SUFFICIENT                    already lit
+      NEEDS_<n>_SUBMISSIONS_FROM_POOL  pool has enough candidates queued
+      SHORT_BY_<n>_CANDIDATES          research still needed
+
+    Omit region/delay to aggregate across all of them.
+    """
+    try:
+        return await cpool.pyramid_coverage(
+            brain_client, region=region, delay=delay, target=target,
+            start_date=start_date, end_date=end_date,
+        )
+    except Exception as e:
+        return {"error": f"An unexpected error occurred: {str(e)}"}
+
+
+@mcp.tool()
+async def pool_submission_plan(
+    max_submissions: int = 4,
+    region: Optional[str] = None,
+    delay: Optional[int] = None,
+    target: int = 3,
+    prod_threshold: float = 0.70,
+    self_threshold: float = 0.70,
+    resolve_conflicts: bool = False,
+) -> Dict[str, Any]:
+    """Pick today's submission batch and prove it is safe for the rest of the pool.
+
+    Ranks candidates by unmet pyramid need, then pyramid multiplier, then Sharpe,
+    and takes up to ``max_submissions`` (BRAIN's daily regular-alpha cap is 4).
+    A candidate is skipped when it clashes with one already selected, or when
+    submitting it would push a candidate left in the pool past a gate:
+
+        projected_prod_corr(B) = max(prod_corr_now(B), max |corr(B, batch)|)
+        projected_self_corr(B) = max(self_corr_now(B), max |corr(B, batch)|)
+
+    ``remaining_pool_after_batch`` lists that projection for every candidate left
+    behind, and ``all_remaining_safe`` is the single answer to "will submitting
+    this batch break anything still queued?".
+
+    If two pooled candidates are mutually exclusive (submitting either destroys
+    the other), a purely protective plan would submit neither and stall forever.
+    Those pairs appear in ``conflicts`` with a recommended keep/drop;
+    ``resolve_conflicts=true`` acts on the recommendation and lists the give-ups
+    in ``sacrificed``.
+
+    Returns a plan only — the agent never submits.
+    """
+    try:
+        return await cpool.submission_plan(
+            brain_client,
+            max_submissions=max_submissions, region=region, delay=delay,
+            target=target, prod_threshold=prod_threshold,
+            self_threshold=self_threshold, resolve_conflicts=resolve_conflicts,
+        )
+    except Exception as e:
+        return {"error": f"An unexpected error occurred: {str(e)}"}
+
+
+@mcp.tool()
+async def pool_sync(refresh_prod: bool = False) -> Dict[str, Any]:
+    """Refresh pooled entries; drop any that are now submitted (status ACTIVE).
+
+    ``refresh_prod=true`` also re-queries production correlation per entry. That
+    endpoint is single-concurrency and slow, so it is off by default — use it
+    after you submit something, since submissions move everyone's numbers.
+    """
+    try:
+        return await cpool.sync_pool(brain_client, refresh_prod=refresh_prod)
+    except Exception as e:
+        return {"error": f"An unexpected error occurred: {str(e)}"}
+
 
 @mcp.tool()
 async def recommend_datasets(

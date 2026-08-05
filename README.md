@@ -275,3 +275,69 @@ sudo journalctl -u mcp-http -f
 ```
 
 该 unit 默认通过 `docker compose` 启停，使用仓库内的 `.env` 作为环境文件，按需修改 `WorkingDirectory` / `User`。
+
+---
+
+## 候选池管理（Candidate Pool）
+
+BRAIN 每天只接受约 4 个 Regular Alpha 提交，但一轮研究往往能产出更多合格 alpha。
+这些 alpha 需要排队，而排队期间有两件事必须被正确处理：
+
+1. **金字塔覆盖 = 已提交 + 候选池**。只看已提交会低估覆盖，导致重复挖同一座塔。
+2. **提交任何一个 alpha，都会抬高其余候选的生产相关性与自相关**，因为被提交的
+   alpha 加入了它们所对标的池子：
+
+   ```
+   投影生产相关性(B | 提交 S) = max( B 当前 prod-corr,  max_{A∈S} |corr(A,B)| )
+   投影自相关(B | 提交 S)     = max( B 当前 self-corr,  max_{A∈S} |corr(A,B)| )
+   ```
+
+因此「保证提交候选后其他候选的生产相关性不超 0.7」等价于
+**池内两两相关性必须始终 < 0.7** —— 这个不变量在**入池那一刻**就强制执行，
+而不是等到提交当天才发现来不及。
+
+候选之间的相关性用本地 PnL 计算，不占用 BRAIN 的相关性并发槽；
+只有候选自身的生产相关性会走那个限流接口，并缓存在条目里。
+
+### 工具
+
+| 工具 | 作用 |
+|---|---|
+| `pool_check` | 试算：这个 alpha 能否入池。不修改池。一次报出全部违规项，而不是只报第一个 |
+| `pool_add` | 通过四道闸后入池；被拒时给出原因且不写入。`force=true` 可强行入池并记录 `forced_reasons` |
+| `pool_remove` | 移除候选（例如手工提交后） |
+| `pool_list` | 列出候选及其指标、相关性 |
+| `pool_pyramid_coverage` | 真实覆盖表：每座塔的「已提交 / 池 / 合计 / 还需提交几个」 |
+| `pool_submission_plan` | 排出今日提交批次，并**证明**它不会伤害池中其余候选 |
+| `pool_sync` | 刷新条目；已提交（status ACTIVE）的自动移出池 |
+
+四道闸（`pool_check` / `pool_add`）：
+
+- 候选自身生产相关性 < `prod_threshold`（默认 0.70）
+- 候选自身自相关 < `self_threshold`（默认 0.70）
+- 与池内每个候选的 |相关性| < `prod_threshold` —— **安全闸**，硬性
+- 与池内每个候选的 |相关性| < `mutual_threshold`（默认 0.40）—— **多样性闸**，
+  可用 `allow_diversity_fail=true` 单独豁免（永远不会豁免安全闸）
+
+### 覆盖表状态
+
+- `OS_SUFFICIENT` —— 已提交数达标，塔已点亮
+- `NEEDS_<n>_SUBMISSIONS_FROM_POOL` —— 池里候选够，交上去即可点亮
+- `SHORT_BY_<n>_CANDIDATES` —— 池子不够，还得继续挖
+
+塔只由**已提交**的 alpha 点亮（默认 `target=3`）；池是能把它推到位的队列，
+所以两者并排显示。省略 `region` / `delay` 即跨区域汇总。
+
+### 互斥候选的死锁
+
+若池中存在一对互相关 ≥ 0.7 的候选（通常来自 `force=true`），提交任一个都会毁掉
+另一个。纯保护式的规划会两个都不提交，于是永久卡住。`pool_submission_plan` 会把
+这类组合列进 `conflicts` 并给出保留/放弃建议（按未满足的金字塔需求 → 倍率 → Sharpe
+排序）；加 `resolve_conflicts=true` 才会执行该建议，被放弃者列在 `sacrificed` 中。
+
+### 说明
+
+- 池文件存放于 `/app/config/candidate_pool.json`（compose 中的 `mcp_config` 卷，重建镜像不丢失），
+  可用 `CANDIDATE_POOL_FILE` 覆盖。
+- **这些工具不会提交任何 alpha**，只产出计划，提交由人工执行。
+- 测试：`python test_candidate_pool.py`（使用假客户端，不触网）。
