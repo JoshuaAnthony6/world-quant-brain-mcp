@@ -166,6 +166,17 @@ class BrainApiClient:
             self._forum_rate_limit_seconds = 0
         self._forum_rate_limit_lock = asyncio.Lock()
         self._forum_rate_limit_until = 0.0
+        # Async submission tracking: platform-side submission checks can take
+        # minutes up to ~1 hour, so submissions run as background tasks and
+        # their progress is tracked here (keyed by alpha_id).
+        self._submission_states: Dict[str, Dict[str, Any]] = {}
+        self._submission_tasks: Dict[str, asyncio.Task] = {}
+        # The platform processes one submission check at a time per account.
+        self._submission_serialize_lock = asyncio.Lock()
+        try:
+            self._submit_max_seconds = max(300.0, float(os.environ.get("BRAIN_SUBMIT_MAX_SECONDS", "5400")))
+        except Exception:
+            self._submit_max_seconds = 5400.0
         
         # Configure session
         self.session.timeout = self._default_timeout_seconds
@@ -1376,21 +1387,22 @@ class BrainApiClient:
         
         return {}
     
-    def _match_alpha_filters(self, alpha: Dict[str, Any], region: Optional[str],
-                             status: Optional[str], alpha_type: Optional[str],
-                             is_super: Optional[bool]) -> bool:
-        """Check if an alpha matches the client-side filters."""
-        if region and alpha.get('settings', {}).get('region', '').upper() != region.upper():
-            return False
-        if status and alpha.get('status', '').upper() != status.upper():
-            return False
-        if alpha_type and alpha.get('type', '').upper() != alpha_type.upper():
-            return False
-        if is_super is not None:
-            actual_is_super = alpha.get('type', '').upper() == 'SUPER'
-            if actual_is_super != is_super:
-                return False
-        return True
+    @staticmethod
+    def _normalize_brain_datetime(value: str) -> str:
+        """BRAIN date filters require ISO 8601 datetimes WITH timezone.
+
+        The API returns 400 ['Expected ISO 8601 datetime with timezone'] for
+        naive values, so date-only strings get 'T00:00:00' appended and
+        timezone-less datetimes get 'Z' appended.
+        """
+        v = (value or '').strip()
+        if not v:
+            return v
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
+            v += "T00:00:00"
+        if re.search(r"(Z|[+-]\d{2}:?\d{2})$", v):
+            return v
+        return v + "Z"
 
     async def get_user_alphas(
         self,
@@ -1407,156 +1419,95 @@ class BrainApiClient:
         status: Optional[str] = None,
         alpha_type: Optional[str] = None,
         is_super: Optional[bool] = None,
+        color: Optional[str] = None,
+        name: Optional[str] = None,
+        tag: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Get user's alphas with advanced filtering and Redis caching (1 day TTL).
-        
-        Note: The BRAIN API does not support region/status/type/is_super as query
-        parameters. These are applied as client-side filters after fetching.
+        """Get user's alphas with server-side filtering and Redis caching (1 day TTL).
+
+        All filters are applied server-side by the BRAIN API (verified by live
+        probes against /users/self/alphas):
+        - region      -> settings.region=<REGION>  (a bare 'region' param is silently ignored)
+        - status      -> status=<STATUS>
+        - alpha_type  -> type=<TYPE>
+        - is_super    -> type=SUPER (True) / type!=SUPER (False)
+        - color       -> color=<COLOR>  (case-sensitive uppercase: RED/GREEN/BLUE/YELLOW/PURPLE)
+        - name        -> name=<NAME>    (exact match only; substring operators don't exist)
+        - tag         -> tag=<TAG>      (singular 'tag'; a 'tags' param is silently ignored)
+        - dates       -> dateCreated>/dateCreated</dateSubmitted>/dateSubmitted<
+                         (values MUST be ISO 8601 with timezone; naive values are
+                         normalized via _normalize_brain_datetime; '>=' does not exist)
+        - order supports nested fields too (e.g. '-is.sharpe'), hidden is true/false
         """
         await self.ensure_authenticated()
-        
-        need_client_filter = any([region, status, is_super is not None])
-        
+
         try:
-            # Build API params (only params the API actually supports)
-            api_params = {
-                "stage": stage,
-            }
+            api_params: Dict[str, Any] = {"stage": stage}
             if start_date:
-                api_params["dateCreated>"] = start_date
+                api_params["dateCreated>"] = self._normalize_brain_datetime(start_date)
             if end_date:
-                api_params["dateCreated<"] = end_date
+                api_params["dateCreated<"] = self._normalize_brain_datetime(end_date)
             if submission_start_date:
-                api_params["dateSubmitted>"] = submission_start_date
+                api_params["dateSubmitted>"] = self._normalize_brain_datetime(submission_start_date)
             if submission_end_date:
-                api_params["dateSubmitted<"] = submission_end_date
+                api_params["dateSubmitted<"] = self._normalize_brain_datetime(submission_end_date)
             if order:
                 api_params["order"] = order
             if hidden is not None:
                 api_params["hidden"] = str(hidden).lower()
-            # 'type' is supported server-side (REGULAR, SUPER, etc.)
-            if alpha_type:
-                api_params["type"] = alpha_type
-            
-            # Build full cache key including client-side filter params
-            cache_params = {**api_params, "limit": limit, "offset": offset}
             if region:
-                cache_params["_region"] = region
+                api_params["settings.region"] = region.upper()
             if status:
-                cache_params["_status"] = status
+                api_params["status"] = status.upper()
+            if color:
+                api_params["color"] = color.upper()
+            if name:
+                api_params["name"] = name
+            if tag:
+                api_params["tag"] = tag
             if alpha_type:
-                cache_params["_type"] = alpha_type
+                api_params["type"] = alpha_type.upper()
             if is_super is not None:
-                cache_params["_is_super"] = str(is_super).lower()
-            
-            cache_key = self._generate_cache_key('user_alphas', cache_params)
-            
-            # Try to get from cache
+                if alpha_type and (alpha_type.upper() == 'SUPER') != is_super:
+                    # Contradictory filters can never match anything
+                    return {
+                        'count': 0, 'next': None, 'previous': None, 'results': [],
+                        'from_cache': False,
+                        'note': f"type={alpha_type} contradicts is_super={is_super}",
+                    }
+                if is_super:
+                    api_params["type"] = "SUPER"
+                elif not alpha_type:
+                    api_params["type!"] = "SUPER"
+
+            api_params["limit"] = limit
+            api_params["offset"] = offset
+
+            cache_key = self._generate_cache_key('user_alphas', api_params)
             cached_data = self._get_cached_data(cache_key)
             if cached_data:
                 return {**cached_data, 'from_cache': True}
-            
-            if not need_client_filter:
-                # No client-side filtering needed — use simple server-side pagination
-                api_params["limit"] = limit
-                api_params["offset"] = offset
-                data = await self._request_json_with_retries(
-                    'GET',
-                    f"{self.base_url}/users/self/alphas",
-                    params=api_params,
-                    op_name=f"get_user_alphas(stage={stage}, offset={offset})",
-                )
-            else:
-                # Client-side filtering: fetch only enough server pages to
-                # satisfy the requested page. Scanning the whole alpha history
-                # can take minutes for accounts with thousands of IS alphas.
-                # Note: The API caps results at 100 per request regardless of limit param.
-                BATCH_SIZE = 100
-                try:
-                    max_scan = max(
-                        BATCH_SIZE,
-                        int(os.environ.get("BRAIN_USER_ALPHAS_CLIENT_FILTER_MAX_SCAN", "1000")),
-                    )
-                except Exception:
-                    max_scan = 1000
-                target_matches = max(offset, 0) + max(limit, 0)
-                filtered_results = []
-                api_offset = 0
-                total_server_count = None
-                exhausted = False
-                hit_scan_limit = False
-                
-                while True:
-                    if api_offset >= max_scan:
-                        hit_scan_limit = True
-                        break
 
-                    batch_limit = min(BATCH_SIZE, max_scan - api_offset)
-                    api_params_batch = {**api_params, "limit": batch_limit, "offset": api_offset}
-                    batch_data = await self._request_json_with_retries(
-                        'GET',
-                        f"{self.base_url}/users/self/alphas",
-                        params=api_params_batch,
-                        op_name=f"get_user_alphas(stage={stage}, offset={api_offset})",
-                    )
-                    
-                    if total_server_count is None:
-                        total_server_count = batch_data.get('count', 0)
-                    
-                    batch_results = batch_data.get('results', [])
-                    if not batch_results:
-                        exhausted = True
-                        break
-                    
-                    for alpha in batch_results:
-                        if self._match_alpha_filters(alpha, region, status, alpha_type, is_super):
-                            filtered_results.append(alpha)
-                    
-                    api_offset += len(batch_results)
-                    if target_matches and len(filtered_results) >= target_matches:
-                        break
-                    # Stop if we've exhausted all server-side results
-                    if api_offset >= total_server_count:
-                        exhausted = True
-                        break
-                
-                # Apply user's offset/limit to the filtered results
-                total_filtered = len(filtered_results)
-                page_results = filtered_results[offset:offset + limit]
-                
-                next_offset = offset + limit
-                has_more = (
-                    total_filtered > next_offset
-                    or (
-                        len(page_results) == limit
-                        and not exhausted
-                        and not hit_scan_limit
-                        and total_server_count is not None
-                        and api_offset < total_server_count
-                    )
-                )
-                partial_count = not exhausted
-                data = {
-                    'count': total_filtered if not partial_count else max(total_filtered, next_offset if has_more else total_filtered),
-                    'next': f"offset={next_offset}&limit={limit}" if has_more else None,
-                    'previous': f"offset={max(0, offset - limit)}&limit={limit}" if offset > 0 else None,
-                    'results': page_results,
-                    'partial_count': partial_count,
-                    'server_scanned': api_offset,
-                    'server_count': total_server_count,
-                    'max_scan': max_scan,
-                }
-            
-            # Add metadata
+            data = await self._request_json_with_retries(
+                'GET',
+                f"{self.base_url}/users/self/alphas",
+                params=api_params,
+                op_name=f"get_user_alphas(stage={stage}, offset={offset})",
+            )
+
             data['from_cache'] = False
-            
-            # Cache complete pages longer. Partial client-filtered pages are
-            # fast-path snapshots, so keep their TTL short.
-            cache_ttl = 300 if data.get('partial_count') else 604800
-            self._set_cached_data(cache_key, data, ttl=cache_ttl)
-            
+            self._set_cached_data(cache_key, data, ttl=86400)
             return data
-            
+
+        except requests.HTTPError as e:
+            # Surface the API's error body (e.g. ['Expected ISO 8601 datetime with timezone'])
+            body = ''
+            try:
+                body = (e.response.text or '')[:300]
+            except Exception:
+                pass
+            self.log(f"Failed to get user alphas: {e} body={body}", "ERROR")
+            raise requests.HTTPError(f"{e} — {body}", response=e.response) from e
         except Exception as e:
             self.log(f"Failed to get user alphas: {str(e)}", "ERROR")
             raise
@@ -1650,23 +1601,43 @@ class BrainApiClient:
             ],
         }
 
-    async def submit_alpha(self, alpha_id: str) -> bool:
-        """Submit an alpha for production.
-        
+    async def submit_alpha(self, alpha_id: str, state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Submit an alpha for production and wait for the platform-side check to finish.
+
         Implements the correct submit flow from submit.py:
         1. POST to /alphas/{alpha_id}/submit
         2. If response has Retry-After header, switch to GET polling until no more retry-after
         3. Non-200/403 responses retry after 2 minutes
         4. Parses response JSON to check IS checks for ALREADY_SUBMITTED and FAILs
+
+        The whole flow can take from a few minutes up to ~1 hour, bounded by
+        BRAIN_SUBMIT_MAX_SECONDS (default 5400s). Progress is written into the
+        optional `state` dict so callers can observe it concurrently.
+
+        Returns a dict with at least {'status': 'SUCCESS' | 'ALREADY_SUBMITTED' |
+        'FAILED' | 'TIMEOUT', 'message': str}.
         """
         await self.ensure_authenticated()
-        
+
         submit_url = f"{self.base_url}/alphas/{alpha_id}/submit"
         attempt = 0
+        deadline = time.monotonic() + self._submit_max_seconds
+
+        def _update(phase: str, **extra: Any) -> None:
+            if state is not None:
+                state['phase'] = phase
+                state['updated_at'] = time.time()
+                state.update(extra)
 
         while True:
+            if time.monotonic() > deadline:
+                msg = f"Submission for {alpha_id} exceeded {self._submit_max_seconds:.0f}s without a final result"
+                self.log(msg, "ERROR")
+                return {'status': 'TIMEOUT', 'message': msg, 'attempts': attempt}
+
             attempt += 1
             self.log(f"Submit attempt {attempt} for alpha {alpha_id}", "INFO")
+            _update('posting', attempts=attempt)
 
             try:
                 response = await self._request('POST', submit_url)
@@ -1675,9 +1646,15 @@ class BrainApiClient:
                 raise
 
             self.log(f"Alpha submit, alpha_id={alpha_id}, status_code={response.status_code}", "INFO")
+            _update('posted', last_status_code=response.status_code)
 
             # Handle Retry-After header: switch to GET polling
+            polls = 0
             while 'retry-after' in {k.lower() for k in response.headers}:
+                if time.monotonic() > deadline:
+                    msg = f"Submission polling for {alpha_id} exceeded {self._submit_max_seconds:.0f}s"
+                    self.log(msg, "ERROR")
+                    return {'status': 'TIMEOUT', 'message': msg, 'attempts': attempt}
                 retry_after_raw = response.headers.get('Retry-After') or response.headers.get('retry-after', '5')
                 try:
                     wait_time = float(retry_after_raw)
@@ -1685,11 +1662,14 @@ class BrainApiClient:
                     wait_time = 5.0
                 # Match reference: 5x multiplier for short waits
                 actual_wait = 5 * wait_time if wait_time < 60 else wait_time
-                self.log(f"Rate limited (Retry-After={retry_after_raw}s), waiting {actual_wait:.0f}s then GET polling...", "INFO")
+                polls += 1
+                self.log(f"Submission processing (Retry-After={retry_after_raw}s), waiting {actual_wait:.0f}s then GET polling...", "INFO")
+                _update('polling', polls=polls, retry_after_seconds=actual_wait)
                 await asyncio.sleep(actual_wait)
                 try:
                     response = await self._request('GET', submit_url)
                     self.log(f"GET poll response, alpha_id={alpha_id}, status_code={response.status_code}", "INFO")
+                    _update('polling', last_status_code=response.status_code)
                 except Exception as e:
                     self.log(f"Submit GET poll failed for {alpha_id}: {e}", "ERROR")
                     raise
@@ -1699,36 +1679,144 @@ class BrainApiClient:
                 try:
                     res_json = response.json()
                 except (json.JSONDecodeError, ValueError):
-                    self.log(f"Submit response for {alpha_id} is not valid JSON: {(response.text or '')[:200]}", "ERROR")
-                    return False
+                    msg = f"Submit response for {alpha_id} is not valid JSON: {(response.text or '')[:200]}"
+                    self.log(msg, "ERROR")
+                    return {'status': 'FAILED', 'message': msg, 'attempts': attempt}
 
                 if not res_json:
-                    return False
+                    return {'status': 'FAILED', 'message': 'Empty submit response body', 'attempts': attempt}
 
                 if 'detail' in res_json and res_json['detail'] == 'Not found.':
-                    self.log(f"Submit failed: alpha {alpha_id} not found", "ERROR")
-                    return False
+                    msg = f"Submit failed: alpha {alpha_id} not found"
+                    self.log(msg, "ERROR")
+                    return {'status': 'FAILED', 'message': msg, 'attempts': attempt}
 
                 # Check IS checks in response
                 if 'is' in res_json and 'checks' in res_json['is']:
+                    failed_checks = []
                     for item in res_json['is']['checks']:
                         if item.get('name') == 'ALREADY_SUBMITTED':
                             self.log(f"Alpha {alpha_id} already submitted", "WARNING")
-                            return False
+                            return {'status': 'ALREADY_SUBMITTED',
+                                    'message': f'Alpha {alpha_id} was already submitted',
+                                    'attempts': attempt}
                         if item.get('result') == 'FAIL':
                             self.log(f"Alpha {alpha_id} IS check failed: {item.get('name')} limit={item.get('limit')} value={item.get('value')}", "ERROR")
-                            return False
+                            failed_checks.append({'name': item.get('name'), 'limit': item.get('limit'), 'value': item.get('value')})
+                    if failed_checks:
+                        return {'status': 'FAILED',
+                                'message': f"Submission checks failed for {alpha_id}",
+                                'failed_checks': failed_checks,
+                                'attempts': attempt}
 
                 self.log(f"Alpha {alpha_id} submission successful!", "INFO")
-                return True
+                return {'status': 'SUCCESS',
+                        'message': f'Alpha {alpha_id} submitted successfully',
+                        'attempts': attempt}
 
             elif response.status_code == 403:
                 self.log(f"Submit forbidden (403) for alpha {alpha_id}", "ERROR")
-                return False
+                return {'status': 'FAILED',
+                        'message': f'Submit forbidden (403) for alpha {alpha_id}',
+                        'attempts': attempt}
 
             else:
                 self.log(f"Submit failed status={response.status_code} for {alpha_id}, waiting 2 minutes before retry...", "WARNING")
+                _update('retry_wait', last_status_code=response.status_code)
                 await asyncio.sleep(120)
+
+    # --- Asynchronous submission management ---
+
+    _SUBMISSION_TERMINAL_STATUSES = {'SUCCESS', 'ALREADY_SUBMITTED', 'FAILED', 'TIMEOUT', 'ERROR'}
+
+    def _submission_state_snapshot(self, alpha_id: str) -> Optional[Dict[str, Any]]:
+        state = self._submission_states.get(alpha_id)
+        if state is None:
+            return None
+        snap = dict(state)
+        started = snap.get('started_at')
+        if started:
+            snap['elapsed_seconds'] = round(time.time() - started, 1)
+        return snap
+
+    def start_submission(self, alpha_id: str, pre_check: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Start a background submission task for an alpha; returns immediately.
+
+        Submissions are serialized (the platform runs one submission check at a
+        time), so a second submission started while another is running waits in
+        QUEUED state.
+        """
+        existing = self._submission_tasks.get(alpha_id)
+        if existing is not None and not existing.done():
+            return {
+                'status': 'ALREADY_RUNNING',
+                'message': f'A submission for {alpha_id} is already in progress',
+                'state': self._submission_state_snapshot(alpha_id),
+            }
+
+        self._submission_states[alpha_id] = {
+            'alpha_id': alpha_id,
+            'status': 'QUEUED',
+            'phase': 'queued',
+            'attempts': 0,
+            'polls': 0,
+            'started_at': time.time(),
+            'updated_at': time.time(),
+            'finished_at': None,
+            'result': None,
+            'error': None,
+            'pre_check': pre_check,
+        }
+        task = asyncio.create_task(self._run_submission(alpha_id))
+        self._submission_tasks[alpha_id] = task
+        return {'status': 'STARTED', 'state': self._submission_state_snapshot(alpha_id)}
+
+    async def _run_submission(self, alpha_id: str) -> None:
+        state = self._submission_states[alpha_id]
+        try:
+            async with self._submission_serialize_lock:
+                state['status'] = 'RUNNING'
+                state['updated_at'] = time.time()
+                result = await self.submit_alpha(alpha_id, state=state)
+            state['result'] = result
+            state['status'] = result.get('status', 'ERROR')
+        except Exception as e:
+            state['status'] = 'ERROR'
+            state['error'] = str(e)
+            self.log(f"Background submission for {alpha_id} crashed: {e}", "ERROR")
+        finally:
+            state['finished_at'] = time.time()
+            state['updated_at'] = time.time()
+
+    async def get_submission_status(self, alpha_id: str) -> Dict[str, Any]:
+        """Report the status of a submission started via start_submission.
+
+        Falls back to a live platform probe (alpha stage / dateSubmitted) when
+        there is no in-memory record, e.g. after a server restart.
+        """
+        snap = self._submission_state_snapshot(alpha_id)
+        if snap is not None:
+            done = snap.get('status') in self._SUBMISSION_TERMINAL_STATUSES
+            return {'source': 'tracker', 'done': done, **snap}
+
+        # No in-memory record — probe the platform directly
+        details = await self.get_alpha_details(alpha_id)
+        stage = details.get('stage')
+        date_submitted = details.get('dateSubmitted')
+        submitted = stage == 'OS' or bool(date_submitted)
+        return {
+            'source': 'live',
+            'done': submitted,
+            'alpha_id': alpha_id,
+            'status': 'SUCCESS' if submitted else 'UNKNOWN',
+            'stage': stage,
+            'date_submitted': date_submitted,
+            'message': (
+                f'Alpha {alpha_id} is submitted (stage={stage})' if submitted
+                else f'No tracked submission for {alpha_id} in this server session and the alpha is not submitted (stage={stage}). '
+                     f'Call submit_alpha to start a submission.'
+            ),
+        }
     
     async def get_events(self) -> Dict[str, Any]:
         """Get available events and competitions."""
@@ -4747,6 +4835,9 @@ async def get_user_alphas(
     status: Optional[str] = None,
     type: Optional[str] = None,
     is_super: Optional[bool] = None,
+    color: Optional[str] = None,
+    name: Optional[str] = None,
+    tag: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Get user's alphas with advanced filtering, pagination, and sorting.
@@ -4766,35 +4857,46 @@ async def get_user_alphas(
             Used for pagination. For example, `limit=50, offset=50` will retrieve alphas 51-100.
             Defaults to 0.
         start_date (Optional[str]): The earliest creation date for the alphas to be included.
-            Filters for alphas created on or after this date.
-            Example format: "2023-01-01T00:00:00Z".
+            Filters for alphas created after this date (strictly greater).
+            Example format: "2023-01-01T00:00:00Z". Date-only or timezone-less values
+            are accepted and normalized to UTC automatically.
         end_date (Optional[str]): The latest creation date for the alphas to be included.
             Filters for alphas created before this date.
-            Example format: "2023-12-31T23:59:59Z".
+            Example format: "2023-12-31T23:59:59Z". Normalized like start_date.
         submission_start_date (Optional[str]): The earliest submission date for the alphas.
-            Only applies to "OS" alphas. Filters for alphas submitted on or after this date.
-            Example format: "2024-01-01T00:00:00Z".
+            Only applies to "OS" alphas. Filters for alphas submitted after this date.
+            Example format: "2024-01-01T00:00:00Z". Normalized like start_date.
         submission_end_date (Optional[str]): The latest submission date for the alphas.
             Only applies to "OS" alphas. Filters for alphas submitted before this date.
-            Example format: "2024-06-30T23:59:59Z".
+            Example format: "2024-06-30T23:59:59Z". Normalized like start_date.
         order (Optional[str]): The sorting order for the returned alphas.
-            Prefix with a hyphen (-) for descending order.
-            Examples: "name" (sort by name ascending), "-dateSubmitted" (sort by submission date descending).
+            Prefix with a hyphen (-) for descending order. Nested fields are supported.
+            Examples: "name", "-dateSubmitted", "-is.sharpe", "dateCreated".
         hidden (Optional[bool]): Filter alphas based on their visibility.
             - `True`: Only return hidden alphas.
             - `False`: Only return non-hidden alphas.
             If not provided, both hidden and non-hidden alphas are returned.
-        region (Optional[str]): Filter alphas by region.
-            Common values: "USA", "EUR", "ASI", "GLB", etc.
+        region (Optional[str]): Filter alphas by region (server-side, settings.region).
+            Common values: "USA", "EUR", "ASI", "GLB", "CHN", "GBR", etc.
             If not provided, alphas from all regions are returned.
-        status (Optional[str]): Filter alphas by their OS status.
-            Common values: "ACTIVE", "SUPERSEDED", "UNSUBMITTED", etc.
+        status (Optional[str]): Filter alphas by status (server-side).
+            Common values: "ACTIVE", "UNSUBMITTED", "DECOMMISSIONED", etc.
             If not provided, alphas with any status are returned.
-        type (Optional[str]): Filter alphas by their expression type.
+        type (Optional[str]): Filter alphas by their expression type (server-side).
             Common values: "REGULAR", "SUPER", etc.
             If not provided, alphas of all types are returned.
         is_super (Optional[bool]): Filter to only super alphas (True) or non-super alphas (False).
-            If not provided, both super and non-super alphas are returned.
+            Applied server-side as type=SUPER / type!=SUPER. If not provided, both are returned.
+        color (Optional[str]): Filter alphas by their color label (server-side).
+            Values: "RED", "GREEN", "BLUE", "YELLOW", "PURPLE" (case-insensitive here,
+            normalized to uppercase). If not provided, alphas of any color are returned.
+        name (Optional[str]): Filter alphas by name (server-side, EXACT match only —
+            the API has no substring/fuzzy name matching).
+        tag (Optional[str]): Filter alphas that carry this tag (server-side, exact tag
+            value, e.g. "PowerPoolSelected"). One tag per query.
+
+    All filters are applied server-side by the BRAIN API, so pagination (count/limit/offset)
+    reflects the filtered set directly.
 
     Returns:
         Dict[str, Any]: A dictionary containing a list of alpha details under the 'results' key,
@@ -4806,6 +4908,7 @@ async def get_user_alphas(
             end_date=end_date, submission_start_date=submission_start_date,
             submission_end_date=submission_end_date, order=order, hidden=hidden,
             region=region, status=status, alpha_type=type, is_super=is_super,
+            color=color, name=name, tag=tag,
         ))
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
@@ -4813,48 +4916,83 @@ async def get_user_alphas(
 @mcp.tool()
 async def submit_alpha(alpha_id: str) -> Dict[str, Any]:
     """
-    Submit an alpha for production with pre-submission IS metrics check.
-    
-    Before submitting, this tool automatically checks the alpha's IS metrics against
-    the following thresholds:
-    - Sharpe > 1.58, Fitness > 1
-    - Margin > 5bp for USA, otherwise > 15bp (hard floor 10bp)
-    - Turnover between 5% and 20%
-    - Returns > 5% and Returns > Drawdown
-    - All IS checks must PASS (no FAIL)
-    
-    If the check fails, submission is blocked and failure details are returned.
-    
+    Start an ASYNCHRONOUS submission of an alpha, with pre-submission IS metrics check.
+
+    The platform-side submission check takes from a few minutes up to ~1 hour, so this
+    tool does NOT wait for the result. It validates the alpha, starts a background
+    submission task, and returns immediately. Use get_submission_status(alpha_id) to
+    poll the outcome (polling every 1-5 minutes is enough; do not busy-wait).
+
+    Before starting, this tool automatically checks the alpha's IS metrics against
+    the submission thresholds (Sharpe, Fitness, Margin, Turnover, Returns, and all
+    IS checks must not FAIL). If the check fails, submission is blocked and failure
+    details are returned.
+
     Args:
-        alpha_id: The ID of the alpha to submit    
+        alpha_id: The ID of the alpha to submit
     Returns:
-        Submission result including pre-check details
+        Immediate acknowledgement that the background submission started (or the
+        reason it was blocked). The final result must be read via
+        get_submission_status(alpha_id).
     """
-    force = False
     try:
-        if not force:
-            # Fetch alpha details for IS metrics check
-            alpha_details = await brain_client.get_alpha_details(alpha_id)
-            check_result = brain_client.pre_submit_check(alpha_details)
-            
-            if not check_result['passed']:
-                return {
-                    "success": False,
-                    "blocked": True,
-                    "reason": "Pre-submission IS metrics check failed. Alpha does not meet submission thresholds.",
-                    "check_result": check_result,
-                }
-            
-            # Passed check — proceed to submit
-            success = await brain_client.submit_alpha(alpha_id)
+        # Fetch alpha details for IS metrics check
+        alpha_details = await brain_client.get_alpha_details(alpha_id)
+
+        stage = alpha_details.get('stage')
+        if stage == 'OS' or alpha_details.get('dateSubmitted'):
             return {
-                "success": success,
-                "blocked": False,
+                "success": False,
+                "blocked": True,
+                "reason": f"Alpha {alpha_id} is already submitted (stage={stage}).",
+            }
+
+        check_result = brain_client.pre_submit_check(alpha_details)
+        if not check_result['passed']:
+            return {
+                "success": False,
+                "blocked": True,
+                "reason": "Pre-submission IS metrics check failed. Alpha does not meet submission thresholds.",
                 "check_result": check_result,
             }
-        else:
-            success = await brain_client.submit_alpha(alpha_id)
-            return {"success": success, "forced": True}
+
+        # Passed check — start background submission and return immediately
+        start = brain_client.start_submission(alpha_id, pre_check=check_result)
+        return {
+            "async": True,
+            "blocked": False,
+            "submission": start,
+            "message": (
+                f"Submission of {alpha_id} started in the background; the platform check "
+                f"may take from a few minutes up to ~1 hour. Poll get_submission_status('{alpha_id}') "
+                f"every few minutes for the final result."
+            ),
+            "check_result": check_result,
+        }
+    except Exception as e:
+        return {"error": f"An unexpected error occurred: {str(e)}"}
+
+@mcp.tool()
+async def get_submission_status(alpha_id: str) -> Dict[str, Any]:
+    """
+    Check the status of an asynchronous alpha submission started via submit_alpha.
+
+    Returns the tracked background-task state: status is one of QUEUED, RUNNING
+    (with phase/attempts/polls progress), or a terminal status — SUCCESS,
+    ALREADY_SUBMITTED, FAILED (with failed_checks), TIMEOUT, ERROR. The 'done'
+    field is true once the submission reached a terminal status.
+
+    If the server was restarted and no in-memory record exists, it falls back to
+    probing the platform (alpha stage / dateSubmitted) to tell whether the alpha
+    is submitted.
+
+    Args:
+        alpha_id: The ID of the alpha whose submission to check
+    Returns:
+        Submission status snapshot
+    """
+    try:
+        return await brain_client.get_submission_status(alpha_id)
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
@@ -5303,9 +5441,9 @@ async def set_alpha_properties(alpha_id: str, name: Optional[str] = None,
       each be at least 100 English characters.
       Args:
         color: may be one of `RED` `GREEN` `YELLOW` `BLUE` `PURPLE`；
-        name: 使用生产相关性命名，不能带空格；建议基于 production correlation
-        的最大值命名，例如 `0.6534` 表示 prod correlation = 0.6534；
-        tags 至少包含 `PowerPoolSelected`；
+        name: 使用生产相关性和自相关性命名，不能带空格；建议基于 correlation
+        的最大值命名，例如 `0.6534_0.2306` 表示 prod correlation = 0.6534, self correlation = 0.2306；
+        tags 如果alpha质量非常好可以设置 `PowerPoolSelected`，质量不好或不好判断就不要设置tag；
         descriptions: Write in English, <=100 words. The three sections MUST be separated by
         actual newline characters (i.e. use the JSON escape sequence \\n\\n between sections,
         NOT the literal text "\\n\\n"). Example value:
@@ -5430,7 +5568,7 @@ async def pool_add(
     force: bool = False,
     allow_diversity_fail: bool = False,
     prod_threshold: float = 0.70,
-    self_threshold: float = 0.70,
+    self_threshold: float = 0.50,
     mutual_threshold: float = 0.40,
     refresh_prod: bool = True,
 ) -> Dict[str, Any]:
