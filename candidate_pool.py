@@ -25,7 +25,7 @@ discovered on submission day when it is too late.
 
 The pool therefore enforces, on every ``add``:
   * candidate's own production correlation      < prod_threshold  (default 0.70)
-  * candidate's own self correlation            < self_threshold  (default 0.70)
+  * candidate's own self correlation            < self_threshold  (default 0.50)
   * |corr(candidate, every pool member)|        < prod_threshold  -- SAFETY
   * |corr(candidate, every pool member)|        < mutual_threshold-- DIVERSITY
 
@@ -64,7 +64,7 @@ PYRAMID_LABELS: Dict[str, str] = {
 }
 
 DEFAULT_PROD_THRESHOLD = 0.70
-DEFAULT_SELF_THRESHOLD = 0.70
+DEFAULT_SELF_THRESHOLD = 0.50
 DEFAULT_MUTUAL_THRESHOLD = 0.40
 DEFAULT_PYRAMID_TARGET = 3
 DEFAULT_DAILY_SUBMIT_CAP = 4
