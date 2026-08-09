@@ -1422,6 +1422,7 @@ class BrainApiClient:
         color: Optional[str] = None,
         name: Optional[str] = None,
         tag: Optional[str] = None,
+        language: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Get user's alphas with server-side filtering and Redis caching (1 day TTL).
 
@@ -1465,6 +1466,8 @@ class BrainApiClient:
                 api_params["name"] = name
             if tag:
                 api_params["tag"] = tag
+            if language:
+                api_params["settings.language"] = language.upper()
             if alpha_type:
                 api_params["type"] = alpha_type.upper()
             if is_super is not None:
@@ -4297,6 +4300,10 @@ def _slim_alpha(a):
         v = a.get(k)
         if v not in (None, "", []):
             out[k] = v
+    for k in ("osmosisPoints",):
+        v = a.get(k)
+        if v is not None:
+            out[k] = v
     return {k: v for k, v in out.items() if v is not None}
 
 
@@ -4838,6 +4845,7 @@ async def get_user_alphas(
     color: Optional[str] = None,
     name: Optional[str] = None,
     tag: Optional[str] = None,
+    language: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Get user's alphas with advanced filtering, pagination, and sorting.
@@ -4894,6 +4902,10 @@ async def get_user_alphas(
             the API has no substring/fuzzy name matching).
         tag (Optional[str]): Filter alphas that carry this tag (server-side, exact tag
             value, e.g. "PowerPoolSelected"). One tag per query.
+        language (Optional[str]): Filter alphas by expression language (server-side,
+            settings.language). Values: "FASTEXPR", "PYTHON" (case-insensitive,
+            normalized to uppercase). If not provided, alphas of all languages
+            are returned.
 
     All filters are applied server-side by the BRAIN API, so pagination (count/limit/offset)
     reflects the filtered set directly.
@@ -4908,7 +4920,7 @@ async def get_user_alphas(
             end_date=end_date, submission_start_date=submission_start_date,
             submission_end_date=submission_end_date, order=order, hidden=hidden,
             region=region, status=status, alpha_type=type, is_super=is_super,
-            color=color, name=name, tag=tag,
+            color=color, name=name, tag=tag, language=language,
         ))
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
