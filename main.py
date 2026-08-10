@@ -6054,6 +6054,204 @@ async def _wait_for_multisimulation_completion(location: str, expected_children:
     except Exception as e:
         return {"error": f"Error waiting for multisimulation completion: {str(e)}"}
 
+# --- Three-stage multisimulation tools (throttling-era pattern) --------------
+# Split of create_multi_simulation into submit / check / fetch so callers
+# control the polling cadence, see rate-limit signals (429 + Retry-After,
+# CONCURRENT/DAILY_SIMULATION_LIMIT bodies, per-child CANCELLED statuses),
+# and never need multi-minute blocking tool calls.
+
+def _build_multisim_payload(alpha_expressions, instrument_type, region, universe,
+                            delay, decay, neutralization, truncation, test_period,
+                            unit_handling, nan_handling, language, lookback,
+                            visualization, pasteurization, max_trade):
+    normalized_language = language.upper()
+    payload = []
+    for alpha_expr in alpha_expressions:
+        settings = {
+            'instrumentType': instrument_type,
+            'region': region,
+            'universe': universe,
+            'delay': delay,
+            'decay': decay,
+            'neutralization': neutralization,
+            'truncation': truncation,
+            'pasteurization': pasteurization,
+            'language': normalized_language,
+            'visualization': visualization,
+            'testPeriod': test_period,
+            'maxTrade': max_trade
+        }
+        if normalized_language == "PYTHON":
+            settings['lookback'] = 256 if lookback is None else lookback
+        else:
+            settings['unitHandling'] = unit_handling
+            settings['nanHandling'] = nan_handling
+        payload.append({'type': 'REGULAR', 'settings': settings,
+                        'regular': alpha_expr})
+    return payload
+
+
+@mcp.tool()
+async def submit_multi_simulation(
+    alpha_expressions: List[str],
+    instrument_type: str = "EQUITY",
+    region: str = "USA",
+    universe: str = "TOP3000",
+    delay: int = 1,
+    decay: int = 4,
+    neutralization: str = "INDUSTRY",
+    truncation: float = 0.0,
+    test_period: str = "P0Y0M",
+    unit_handling: str = "VERIFY",
+    nan_handling: str = "OFF",
+    language: str = "FASTEXPR",
+    lookback: Optional[int] = None,
+    visualization: bool = False,
+    pasteurization: str = "ON",
+    max_trade: str = "OFF"
+) -> Dict[str, Any]:
+    """Stage 1/3: submit a multisimulation and return IMMEDIATELY (seconds).
+
+    Returns {submitted, location, multisimulation_id} on success. On HTTP 429
+    returns {error: "RATE_LIMITED", retry_after}. Poll the location with
+    check_multi_simulation, then call fetch_multi_simulation_result.
+    Same parameters as create_multi_simulation.
+    """
+    try:
+        if len(alpha_expressions) < 2:
+            return {"error": "At least 2 alpha expressions are required"}
+        if len(alpha_expressions) > 10:
+            return {"error": "Maximum 10 alpha expressions allowed per request"}
+        await brain_client.ensure_authenticated()
+        payload = _build_multisim_payload(
+            alpha_expressions, instrument_type, region, universe, delay, decay,
+            neutralization, truncation, test_period, unit_handling, nan_handling,
+            language, lookback, visualization, pasteurization, max_trade)
+        response = await brain_client._request(
+            'POST', f"{brain_client.base_url}/simulations", json=payload)
+        if response.status_code == 429:
+            return {
+                "error": "RATE_LIMITED",
+                "status_code": 429,
+                "retry_after": response.headers.get("Retry-After"),
+                "details": response.text[:500],
+            }
+        if response.status_code != 201:
+            return {
+                "error": f"Failed to create multisimulation. Status: {response.status_code}",
+                "status_code": response.status_code,
+                "details": response.text[:800],
+            }
+        location = response.headers.get('Location', '')
+        if not location:
+            return {"error": "No location header in multisimulation response"}
+        return {
+            "submitted": True,
+            "location": location,
+            "multisimulation_id": location.rstrip('/').split('/')[-1],
+            "n_expressions": len(alpha_expressions),
+        }
+    except Exception as e:
+        return {"error": f"Error submitting multisimulation: {str(e)}"}
+
+
+@mcp.tool()
+async def check_multi_simulation(location: str) -> Dict[str, Any]:
+    """Stage 2/3: single status probe of a multisimulation (one GET, seconds).
+
+    Returns {status, children, retry_after}. Re-call after sleeping
+    ~retry_after seconds until status is COMPLETE or ERROR (children may
+    appear before completion). RATE_LIMITED status means back off harder.
+    """
+    try:
+        await brain_client.ensure_authenticated()
+        response = await brain_client._request('GET', location)
+        if response.status_code == 429:
+            return {"status": "RATE_LIMITED",
+                    "retry_after": response.headers.get("Retry-After") or 30}
+        if response.status_code != 200:
+            return {"status": "HTTP_ERROR",
+                    "status_code": response.status_code,
+                    "details": response.text[:500]}
+        data = response.json()
+        retry_after = response.headers.get("Retry-After")
+        status = data.get("status")
+        if not status:
+            status = "IN_PROGRESS" if retry_after else "UNKNOWN"
+        return {
+            "status": status,
+            "children": data.get("children", []),
+            "n_children": len(data.get("children", [])),
+            "retry_after": float(retry_after) if retry_after else 0.0,
+        }
+    except Exception as e:
+        return {"status": "CLIENT_ERROR", "error": str(e)}
+
+
+@mcp.tool()
+async def fetch_multi_simulation_result(location: str) -> Dict[str, Any]:
+    """Stage 3/3: fetch per-child results after check reports completion.
+
+    One GET per child simulation plus one GET per produced alpha. Child
+    simulations without an alpha id report their platform status explicitly
+    (e.g. CANCELLED / ERROR) instead of a generic message. Output matches
+    create_multi_simulation's alpha_results shape.
+    """
+    try:
+        await brain_client.ensure_authenticated()
+        response = await brain_client._request('GET', location)
+        if response.status_code != 200:
+            return {"error": f"multisim fetch failed: {response.status_code}",
+                    "details": response.text[:400]}
+        data = response.json()
+        children = data.get("children", [])
+        if not children:
+            return {"error": "no children yet — poll check_multi_simulation until completion",
+                    "status": data.get("status")}
+        alpha_results = []
+        for i, child_id in enumerate(children):
+            child_url = child_id if str(child_id).startswith('http') \
+                else f"{brain_client.base_url}/simulations/{child_id}"
+            try:
+                child_resp = await brain_client._request('GET', child_url)
+                if child_resp.status_code != 200:
+                    alpha_results.append({
+                        "location": child_url,
+                        "error": f"child fetch failed: {child_resp.status_code}"})
+                    continue
+                child = child_resp.json()
+                child_status = child.get("status")
+                alpha_id = child.get("alpha")
+                if not alpha_id:
+                    alpha_results.append({
+                        "location": child_url,
+                        "status": child_status,
+                        "error": f"No alpha ID (child status: {child_status})"})
+                    continue
+                details_resp = await brain_client._request(
+                    'GET', f"{brain_client.base_url}/alphas/{alpha_id}")
+                if details_resp.status_code == 200:
+                    alpha_results.append({"alpha_id": alpha_id,
+                                          "location": child_url,
+                                          "details": details_resp.json()})
+                else:
+                    alpha_results.append({
+                        "alpha_id": alpha_id, "location": child_url,
+                        "error": f"Failed to get alpha details: {details_resp.status_code}"})
+            except Exception as e:
+                alpha_results.append({"location": f"child_{i+1}", "error": str(e)})
+        return _slim_multisim({
+            "success": True,
+            "message": f"fetched {len(alpha_results)} child results",
+            "total_requested": len(children),
+            "total_created": len(alpha_results),
+            "multisimulation_id": location.rstrip('/').split('/')[-1],
+            "multisim_status": data.get("status"),
+            "alpha_results": alpha_results,
+        })
+    except Exception as e:
+        return {"error": f"Error fetching multisimulation result: {str(e)}"}
+
 # --- Payment and Financial Tools ---
 
 @mcp.tool()
