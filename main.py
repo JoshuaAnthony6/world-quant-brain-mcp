@@ -368,6 +368,24 @@ class AlphaStore:
             PRIMARY KEY (alpha_id, token)
         )""",
         "CREATE INDEX IF NOT EXISTS ix_tokens_token ON alpha_tokens(token, kind)",
+        # Datafield catalogue, indexed for search. It lives in the same database
+        # as the alpha corpus so "which of the fields I actually use are about
+        # analyst revisions" is one join rather than two lookups in two stores.
+        """CREATE TABLE IF NOT EXISTS datafields (
+            id TEXT PRIMARY KEY, description TEXT, type TEXT,
+            dataset TEXT, category TEXT, date_created TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS datafield_configs (
+            id TEXT NOT NULL, region TEXT, universe TEXT, delay INTEGER,
+            coverage REAL, user_count INTEGER, alpha_count INTEGER,
+            PRIMARY KEY (id, region, universe, delay)
+        )""",
+        "CREATE INDEX IF NOT EXISTS ix_dfcfg ON datafield_configs(region, universe, delay)",
+        # porter stemming is the whole point: the catalogue says "estimates
+        # lowered" where a researcher types "lower", and substring matching also
+        # produced false hits like "cutoff" for "cut".
+        """CREATE VIRTUAL TABLE IF NOT EXISTS datafields_fts
+           USING fts5(id UNINDEXED, description, tokenize='porter unicode61')""",
     ]
 
     # Expression identifiers: FastExpr fields and operators are both bare words.
@@ -558,6 +576,109 @@ class AlphaStore:
                 conn.close()
         async with self._lock:
             await asyncio.to_thread(_rb)
+
+    # --- Datafield search index -------------------------------------------- #
+
+    _FTS_OPERATORS = re.compile(r'\b(AND|OR|NOT|NEAR)\b|["()*:^]')
+
+    @staticmethod
+    def fts_query(search: str) -> str:
+        """Turn a user search string into a safe FTS5 query.
+
+        A query already written in FTS5 syntax is passed through; anything else
+        is quoted term-by-term and AND-ed, which both matches the previous
+        keyword behaviour and stops punctuation from being read as syntax.
+        """
+        text = (search or '').strip()
+        if not text:
+            return ''
+        if AlphaStore._FTS_OPERATORS.search(text):
+            return text
+        terms = [t for t in re.split(r'[^\w]+', text) if t]
+        return ' AND '.join('"%s"' % t for t in terms)
+
+    def _index_datafields_sync(self, fields: List[Dict[str, Any]],
+                               configs: List[tuple]) -> Dict[str, Any]:
+        conn = self._connect()
+        try:
+            conn.execute("DELETE FROM datafields_fts")
+            conn.execute("DELETE FROM datafields")
+            conn.execute("DELETE FROM datafield_configs")
+            conn.executemany("INSERT OR REPLACE INTO datafields VALUES (?,?,?,?,?,?)", fields)
+            conn.executemany(
+                "INSERT OR REPLACE INTO datafield_configs VALUES (?,?,?,?,?,?,?)", configs)
+            conn.executemany("INSERT INTO datafields_fts(id, description) VALUES (?,?)",
+                             [(f[0], f[1]) for f in fields if f[1]])
+            conn.commit()
+            return {'fields': len(fields), 'config_rows': len(configs)}
+        finally:
+            conn.close()
+
+    async def index_datafields(self, fields: List[Dict[str, Any]],
+                               configs: List[tuple]) -> Dict[str, Any]:
+        await self.ensure_ready()
+        async with self._lock:
+            return await asyncio.to_thread(self._index_datafields_sync, fields, configs)
+
+    async def search_datafields(self, search: str, region: Optional[str] = None,
+                                universe: Optional[str] = None, delay: Optional[int] = None,
+                                data_type: Optional[str] = None,
+                                dataset_id: Optional[str] = None,
+                                limit: int = 200) -> Optional[List[Dict[str, Any]]]:
+        """Rank fields by relevance to ``search``. None when the index is empty."""
+        await self.ensure_ready()
+        q = self.fts_query(search)
+        if not q:
+            return None
+
+        def _q():
+            conn = self._connect()
+            try:
+                if not conn.execute("SELECT COUNT(*) n FROM datafields").fetchone()["n"]:
+                    return None
+                sql = ["SELECT d.id, d.description, d.type, d.dataset, d.category,",
+                       "       d.date_created, c.coverage, c.user_count, c.alpha_count",
+                       "FROM datafields_fts f",
+                       "JOIN datafields d ON d.id = f.id",
+                       "LEFT JOIN datafield_configs c ON c.id = d.id"]
+                params: List[Any] = []
+                cond = ["f.datafields_fts MATCH ?"]
+                params.append(q)
+                for col, val in (("c.region", region and region.upper()),
+                                 ("c.universe", universe and universe.upper()),
+                                 ("c.delay", delay)):
+                    if val is not None:
+                        cond.append(f"{col} = ?"); params.append(val)
+                if data_type and data_type != 'ALL':
+                    cond.append("d.type = ?"); params.append(data_type)
+                if dataset_id:
+                    cond.append("d.dataset = ?"); params.append(dataset_id)
+                sql.append("WHERE " + " AND ".join(cond))
+                sql.append("ORDER BY rank LIMIT ?")
+                params.append(limit)
+                try:
+                    return [dict(r) for r in conn.execute(" ".join(sql), params).fetchall()]
+                except sqlite3.OperationalError:
+                    # Malformed FTS expression: fall back to the caller's filter.
+                    return None
+            finally:
+                conn.close()
+        return await asyncio.to_thread(_q)
+
+    async def datafield_index_stats(self) -> Dict[str, Any]:
+        await self.ensure_ready()
+
+        def _s():
+            conn = self._connect()
+            try:
+                return {
+                    'fields': conn.execute("SELECT COUNT(*) n FROM datafields").fetchone()["n"],
+                    'config_rows': conn.execute(
+                        "SELECT COUNT(*) n FROM datafield_configs").fetchone()["n"],
+                }
+            finally:
+                conn.close()
+        return await asyncio.to_thread(_s)
 
     async def get_state(self, key: str) -> Optional[str]:
         await self.ensure_ready()
@@ -2431,8 +2552,11 @@ class BrainApiClient:
                    'dataset_id': dataset_id, 'declared_count': block.get('declared_count'),
                    'complete': block.get('complete')}
             if search:
-                out['results'] = [f for f in rows if _dataset_field_matches(f, search)]
+                ranked = await self._fts_filter(rows, search, region, universe, delay)
+                out['results'] = ranked if ranked is not None else [
+                    f for f in rows if _dataset_field_matches(f, search)]
                 out['count'] = len(out['results'])
+                out['search_mode'] = 'fts5' if ranked is not None else 'substring'
             if filter_sharpe:
                 filtered, removed, applied = self._sharpe_filter_rows(out['results'], region, delay)
                 out['results'] = filtered
@@ -2562,9 +2686,13 @@ class BrainApiClient:
                 _annotate_catalogue_completeness(cached_data)
                 result = {**cached_data, 'from_cache': True}
                 results = result.get('results', [])
-                # Apply fuzzy search filter if needed
+                # Full-text first: stemming and ranking beat substring matching,
+                # which matched "cutoff" for "cut" and missed "estimates lowered".
                 if search:
-                    results = [item for item in results if fuzzy_search_filter(item, search)]
+                    ranked = await self._fts_filter(results, search, region, universe, delay)
+                    results = ranked if ranked is not None else [
+                        item for item in results if fuzzy_search_filter(item, search)]
+                    result['search_mode'] = 'fts5' if ranked is not None else 'substring'
                 # Apply OS/IS Sharpe filtering
                 if filter_sharpe:
                     results, removed, applied = sharpe_filter(results, region, delay)
@@ -2638,14 +2766,13 @@ class BrainApiClient:
             if all_results:
                 await self.store.put('datafields', cache_key, complete_data, key_params=cache_params)
 
-            # Apply fuzzy search filter if needed
             if search:
-                filtered_results = [
-                    item for item in all_results
-                    if fuzzy_search_filter(item, search)
-                ]
+                ranked = await self._fts_filter(all_results, search, region, universe, delay)
+                filtered_results = ranked if ranked is not None else [
+                    item for item in all_results if fuzzy_search_filter(item, search)]
                 complete_data['results'] = filtered_results
                 complete_data['count'] = len(filtered_results)
+                complete_data['search_mode'] = 'fts5' if ranked is not None else 'substring'
             
             # Apply OS/IS Sharpe ratio filtering
             if filter_sharpe:
@@ -3035,6 +3162,76 @@ class BrainApiClient:
                 op_set=vocab['operators'], field_set=vocab['fields'])
         except Exception as e:
             self.log(f"[corpus] Failed to record alpha {alpha.get('id')}: {e}", "WARNING")
+
+    async def _fts_filter(self, rows: List[Dict[str, Any]], search: str,
+                          region: Optional[str], universe: Optional[str],
+                          delay: Optional[Any]) -> Optional[List[Dict[str, Any]]]:
+        """Order ``rows`` by full-text relevance. None when the index cannot serve it."""
+        try:
+            # No configuration filter here: the caller's rows already belong to
+            # the right configuration, so this only needs relevance ordering.
+            hits = await self.alpha_store.search_datafields(search, limit=20000)
+        except Exception as e:
+            self.log(f"[field-index] FTS search failed ({e}); using substring match", "WARNING")
+            return None
+        if hits is None:
+            return None
+        order = {h['id']: i for i, h in enumerate(hits)}
+        # Keep the caller's own rows (they carry this configuration's metrics)
+        # but in relevance order.
+        matched = [r for r in rows if r.get('id') in order]
+        matched.sort(key=lambda r: order[r['id']])
+        return matched
+
+    async def build_datafield_search_index(self) -> Dict[str, Any]:
+        """Index every stored datafield description for full-text search.
+
+        Reads only the local catalogues — zero platform requests. Worth doing
+        because the previous search was a Python substring scan over the cached
+        rows: it took ~550 ms, matched "cutoff" for "cut", and missed the 69
+        fields describing a dividend cut as "DPS estimates lowered". FTS5 with
+        porter stemming builds in well under a second and answers in ~1 ms.
+        """
+        fields: Dict[str, tuple] = {}
+        configs: List[tuple] = []
+        try:
+            # The CONFIG-level catalogues, not the per-dataset ones: a
+            # configuration built by reuse (dedup mode) has no per-dataset
+            # entries at all, so indexing from those silently skipped it.
+            entries = await self.store.list_entries('datafields')
+        except Exception as e:
+            return {'error': f'could not list catalogues: {e}'}
+
+        for entry in entries:
+            kp = entry.get('key_params') or {}
+            if kp.get('dataset_id') or (kp.get('data_type') or ''):
+                continue  # subsets, not whole-configuration catalogues
+            payload = await self.store.get('datafields', entry.get('key'))
+            region, universe, delay = kp.get('region'), kp.get('universe'), kp.get('delay')
+            for f in ((payload or {}).get('results') or []):
+                fid = f.get('id')
+                if not fid:
+                    continue
+                if fid not in fields:
+                    ds = f.get('dataset')
+                    cat = f.get('category')
+                    fields[fid] = (
+                        fid, (f.get('description') or '').strip(), f.get('type'),
+                        ds.get('id') if isinstance(ds, dict) else ds,
+                        cat.get('id') if isinstance(cat, dict) else cat,
+                        f.get('dateCreated'),
+                    )
+                if region:
+                    configs.append((fid, region, universe, delay, f.get('coverage'),
+                                    f.get('userCount'), f.get('alphaCount')))
+
+        if not fields:
+            return {'error': 'No stored datafield catalogues to index.',
+                    'hint': 'Run build_datafield_catalogue(action="start") first.'}
+        result = await self.alpha_store.index_datafields(list(fields.values()), configs)
+        self.log(f"[field-index] Indexed {result['fields']} fields, "
+                 f"{result['config_rows']} config rows", "INFO")
+        return result
 
     async def _known_field_names(self) -> List[str]:
         """Every datafield id in the local catalogues, across all configurations.
@@ -6788,7 +6985,8 @@ def _slim_datafields(obj, limit: int = 50, offset: int = 0, sort: str = "userCou
     for k in ("sharpe_filter_applied", "sharpe_filter_removed", "capped", "warning",
               "coverage", "declared_total", "declared_count", "complete",
               "incomplete_datasets", "dataset_id", "filtered_since",
-              "fetched_rows", "fields_in_two_datasets", "metrics_from_universe", "note"):
+              "fetched_rows", "fields_in_two_datasets", "metrics_from_universe", "note",
+              "search_mode"):
         if k in payload:
             out[k] = payload[k]
     return _rewrap(out, w)
@@ -7320,7 +7518,14 @@ async def get_datafields(
         universe: Universe of stocks (e.g., USA和GLB默认"TOP3000"、IND默认"TOP500"、ASI默认"MINVOL1M"、CHN默认"TOP2000U")
         dataset_id: Specific dataset ID to filter by
         data_type: Type of data (e.g., "MATRIX",'VECTOR','GROUP')
-        search: Fuzzy multi-keyword search (space separated = AND)
+        search: Full-text search over field descriptions (FTS5 + porter stemming,
+            BM25-ranked). Space-separated words are AND-ed; FTS5 syntax works too
+            ("dividend AND (cut OR lower OR reduce)", "\"short squeeze\"").
+            It matches the WORDS in a description, not the meaning: "investor
+            attention" returns nothing because no description uses that phrase,
+            though search-volume and news-buzz fields exist. Widen with OR terms
+            when a concept can be worded several ways. Falls back to substring
+            matching if the index has not been built.
         filter_sharpe: Filter out fields with OS/IS Sharpe < 0 (default: True)
         since: Keep only fields with dateCreated >= this date ("2026-03-01").
                New fields land in monthly batches, so this is how you find data
@@ -9367,6 +9572,13 @@ async def sync_platform_cache(
         data = await brain_client.get_operators(force_refresh=True)
         return {'scope': 'operators', 'refreshed': True, 'operators': len(data or [])}
 
+    if scope == "field_index":
+        # Local reindex of the datafield descriptions. No platform requests.
+        result = await brain_client.build_datafield_search_index()
+        return {'scope': 'field_index', **result,
+                'note': ('Full-text index over datafield descriptions (porter stemming). '
+                         'Rebuild after build_datafield_catalogue adds configurations.')}
+
     if scope == "alphas":
         ids = [a for a in (alpha_ids or []) if a]
         if not ids:
@@ -9489,7 +9701,7 @@ async def sync_platform_cache(
 
     return {'error': f'Unknown scope {scope!r}',
             'valid': ['status', 'list', 'migrate', 'operators', 'datasets', 'datafields',
-                      'datafields_full', 'alphas']}
+                      'datafields_full', 'field_index', 'alphas']}
 
 
 @mcp.tool()

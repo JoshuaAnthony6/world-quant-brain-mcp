@@ -347,6 +347,25 @@ USA/TOP3000 的数据集声明 **91,076** 个字段，全局扫描只能拿到 *
 
 注：`MEA/TOP300`、`MEA/TOP400` 在平台上已返回 0 个数据集（本地仍留有它们的 OS PnL 池），构建会跳过并标记 `status: empty`。
 
+### 字段搜索：FTS5，以及为什么暂不上向量库
+
+字段描述有 128,442 条唯一文本，中位长度 75 字符的技术短语。此前的搜索是 Python 子串 AND 匹配，实测有真实的召回和精确率问题：
+
+```
+search="dividend cut"  ->  4 条
+   anl69_td_xe_dvd  "...which is the cutoff date"   <- 匹配到 cut-off, 误报
+漏掉 69 条语义相关的, 例如:
+   est_12m_dps_lowerednum_4wks  "Number of lowered analyst estimates of dividend per share"
+```
+
+改用 **FTS5 + porter 词干 + BM25 排序**（`cache/alphas.db`，与 alpha 语料同库，便于联表）。建索引 144,516 字段 / 950,240 配置行约 6 秒，**零平台请求**，用 `sync_platform_cache(scope="field_index")` 重建。
+
+效果：`analyst revision` 从返回 "forecast type" 元数据标志变成返回真正的修正指标（898 条），`short squeeze` 83 条全部相关，"cutoff" 误报消失。支持 FTS5 语法：`dividend AND (cut OR lower OR reduce)`。
+
+**向量库的取舍**：FTS5 匹配的是描述里的**词**，不是**意思**。`investor attention` 返回 0——没有描述用这个说法，尽管 search-volume 和 news-buzz 类字段是存在的。实测表明靠调用方扩展查询并不能干净地补上：`search volume` / `news attention` / `abnormal turnover` 都是 0 条，而 `attention OR interest OR buzz` 虽有 2098 条但精确率很差（"interest" 会命中 short interest、interest rate）。
+
+所以这是个**真实的能力缺口**，向量检索确实能填。暂不引入的理由是成本而非无用：Ollama 当前没有映射端口、与 mcp 不在同一 docker 网络（Milvus 已开放 19530），另需 14 万次嵌入和约 440MB 向量。等这类"不知道该用什么词"的查询成为瓶颈时再上，届时只是在现有三层之上加一层，不影响已有结构。
+
 ### 数据目录的检索方式
 
 平台给每个 datafield 打了 `dateCreated`、每个 dataset 打了 `dateUpdated`，新数据按月批量上线。这两个字段服务端支持 `order=` 和 `>` 过滤，本地缓存也 100% 保留了它们，所以"有没有新数据"完全可以离线回答。
