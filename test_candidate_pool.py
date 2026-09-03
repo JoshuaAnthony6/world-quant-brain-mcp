@@ -156,9 +156,30 @@ async def main():
             d = await FakeClient.get_alpha_details(self, aid)
             if aid == "A": d["status"] = "ACTIVE"
             return d
-    s = await cp.sync_pool(SubmittedClient())
+
+    # Default path: one submitted-alpha listing, no per-entry record fetches.
+    class ListingClient(SubmittedClient):
+        def __init__(self):
+            super().__init__(); self.detail_calls = 0; self.list_calls = 0
+        async def get_alpha_details(self, aid):
+            self.detail_calls += 1
+            return await SubmittedClient.get_alpha_details(self, aid)
+        async def get_submitted_ids_since(self, since=None):
+            self.list_calls += 1
+            return {"ids": ["A"], "rows": {}, "since": since, "pages": 1}
+
+    lc = ListingClient()
+    s = await cp.sync_pool(lc)
     check("sync drops the now-submitted A", s["promoted_to_submitted"] == ["A"], s)
     check("pool shrank to 3", s["pool_size"] == 3, s)
+    check("cheap path used the submitted listing", s.get("mode") == "submitted-list", s)
+    check("cheap path made 1 listing call", lc.list_calls == 1, lc.list_calls)
+    check("cheap path fetched no per-entry records", lc.detail_calls == 0, lc.detail_calls)
+
+    # Opt-in full refresh still reads every entry, and a client without the
+    # listing method degrades to that path instead of failing.
+    s2 = await cp.sync_pool(SubmittedClient(), refresh_details=True)
+    check("refresh_details path still reports a mode", s2.get("mode") == "full-refresh", s2)
 
     print("\n" + ("ALL PASS" if not FAIL else f"{len(FAIL)} FAILED: {FAIL}"))
     return 1 if FAIL else 0

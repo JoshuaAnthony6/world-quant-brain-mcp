@@ -191,6 +191,19 @@ def _parse_glossary_terms(content: str) -> List[Dict[str, str]]:
             "ago" not in term["definition"] and
             "minute read" not in term["definition"]]
 
+def _brain_store():
+    """The main client's permanent on-disk store, or None if unavailable.
+
+    Imported lazily: forum_functions is imported *by* main, so a module-level
+    import would be circular.
+    """
+    try:
+        from main import brain_client
+        return brain_client.store
+    except Exception:
+        return None
+
+
 class ForumClient:
     """Forum client for WorldQuant BRAIN support site, using Playwright."""
     
@@ -222,6 +235,18 @@ class ForumClient:
         except Exception:
             self.max_concurrency = 1
         self._forum_operation_semaphore = asyncio.Semaphore(self.max_concurrency)
+        # Cached Zendesk SSO handshake (see _ensure_support_session)
+        try:
+            self._support_sso_ttl = max(0, int(float(os.getenv("FORUM_SSO_TTL_SECONDS", "1800"))))
+        except Exception:
+            self._support_sso_ttl = 1800
+        self._support_sso_jwt: Optional[str] = None
+        self._support_sso_locale: Optional[str] = None
+        self._support_sso_valid_until = 0.0
+        try:
+            self._post_ttl = max(0, int(float(os.getenv("FORUM_POST_TTL_SECONDS", "86400"))))
+        except Exception:
+            self._post_ttl = 86400
         # The session is mainly used for the initial authentication via brain_client
         self.session = requests.Session()
         self.session.headers.update({
@@ -235,7 +260,14 @@ class ForumClient:
         return f"{self.base_url}/api/v2/community/posts/{post_id}/comments.json?page={page}&include=users"
 
     async def _ensure_support_session(self, email: str, password: str, locale: str = "zh-cn", timeout_seconds: int = 30):
-        """Establish a Zendesk support session using the authenticated BRAIN session."""
+        """Establish a Zendesk support session using the authenticated BRAIN session.
+
+        The SSO handshake is a multi-hop redirect chain that costs far more than
+        the forum reads that follow it, and the cookie it plants stays valid for
+        the life of the BRAIN session — so it is redone only after
+        ``FORUM_SSO_TTL_SECONDS`` (default 30 min) or when the BRAIN session's
+        JWT changes (i.e. after a re-authentication).
+        """
         try:
             from main import brain_client
         except ImportError:
@@ -257,6 +289,21 @@ class ForumClient:
             )
             if auth_result.get('status') != 'authenticated':
                 raise Exception("BRAIN platform authentication failed.")
+
+        # Skip the handshake while the cached one is still backed by the same JWT.
+        jwt = None
+        try:
+            jwt = brain_client.session.cookies.get('t')
+        except Exception:
+            jwt = None
+        now = time.time()
+        if (
+            jwt
+            and self._support_sso_jwt == jwt
+            and self._support_sso_locale == locale
+            and now < self._support_sso_valid_until
+        ):
+            return brain_client.session
 
         access_url = (
             "https://worldquantbrain.zendesk.com/access"
@@ -280,6 +327,10 @@ class ForumClient:
             f"Support SSO handshake completed with status={response.status_code}, final_url={response.url}",
             "INFO"
         )
+        if response.status_code < 400:
+            self._support_sso_jwt = jwt
+            self._support_sso_locale = locale
+            self._support_sso_valid_until = time.time() + self._support_sso_ttl
         return brain_client.session
 
     async def _get_support_json(self, session: requests.Session, url: str, timeout_seconds: int = 30) -> Dict[str, Any]:
@@ -395,8 +446,20 @@ class ForumClient:
         
         return browser, context
 
-    async def get_glossary_terms(self, email: str, password: str) -> List[Dict[str, str]]:
-        """Extract glossary terms from the forum using Playwright."""
+    async def get_glossary_terms(self, email: str, password: str,
+                                 force_refresh: bool = False) -> List[Dict[str, str]]:
+        """Extract glossary terms from the forum using Playwright.
+
+        This spins up a whole headless browser to scrape one article of platform
+        terminology that changes maybe once a year, so the parsed result is kept
+        permanently on disk and the browser is only launched on a miss.
+        """
+        store = _brain_store()
+        if store is not None and not force_refresh:
+            cached = await store.get('forum_glossary', 'terms')
+            if cached:
+                return cached
+
         if async_playwright is None:
             raise ImportError("Playwright not available. Please install it with: pip install playwright")
 
@@ -415,8 +478,10 @@ class ForumClient:
                     content = await page.content()
                     
                     terms = _parse_glossary_terms(content)
-                    
+
                     log(f"Extracted {len(terms)} glossary terms", "SUCCESS")
+                    if terms and store is not None:
+                        await store.put('forum_glossary', 'terms', terms)
                     return terms
 
                 except Exception as e:
@@ -592,13 +657,33 @@ class ForumClient:
                 "error": f"Forum search timed out after {overall_timeout}s"
             }
 
-    async def read_full_forum_post(self, email: str, password: str, post_url_or_id: str, include_comments: bool = True) -> Dict[str, Any]:
-        """Read a complete forum post and its comments via Zendesk JSON API."""
+    async def read_full_forum_post(self, email: str, password: str, post_url_or_id: str,
+                                   include_comments: bool = True,
+                                   force_refresh: bool = False) -> Dict[str, Any]:
+        """Read a complete forum post and its comments via Zendesk JSON API.
+
+        A post's body is written once; its comment thread grows slowly. Reading a
+        long thread costs one request per comment page on top of the SSO
+        handshake, so the assembled result is stored on disk and re-read only
+        after FORUM_POST_TTL_SECONDS (default 24h) or on force_refresh.
+        """
+        store = _brain_store()
+        post_id = _extract_post_id(post_url_or_id)
+        cache_key = f"{post_id}:{'with' if include_comments else 'no'}-comments"
+        if store is not None and not force_refresh:
+            envelope = await store.get_envelope('forum_post', cache_key)
+            if envelope and envelope.get('payload'):
+                age = time.time() - (envelope.get('fetched_at') or 0)
+                if age <= self._post_ttl:
+                    payload = dict(envelope['payload'])
+                    payload['from_cache'] = True
+                    payload['cached_age_hours'] = round(age / 3600, 1)
+                    return payload
+
         try:
             async with self._forum_operation_semaphore:
                 log("Starting forum post reading process via Zendesk API", "INFO")
 
-                post_id = _extract_post_id(post_url_or_id)
                 locale = _extract_locale(post_url_or_id)
                 session = await self._ensure_support_session(email, password, locale=locale)
 
@@ -653,12 +738,15 @@ class ForumClient:
                         page_num += 1
 
                 log(f"Extracted {len(comments)} comments in total.", "SUCCESS")
-                return {
+                result = {
                     'success': True,
                     'post': post_data,
                     'comments': comments,
                     'total_comments': len(comments)
                 }
+                if store is not None:
+                    await store.put('forum_post', cache_key, result)
+                return result
 
         except Exception as e:
             log(f"Failed to read forum post: {str(e)}", "ERROR")

@@ -39,6 +39,7 @@ touches the rate-limited endpoint, and it is cached in the entry.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
@@ -849,8 +850,18 @@ async def submission_plan(
     }
 
 
-async def sync_pool(client: Any, *, refresh_prod: bool = False) -> Dict[str, Any]:
-    """Refresh entries: drop alphas that are now submitted, re-read metrics.
+async def sync_pool(
+    client: Any,
+    *,
+    refresh_prod: bool = False,
+    refresh_details: bool = False,
+) -> Dict[str, Any]:
+    """Refresh entries: drop alphas that are now submitted.
+
+    ``refresh_details`` re-reads every entry's record (one request per entry).
+    It is off by default because a pooled alpha's record is frozen apart from
+    being submitted, which is detected far more cheaply from the submitted-alpha
+    list. Turn it on to also pick up manual edits or platform-side deletions.
 
     ``refresh_prod`` re-queries production correlation for each entry. That endpoint
     is single-concurrency and slow, so it is opt-in.
@@ -858,11 +869,73 @@ async def sync_pool(client: Any, *, refresh_prod: bool = False) -> Dict[str, Any
     pool = load_pool()
     entries: Dict[str, Any] = pool.get("entries", {})
     promoted, refreshed, errors = [], [], []
+    aids = list(entries.keys())
 
-    for aid in list(entries.keys()):
+    # A pooled alpha is in-sample, and an in-sample alpha's record is produced by
+    # its simulation: re-simulating yields a NEW id, so code, settings, pyramid
+    # and every IS metric are frozen for the life of the entry (verified against
+    # live records: 0 of the sampled entries had drifted). The single thing that
+    # can change is that it got submitted.
+    #
+    # So the sweep asks the cheap question directly — "what was submitted since
+    # this pool's oldest entry was added?" — which is 1-2 list pages no matter
+    # how large the pool is, instead of one record fetch per entry.
+    cheap_path = aids and not refresh_details and hasattr(client, "get_submitted_ids_since")
+    if cheap_path:
+        added = [e.get("added_at") for e in entries.values() if e.get("added_at")]
         try:
-            details = await client.get_alpha_details(aid)
+            submitted = await client.get_submitted_ids_since(min(added) if added else None)
+            submitted_ids = set(submitted.get("ids") or [])
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "action": "sync",
+                "error": f"could not list submitted alphas: {exc}",
+                "hint": "retry, or call with refresh_details=True to read every entry individually",
+                "promoted_to_submitted": [],
+                "refreshed": [],
+                "errors": [{"error": str(exc)}],
+                "pool_size": len(entries),
+            }
+        for aid in aids:
+            if aid in submitted_ids:
+                entries.pop(aid, None)
+                promoted.append(aid)
+            else:
+                refreshed.append(aid)
+        if refresh_prod:
+            for aid in list(refreshed):
+                prod = await fetch_production_correlation(client, aid)
+                if prod["value"] is not None:
+                    entries[aid]["prod_corr"] = prod["value"]
+                    entries[aid]["prod_corr_checked_at"] = _now()
+        save_pool(pool)
+        return {
+            "action": "sync",
+            "mode": "submitted-list",
+            "promoted_to_submitted": promoted,
+            "refreshed": refreshed,
+            "errors": errors,
+            "pool_size": len(entries),
+            "refresh_prod": refresh_prod,
+            "requests_used": submitted.get("pages"),
+            "note": ("Detected promotions from the submitted-alpha list "
+                     f"({len(submitted_ids)} submitted since {submitted.get('since')}). "
+                     "Pass refresh_details=True to re-read every entry's record instead."),
+        }
+
+    # Full re-read: every entry's record in one concurrent batch. Independent GETs
+    # on a rate-limited endpoint, so the client paces them; doing them one at a
+    # time made a sweep cost (pool size x round trip) of pure latency.
+    async def _details(aid: str):
+        try:
+            return aid, await client.get_alpha_details(aid, force_refresh=True), None
         except Exception as exc:  # noqa: BLE001 - report, don't abort the sweep
+            return aid, None, exc
+
+    fetched = await asyncio.gather(*[_details(aid) for aid in aids])
+
+    for aid, details, exc in fetched:
+        if exc is not None:
             errors.append({"alpha_id": aid, "error": str(exc)})
             continue
         summary = summarize_alpha(details or {})
@@ -882,6 +955,7 @@ async def sync_pool(client: Any, *, refresh_prod: bool = False) -> Dict[str, Any
     save_pool(pool)
     return {
         "action": "sync",
+        "mode": "full-refresh",
         "promoted_to_submitted": promoted,
         "refreshed": refreshed,
         "errors": errors,

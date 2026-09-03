@@ -181,6 +181,219 @@ python main.py
 | `FORUM_RATE_LIMIT_SECONDS` | | 论坛调用间隔，默认 `0` |
 | `REDIS_HOST` / `REDIS_PORT` | | Redis 地址，Docker 模式自动为 `redis:6379` |
 
+### 流量与并发调优
+
+服务会读取 BRAIN 返回的 `X-RateLimit-*` 响应头，按端点族（`data-fields` 1 次/秒 + 30 次/分、`users/self/alphas` 30 次/分、`alphas/{id}` 2000 次/小时等）自动限速，无需手工配置节流间隔。用 `get_api_traffic_status` 工具可查看当前各端点族的配额、近一分钟请求数和缓存命中情况。
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `BRAIN_MAX_CONCURRENCY` | `8` | 同时在途的 HTTP 请求数上限（连接池按此值 ×2 配置） |
+| `BRAIN_RATE_LIMIT_SAFETY` | `0.9` | 相对平台配额保留的安全余量，多端同时登录时可调低 |
+| `BRAIN_RATE_LIMIT_REDIS_RETRY_SECONDS` | `30` | 限流器降级后重试 Redis 的间隔 |
+| `BRAIN_CACHE_DIR` | `./cache` | 永久存储目录（见下） |
+| `BRAIN_ALPHA_DETAILS_IS_TTL` | `120` | IS alpha 详情的 Redis TTL，仅合并同一次工作流内的重复读取 |
+| `BRAIN_ALPHA_DETAILS_MAX_AGE` | `604800` | OS alpha 详情的磁盘记录新鲜度窗口，设 `0` 则永不过期 |
+| `BRAIN_OS_LIST_TTL_SECONDS` | `300` | OS alpha 列表免校验窗口；窗口内 0 请求，过期后用 1 行探针校验。设 `0` 则每次都校验（仍只需 1 个请求） |
+| `BRAIN_OS_LIST_RETAIN_SECONDS` | `86400` | 列表条目保留时长，供探针比对 |
+| `BRAIN_AUTH_CHECK_TTL_SECONDS` | `300` | 复用登录态的时长，到期才重新校验一次 |
+| `FORUM_SSO_TTL_SECONDS` | `1800` | Zendesk SSO 握手复用时长 |
+| `FORUM_POST_TTL_SECONDS` | `86400` | 论坛帖子（含评论）缓存时长 |
+
+### 自己的 alpha 语料库
+
+`sync_alpha_corpus` 把账号的全部 alpha 镜像到 `cache/alphas.db`。三个平台事实决定了它的实现方式：
+
+| 事实 | 后果 |
+| --- | --- |
+| `offset >= 1000` 被拒（`"Cannot display more than the first 1,000 alphas"`） | 不能用 offset 翻页，必须按 `dateCreated` 游标前进 |
+| `count` 在 10000 饱和 | 无法从 count 判断真实体量，只能实测（约 2,769/天） |
+| `dateCreated` 秒级、同秒最多 8 个 | 游标每次回退 1 秒重叠，靠主键去重，否则会漏掉边界那一秒的行 |
+| 平台返回本地偏移（`-04:00`），游标是 UTC | **必须统一为 UTC**，否则文本比较认为 `08-14T22:49-04:00 < 08-15T00:00Z`，同步会误判"游标倒退"而退化成每批 +1 秒（一天要 86400 批） |
+
+入库时间戳一律归一为 UTC，所以 SQLite 的文本序等于时间序。
+
+回测完成后 alpha **立即入库**（`create_simulation` 和多模拟的两条路径都接了），所以「我刚试过这个吗」不必等下次同步。这不增加任何平台请求——回测本来就已经拿到完整记录了。
+
+注意 `alphas_fts` 是 FTS5 的**外部内容表**，不会跟随主表写入自动更新：增量写入必须显式维护三处索引（行、FTS 词条、token 关联），否则新 alpha 会「存进去了但搜不到」。批量同步走 `index=False` + 末尾一次性重建（几十万行时更快），实时写入才开 `index=True`。
+
+`analyze_my_research` 在此之上做分析，**零平台请求**：
+
+```
+scope="summary"       各配置的尝试数/命中数/出片率
+scope="productivity"  按数据字段的出片率 (hits/attempts)
+scope="operators"     按算子的出片率
+scope="gaps"          试得最少的配置组合
+scope="similar"       FTS5 搜表达式：这个想法我试过没有
+scope="best"          最佳 alpha
+```
+
+`productivity` 之所以能算出「出片率」而不只是列出好 alpha，是因为语料保留了失败样本——分母。只同步赢家的话这个 scope 就没有意义。
+
+**看出片率时要连样本量一起看**：本账号实测 `generate_stats` 是 57 试 57 中（1.000），但这不是该算子有效——它只出现在本就精心构造的 Python alpha 里，是继承了那一类 alpha 的成功率而非导致它。`ts_scale` 那种 706 试 51.8% 的大样本才可信。
+
+实测（15,290 条样本）：token 索引构建 0.3s，索引查询 0.6ms，FTS5 全文搜索 1.0ms。
+
+### 存储分层
+
+三类数据、三种存储，不是三选一：
+
+| 数据 | 存储 | 理由（实测） |
+| --- | --- | --- |
+| 目录类大块（datafields/datasets/PnL，单条最大 5.3MB） | **磁盘文件**（zlib 压缩） | 压缩到 4.3%，读取 34ms——比 Redis GET 的 39ms 还快，`json.loads` 才是瓶颈 |
+| 自己的 alpha 语料（约 678,000 条） | **SQLite**（`cache/alphas.db`） | 一键一文件会产生 678k 个 inode 且每次查询都是全解压扫描；实测 551 字节/条 → 约 374MB，带索引 + FTS5，零新依赖 |
+| 会变的小数据（alpha 列表、pyramid 统计、分布式锁、限流窗口） | **Redis** | 有 TTL、需跨进程共享 |
+
+向量库（机器上已有 Milvus + Ollama 的 `nomic-embed-text`）目前**不使用**。它唯一不可替代的场景是数据字段描述的语义检索（"找关于分析师预期修正的字段"，关键词会漏同义词）。等 FTS5 被证明不够时再加一层即可，不影响前三层。
+
+### 跨进程共享的限流器
+
+限流窗口存在 Redis 里（每个 端点族×时间窗 一个 ZSET，一段 Lua 原子完成剪枝→计数→准入），所以服务进程、后台构建、独立脚本共用同一份配额。改造前实测：独立进程与服务并发时触发 `429 on data-sets`；改造后两个独立进程各发 10 个请求，**零 429**。
+
+学到的配额发布在 `rl:limits:<bucket>`，新进程直接继承，无需自己踩一遍。429 冷却也是共享的（`rl:cool:<bucket>`）——429 是账号级的，不是进程级的。
+
+**降级**：Redis 不可用时自动回落到进程内滑动窗口，服务保持可用；每 `BRAIN_RATE_LIMIT_REDIS_RETRY_SECONDS`（默认 30s）重试一次，恢复后自动切回。`get_api_traffic_status` 的 `rate_limits._backend` 显示当前后端，`sent_last_minute_all_processes` 是所有进程合计的用量。
+
+### 两层缓存：磁盘永久存储 + Redis 热层
+
+不可变的平台数据存在 `cache/` 下的 zlib 压缩文件里，**永不过期**，用 `sync_platform_cache` 工具手动刷新。Redis 只保留真正会变的数据（alpha 列表、pyramid 统计）和分布式锁。
+
+| 数据 | 存放位置 | 是否过期 | 依据 |
+| --- | --- | --- | --- |
+| `data-fields` / `data-sets` 目录 | 磁盘 | 否 | 实测 5.3MB JSON 压缩到 226KB（4.3%），磁盘读比 Redis GET 还快 |
+| 算子表 `operators` | 磁盘 | 否 | 只在平台发版时变化 |
+| alpha PnL | 磁盘 | 否 | 实测 2025-03 提交的 alpha 至今 PnL 仍停在 `2023-12-29`，recordset 只含样本内模拟且长度不变 |
+| OS alpha 详情 | 磁盘 | 7 天窗口 | 表达式/settings/IS 指标已冻结，但 `os.osISSharpeRatio` 等会随样本外表现累积而变化 |
+| IS alpha 详情 | Redis | 120 秒 | alpha 未提交前仍可编辑 |
+| alpha yearly-stats / recordsets | 磁盘 | 否 | 与 PnL 同源：2025-03 提交的 alpha 至今 yearly-stats 仍止于 2023 |
+| 教程 / 竞赛协议 | 磁盘 | 否 | 静态文档 |
+| `user_alphas` 列表 | Redis | 1 天 | 会随新建 alpha 变化 |
+| OS alpha id 列表 | Redis | 5 分钟 | 只在提交 alpha 时变化，提交成功即主动失效 |
+| pyramid multipliers / events / 用户资料 | Redis | 1 小时 | 平台按自己的节奏更新 |
+| 竞赛详情 | Redis | 1 天 | 公布后不再变动 |
+
+另外：账号自身的 user id 在进程内记忆一次（此前 `get_leaderboard` / `get_user_competitions` 每次都要多花一个 `/users/self` 往返）；`/alphas/{id}/recordsets/*` 在平台计算期间会返回 `200 + 空 body + Retry-After: 1.0`，现已遵守该头（此前硬编码 sleep 2s 并 ×1.5 递增）。
+
+### 自相关检查的性能
+
+目标 alpha 的 PnL/详情走磁盘、OS 池 PnL 走 pickle 宽表、相关性用 pandas 本地算，唯一的网络调用是拉取 OS alpha 列表。
+
+该端点实测约 **50ms/行**，且不支持字段裁剪（`fields`/`only`/`include`/`omit` 均被静默忽略），所以列表本身很贵。因为一天最多提交 5 个 alpha，列表几乎不变，于是改用 **1 行探针**校验：按 `-dateSubmitted` 取 1 行，比对 `count` 和最新 id——提交会同时改变两者，删除会改变 `count`。
+
+USA/TOP3000（249 个 OS alpha）实测：
+
+| 状态 | 端到端 | 请求 | 流量 |
+| --- | --- | --- | --- |
+| 冷启动（全量分页） | 23.73 s | 6 | 999 KB |
+| 免校验窗口内 | **0.03 s** | **0** | 0 |
+| 窗口过期（1 行探针） | **0.53 s** | 1 | **4.5 KB** |
+
+三者 `max_self_corr` 完全一致。探针检测到变化时会自动退回全量分页。
+
+通过本服务提交 alpha 会立即让列表失效；**在浏览器里提交**的 alpha 最多 5 分钟后才进入对比池。若两边混用，把 `BRAIN_OS_LIST_TTL_SECONDS` 设为 `0`——每次都用探针校验，仍只需 1 个 4.5KB 的请求。
+
+### 模拟账本（回测去重）
+
+所有回测都经过本服务，所以每次完成的模拟都会记录到 `cache/simulations/ledger.jsonl`——表达式、settings、alpha_id、IS 指标。带来两件事：
+
+**同一个请求不会付第二次钱。** `create_simulation` 按 (type + settings + 表达式) 的指纹查账本，命中就直接返回当时的 alpha（响应带 `from_local_ledger: true` 和 `previously_simulated_at`），实测 **1ms** 对比一次真实回测的数分钟。改动任一参数（如 decay 4→99）会正确 miss 并走真实模拟。
+
+数据是按月批量上线的，新字段可能改变结果，所以**月度数据发布后**值得用 `reuse_existing=false` 强制重跑（先用 `whats_new_in_data` 确认有没有新数据）。
+
+**自己的研究历史可本地检索。** `search_my_simulations(region=, universe=, contains=, min_sharpe=, sort=)` 直接查账本，零平台请求——不必再去分页 `/users/self/alphas`（每行约 50ms/4KB，且限流 30 次/分）。
+
+### 论坛
+
+| | 首次 | 二次 |
+| --- | --- | --- |
+| `read_full_forum_post`（含 17 条评论） | 5476 ms | **0 ms** |
+| `get_glossary_terms` | 启动完整 Playwright 浏览器 | 磁盘读取 |
+
+术语表是一篇几乎不变的文章，此前每次调用都要拉起一个无头浏览器，现已永久存盘。帖子正文写定后不变、评论增长缓慢，按 `FORUM_POST_TTL_SECONDS`（默认 24h）缓存，`force_refresh=true` 可强制回源。
+
+### 数据目录的完整性（重要）
+
+`/data-fields` 的**无过滤窗口硬性截断在 10000 行**，而且 `count` 也在 10000 饱和，所以从返回值上看不出被截断：
+
+```
+offset=9950      -> http=200 count=10000
+offset=10000     -> http=400 ["Invalid offset. Please use filters to narrow down the result."]
+```
+
+USA/TOP3000 的数据集声明 **91,076** 个字段，全局扫描只能拿到 **10,000**（11%），**267 个数据集一个字段都抓不到**（如 `pv87` 声明 6666 个）。
+
+出路是按 `dataset.id` 查询——该过滤会解除上限（`dataset.id=pv87` 返回完整的 6666）。因此：
+
+- `get_datafields(dataset_id=...)` 对该数据集**始终完整**，并永久存盘
+- 不带 `dataset_id` 的结果若触及上限，会带上 `capped: true` 和明确的 `warning`
+- `build_datafield_catalogue(action="start")` 逐数据集重建完整目录
+
+构建作为**服务进程内的后台任务**运行，与前台请求共享同一个限流器——另起进程会让两个限流器各自以为拥有全部 30 次/分配额，必然互撞 429（实测确认：独立进程跑估算脚本时触发了 `429 on data-sets`，而服务进程内的构建全程零 429）。构建期间 `check_self_correlation` 实测仍是 0.55 秒。
+
+完整性已实测验证：DEU/TOP500 重建后 **178/178 数据集、22,494/22,494 声明字段全部到手**，零字段数据集归零。注意合并后唯一字段是 22,492——因为**一个字段可以同时属于两个数据集**（该配置下 `price_momentum_12m_minus_1m` 同属 `analyst94` 和 `model109`，`baltic_dry_index` 同属 `model193` 和 `model219`）。所以完整性按**抓取行数**判定，不是按去重后的数量，否则每个建完的目录都会被误报为缺失。
+
+完全可续跑：已存盘的数据集自动跳过（实测停止后重启，20 秒跳过已完成的 14 个数据集）。`action="status"` 看进度和 ETA，`action="stop"` 随时中断。
+`sync_platform_cache(scope="status")` 会列出每个配置的 `declared / stored / coverage`，哪些配置还有盲区一眼可见。
+
+#### 构建成本与去重
+
+本账号 23 个在用配置合计 **4,635 数据集 / 950,244 声明字段 / 19,005 页**。受 30 页/分限流，全量约 **11.7 小时**。
+
+但字段 id 只取决于 **(region, delay)**，与 universe 无关——实测 `option4` 在 USA/TOP3000 和 USA/TOP500 返回的 1298 个 id 完全相同，四个 USA universe 都是 345 数据集 / 91,076 字段，差异仅在 `userCount` / `alphaCount` / `coverage`。
+
+| mode | 耗时 | 说明 |
+| --- | --- | --- |
+| `dedup`（默认） | 约 **4.9 小时** | 数据集列表相同的配置直接复用已建目录，payload 里用 `metrics_from_universe` 标明使用指标来自哪个 universe |
+| `all` | 约 11.7 小时 | 每个配置单独下载，各自带真实的使用指标。关心 universe 级拥挤度时用 |
+
+注：`MEA/TOP300`、`MEA/TOP400` 在平台上已返回 0 个数据集（本地仍留有它们的 OS PnL 池），构建会跳过并标记 `status: empty`。
+
+### 数据目录的检索方式
+
+平台给每个 datafield 打了 `dateCreated`、每个 dataset 打了 `dateUpdated`，新数据按月批量上线。这两个字段服务端支持 `order=` 和 `>` 过滤，本地缓存也 100% 保留了它们，所以"有没有新数据"完全可以离线回答。
+
+`get_datafields` / `get_datasets` 现在返回**一页结果 + 覆盖全量匹配的分面计数**（dataset / category / type / 日期），而不是整个目录：
+
+| 调用 | 匹配 | 返回 | 输出 |
+| --- | --- | --- | --- |
+| datafields 全量（旧行为） | 9539 | 9539 | ~637k tokens |
+| datafields 默认 `limit=50` | 9539 | 50 | **~3.1k tokens** |
+| datafields `since=2026-04-01` | 1206 | 50 | ~3.2k tokens |
+| datasets 默认 | 345 | 40 | ~4.9k tokens |
+
+新增参数：`since`（按 `dateCreated`/`dateUpdated` 过滤）、`sort`（含 `-dateCreated` / `-dateUpdated` 取最新）、`limit`、`offset`（响应带 `next_offset`）。
+
+**排序偏向**：默认 `sort="userCount"` 是热度倒序，`userCount=0` 的字段永远排在最后。但对 alpha 研究来说，未被拥挤使用的字段往往更有价值——USA/TOP3000 的 10000 个字段里有 **2375 个 userCount=0**。`facets.userCount` 现在会按 `0 (uncrowded) / 1-10 / 11-100 / >100` 分桶，让这个尾部规模可见；用 `sort="dateCreated"`、`sort="coverage"` 或按 `dataset_id` 逐个浏览可以避开该偏向。
+
+`whats_new_in_data(region, universe, delay, since=None)` 直接回答"上次看之后有什么新数据"——发布时间线、新增最多的数据集、最热门的新字段，约 1.4k tokens，**零平台请求**。要拿到比缓存更新的目录，先跑 `sync_platform_cache(scope="datafields", region=..., universe=..., delay=..., confirm=True)`。
+
+### 候选池
+
+`pool_sync` 的成本与池大小无关。池里的 alpha 是样本内的，而样本内 alpha 的记录由它那次模拟产生——重新模拟会得到**新的 id**，所以 code、settings、pyramid 和全部 IS 指标在条目的生命周期内都是冻结的（对线上记录抽样验证：0 个条目发生漂移）。唯一会变的是"它被提交了"。
+
+因此默认不再逐个读取条目，而是直接问"自本池最旧条目加入以来提交了哪些 alpha"——无论池多大都只要 1-2 页。117 个条目实测：
+
+| | 请求 | 耗时 |
+| --- | --- | --- |
+| 逐条读取（旧行为） | 117 | — |
+| 提交列表（新默认） | **2** | 7.2 s |
+
+需要捕捉手工改动或平台侧删除时，用 `refresh_details=true` 退回逐条读取。
+
+`plan_submission` / `evaluate_candidate` 走的 `get_mutual_correlation` 在 PnL 全部落盘后是**零请求**——117 个条目的完整相关矩阵约 0.3 s 纯本地计算，无需再缓存 pairwise 结果。
+
+`sync_platform_cache` 的用法：
+
+```
+scope="status"      # 默认，零请求：各命名空间的条目数、体积、最旧年龄
+scope="migrate"     # 零请求：把还留在 Redis 里的不可变数据搬到磁盘并释放内存
+scope="operators"   # 1 次请求
+scope="datasets"    # 指定 region/universe/delay 刷新某一组，或刷新最旧的 max_entries 组
+scope="datafields"  # 同上；单组约 200 次请求（1 次/秒），必须 confirm=True
+scope="alphas"      # 刷新指定 alpha_ids 的详情与 PnL
+```
+
+不带 `confirm=True` 时只做试算，返回预计请求数和耗时。单次工具调用也可用 `force_refresh=True` 强制回源；`check_submission_status` 已默认绕过缓存。
+
 完整字段参考 `.env.example`。
 
 ---

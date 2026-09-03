@@ -215,3 +215,6 @@ host_labs/node_modules/
 # BRAIN 凭据落盘位置 (_resolve_config_path 默认写在仓库内)
 user_config.json
 .brain_mcp_config.json
+
+# Permanent on-disk platform cache (sync_platform_cache)
+cache/

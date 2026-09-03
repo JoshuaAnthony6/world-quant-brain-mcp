@@ -8,22 +8,24 @@ import json
 import time
 import asyncio
 import logging
-from typing import Dict, List, Optional, Any, Union
+from typing import Dict, List, Optional, Any, Union, Sequence
 import re
 import base64
 from bs4 import BeautifulSoup
 from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import os
 import sys
 from pathlib import Path
 from time import sleep
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 import redis
+import sqlite3
 import hashlib
 import math
 import uuid
 import random
+from collections import deque
 
 import requests
 import pandas as pd
@@ -94,6 +96,955 @@ class SimulationData(BaseModel):
 
         return self
 
+
+
+# The unfiltered /data-fields window stops here; offset beyond it returns HTTP 400.
+_DATAFIELDS_WINDOW_CAP = 10000
+
+_CATALOGUE_TRUNCATED_WARNING = (
+    f"TRUNCATED at the {_DATAFIELDS_WINDOW_CAP}-row limit of the unfiltered /data-fields "
+    "window. Fields beyond it are NOT here and cannot be reached by paging — for USA/TOP3000 "
+    "that hides ~89% of the catalogue and 267 datasets entirely. Query one dataset at a time "
+    "(dataset_id=...) for complete coverage, or run build_datafield_catalogue once."
+)
+
+
+def _annotate_catalogue_completeness(payload):
+    """Mark a config-level catalogue as truncated, deriving it at read time.
+
+    Entries stored before this flag existed carry no marker, and a catalogue that
+    silently looks whole is precisely how the gap went unnoticed — so the state is
+    recomputed on every read rather than trusted from storage.
+
+    Completeness is judged on rows FETCHED, not on unique ids: a field can belong
+    to two datasets at once (verified in DEU/TOP500, where
+    price_momentum_12m_minus_1m is in both analyst94 and model109), so a complete
+    catalogue legitimately holds fewer unique ids than the datasets declare.
+    """
+    if not isinstance(payload, dict) or 'results' not in payload:
+        return payload
+    declared = payload.get('declared_total')
+    unique = len(payload.get('results') or [])
+    fetched = payload.get('fetched_rows')
+    if fetched is None:
+        fetched = unique
+    if declared:
+        payload['coverage'] = round(fetched / declared, 4)
+        payload['capped'] = fetched < declared
+        if payload['capped']:
+            payload['warning'] = (f"INCOMPLETE: {fetched} of {declared} declared fields stored. "
+                                  "Run build_datafield_catalogue to finish it.")
+        else:
+            payload.pop('warning', None)
+    elif unique >= _DATAFIELDS_WINDOW_CAP:
+        payload['capped'] = True
+        payload['warning'] = _CATALOGUE_TRUNCATED_WARNING
+    return payload
+
+
+def _dataset_field_matches(item: Dict[str, Any], search_term: str) -> bool:
+    """Multi-keyword AND match over a datafield's searchable text."""
+    keywords = [k.strip().lower() for k in (search_term or '').split() if k.strip()]
+    if not keywords:
+        return True
+    parts = [str(item.get(k) or '') for k in ('name', 'description', 'id')]
+    ds = item.get('dataset')
+    if isinstance(ds, dict):
+        parts += [str(ds.get(k) or '') for k in ('name', 'vendor', 'id')]
+    text = ' '.join(parts).lower()
+    return all(k in text for k in keywords)
+
+
+class PersistentStore:
+    """Permanent, on-disk store for platform data that never changes.
+
+    A submitted (OS) alpha's record, an alpha's PnL series, the datafield and
+    dataset catalogues and the operator list are all immutable for practical
+    purposes, so they belong in durable storage rather than a TTL cache. Redis is
+    deliberately NOT used for them: this deployment runs it with
+    ``maxmemory-policy=noeviction`` and no cap, so parking hundreds of MB of
+    permanent data there trades an API-traffic problem for an out-of-memory one.
+
+    Measured on this data, disk is also simply the better tier: a 5.3 MB
+    datafield catalogue compresses to 4.3% (226 KB), and reading + inflating it
+    from disk costs less than a Redis GET of the raw string because ``json.loads``
+    dominates either way.
+
+    Layout: ``<root>/<namespace>/<sha1[:2]>/<sha1>.z``, each holding one
+    zlib-compressed JSON envelope. Writes are atomic (temp file + os.replace) so a
+    crash or a concurrent writer can never leave a torn entry behind.
+    """
+
+    ENVELOPE_VERSION = 1
+
+    def __init__(self, root: Path, log, level: int = 6):
+        self.root = Path(root)
+        self._log = log
+        self._level = level
+
+    @staticmethod
+    def _digest(key: str) -> str:
+        return hashlib.sha1(key.encode('utf-8')).hexdigest()
+
+    def path_for(self, namespace: str, key: str) -> Path:
+        h = self._digest(key)
+        return self.root / namespace / h[:2] / f"{h}.z"
+
+    # --- blocking primitives (always called via asyncio.to_thread) ---------- #
+
+    def _read_sync(self, path: Path) -> Optional[Dict[str, Any]]:
+        try:
+            blob = path.read_bytes()
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            self._log(f"[store] Read failed for {path}: {e}", "WARNING")
+            return None
+        try:
+            envelope = json.loads(zlib.decompress(blob))
+        except Exception as e:
+            # A corrupt entry must not poison the caller; drop it and re-fetch.
+            self._log(f"[store] Corrupt entry {path} ({e}); discarding", "WARNING")
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            return None
+        if not isinstance(envelope, dict) or 'payload' not in envelope:
+            return None
+        return envelope
+
+    def _write_sync(self, path: Path, envelope: Dict[str, Any]) -> int:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        blob = zlib.compress(
+            json.dumps(envelope, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
+            self._level,
+        )
+        tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            tmp.write_bytes(blob)
+            os.replace(tmp, path)  # atomic within the same directory
+        except OSError as e:
+            self._log(f"[store] Write failed for {path}: {e}", "WARNING")
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            return 0
+        return len(blob)
+
+    # --- async API --------------------------------------------------------- #
+
+    async def get(self, namespace: str, key: str) -> Optional[Any]:
+        """Return the stored payload, or None when absent."""
+        envelope = await asyncio.to_thread(self._read_sync, self.path_for(namespace, key))
+        return envelope['payload'] if envelope else None
+
+    async def get_envelope(self, namespace: str, key: str) -> Optional[Dict[str, Any]]:
+        """Return the full record including ``fetched_at`` and ``key_params``."""
+        return await asyncio.to_thread(self._read_sync, self.path_for(namespace, key))
+
+    async def put(
+        self,
+        namespace: str,
+        key: str,
+        payload: Any,
+        key_params: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """Store ``payload`` permanently. Returns the compressed size in bytes."""
+        envelope = {
+            'v': self.ENVELOPE_VERSION,
+            'ns': namespace,
+            'key': key,
+            'key_params': key_params,
+            'fetched_at': time.time(),
+            'payload': payload,
+        }
+        return await asyncio.to_thread(self._write_sync, self.path_for(namespace, key), envelope)
+
+    async def delete(self, namespace: str, key: str) -> bool:
+        def _rm(path: Path) -> bool:
+            try:
+                path.unlink()
+                return True
+            except OSError:
+                return False
+        return await asyncio.to_thread(_rm, self.path_for(namespace, key))
+
+    def iter_files(self, namespace: str):
+        base = self.root / namespace
+        if not base.exists():
+            return
+        yield from base.glob('*/*.z')
+
+    async def list_entries(self, namespace: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Metadata for stored entries (payload omitted), newest first."""
+        def _scan() -> List[Dict[str, Any]]:
+            rows = []
+            for f in self.iter_files(namespace):
+                envelope = self._read_sync(f)
+                if not envelope:
+                    continue
+                rows.append({
+                    'key': envelope.get('key'),
+                    'key_params': envelope.get('key_params'),
+                    'fetched_at': envelope.get('fetched_at'),
+                    'age_days': round((time.time() - (envelope.get('fetched_at') or 0)) / 86400, 2),
+                    'bytes': f.stat().st_size,
+                })
+            rows.sort(key=lambda r: r.get('fetched_at') or 0, reverse=True)
+            return rows[:limit] if limit else rows
+        return await asyncio.to_thread(_scan)
+
+    async def stats(self, namespaces: Sequence[str]) -> Dict[str, Any]:
+        def _scan() -> Dict[str, Any]:
+            out: Dict[str, Any] = {}
+            total_files = total_bytes = 0
+            for ns in namespaces:
+                n = b = 0
+                oldest = None
+                for f in self.iter_files(ns):
+                    try:
+                        st = f.stat()
+                    except OSError:
+                        continue
+                    n += 1
+                    b += st.st_size
+                    oldest = st.st_mtime if oldest is None else min(oldest, st.st_mtime)
+                out[ns] = {
+                    'entries': n,
+                    'bytes': b,
+                    'oldest_age_days': round((time.time() - oldest) / 86400, 2) if oldest else None,
+                }
+                total_files += n
+                total_bytes += b
+            out['_total'] = {'entries': total_files, 'bytes': total_bytes,
+                             'mb': round(total_bytes / 1048576, 2)}
+            return out
+        return await asyncio.to_thread(_scan)
+
+
+class AlphaStore:
+    """SQLite corpus of every alpha this account has simulated.
+
+    Why not the file store: this account creates ~2,769 alphas/day and holds
+    ~678,000 since 2026-01-01. One file per alpha would mean 678k inodes and turn
+    every question into a full decompress-and-scan; the same corpus is ~450 MB in
+    SQLite with indexes, and FTS5 (present in the container, no new dependency)
+    answers "have I tried this expression" in milliseconds.
+
+    Keeping *every* alpha rather than only the good ones is what buys the
+    denominator: "which datafield actually produces high-Sharpe alphas" is a
+    ratio, and it is unanswerable from a corpus of winners alone.
+    """
+
+    COLUMNS = 27
+
+    SCHEMA = [
+        """CREATE TABLE IF NOT EXISTS alphas (
+            id TEXT PRIMARY KEY,
+            date_created TEXT, date_submitted TEXT,
+            stage TEXT, status TEXT, type TEXT, color TEXT,
+            instrument_type TEXT, region TEXT, universe TEXT, delay INTEGER,
+            neutralization TEXT, decay REAL, truncation REAL, language TEXT,
+            expression TEXT,
+            sharpe REAL, fitness REAL, turnover REAL, returns REAL,
+            margin REAL, drawdown REAL, long_count INTEGER, short_count INTEGER,
+            pyramids TEXT, classifications TEXT,
+            fetched_at REAL
+        )""",
+        "CREATE INDEX IF NOT EXISTS ix_alphas_cfg ON alphas(region, universe, delay)",
+        "CREATE INDEX IF NOT EXISTS ix_alphas_sharpe ON alphas(sharpe DESC)",
+        "CREATE INDEX IF NOT EXISTS ix_alphas_date ON alphas(date_created)",
+        "CREATE INDEX IF NOT EXISTS ix_alphas_stage ON alphas(stage)",
+        """CREATE VIRTUAL TABLE IF NOT EXISTS alphas_fts
+           USING fts5(expression, content='alphas', content_rowid='rowid')""",
+        "CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, value TEXT)",
+        # Which identifiers each expression uses. Without this table, "how often
+        # does field X produce a good alpha" means tokenising 678k expressions on
+        # every question; with it, it is one indexed GROUP BY.
+        """CREATE TABLE IF NOT EXISTS alpha_tokens (
+            alpha_id TEXT NOT NULL, token TEXT NOT NULL, kind TEXT,
+            PRIMARY KEY (alpha_id, token)
+        )""",
+        "CREATE INDEX IF NOT EXISTS ix_tokens_token ON alpha_tokens(token, kind)",
+    ]
+
+    # Expression identifiers: FastExpr fields and operators are both bare words.
+    _TOKEN_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
+
+    def __init__(self, path: Path, log):
+        self.path = Path(path)
+        self._log = log
+        self._lock = asyncio.Lock()
+        self._ready = False
+
+    def _connect(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(self.path), timeout=30)
+        conn.row_factory = sqlite3.Row
+        # WAL lets the analysis tools read while a sync is still writing.
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+    def _init_sync(self) -> None:
+        conn = self._connect()
+        try:
+            for stmt in self.SCHEMA:
+                conn.execute(stmt)
+            conn.commit()
+        finally:
+            conn.close()
+        self._ready = True
+
+    async def ensure_ready(self) -> None:
+        if not self._ready:
+            await asyncio.to_thread(self._init_sync)
+
+    @staticmethod
+    def _utc(value: Optional[str]) -> Optional[str]:
+        """Normalise a platform timestamp to UTC.
+
+        The API returns local-offset stamps ("2026-08-14T20:00:21-04:00"), and
+        SQLite compares them as text — so a naive range query on '2026-08-15'
+        silently misses rows that are inside the UTC day. Everything is stored as
+        UTC so lexicographic comparison is the same as chronological.
+        """
+        if not value:
+            return value
+        try:
+            return datetime.fromisoformat(value).astimezone(timezone.utc)\
+                .isoformat().replace('+00:00', 'Z')
+        except (ValueError, TypeError):
+            return value
+
+    @staticmethod
+    def row_from_alpha(a: Dict[str, Any]) -> Optional[tuple]:
+        """Flatten one platform alpha record into a corpus row."""
+        aid = a.get('id')
+        if not aid:
+            return None
+        s = a.get('settings') or {}
+        m = a.get('is') or {}
+        # The expression arrives as {"code","description","operatorCount"} for
+        # REGULAR alphas and as a bare string elsewhere; SUPER alphas carry it
+        # under `combo` in either shape.
+        expression = AlphaStore._code_of(a.get('regular')) or AlphaStore._code_of(a.get('combo'))
+        pyr = a.get('pyramids')
+        return AlphaStore._sanitize((
+            aid, AlphaStore._utc(a.get('dateCreated')), AlphaStore._utc(a.get('dateSubmitted')),
+            a.get('stage'), a.get('status'), a.get('type'), a.get('color'),
+            s.get('instrumentType'), s.get('region'), s.get('universe'), s.get('delay'),
+            s.get('neutralization'), s.get('decay'), s.get('truncation'), s.get('language'),
+            expression,
+            m.get('sharpe'), m.get('fitness'), m.get('turnover'), m.get('returns'),
+            m.get('margin'), m.get('drawdown'), m.get('longCount'), m.get('shortCount'),
+            json.dumps([p.get('name') for p in pyr if isinstance(p, dict)], ensure_ascii=False)
+                if isinstance(pyr, list) else None,
+            json.dumps([c.get('name') or c.get('id') for c in (a.get('classifications') or [])
+                        if isinstance(c, dict)], ensure_ascii=False),
+            time.time(),
+        ))
+
+    @staticmethod
+    def _code_of(value: Any) -> Optional[str]:
+        if isinstance(value, dict):
+            code = value.get('code')
+            return code if isinstance(code, str) else None
+        return value if isinstance(value, str) else None
+
+    @staticmethod
+    def _sanitize(row: tuple) -> tuple:
+        """Make every value bindable by sqlite3.
+
+        One unexpected shape in 678,000 records would otherwise abort the whole
+        sync, so anything that is not a primitive is stored as JSON text rather
+        than raising.
+        """
+        out = []
+        for v in row:
+            if v is None or isinstance(v, (str, int, float, bytes)):
+                out.append(v)
+            else:
+                try:
+                    out.append(json.dumps(v, ensure_ascii=False, default=str))
+                except Exception:
+                    out.append(str(v))
+        return tuple(out)
+
+    def _upsert_sync(self, rows: List[tuple], index: bool,
+                     op_set: set, field_set: set) -> int:
+        if not rows:
+            return 0
+        conn = self._connect()
+        try:
+            if index:
+                # alphas_fts is an external-content table, so it does not follow
+                # writes to `alphas` on its own. An incremental write has to
+                # remove the old term row before adding the new one, or a
+                # re-simulated id would match twice.
+                ids = [r[0] for r in rows]
+                q = ",".join("?" * len(ids))
+                for rowid, expr in conn.execute(
+                        f"SELECT rowid, expression FROM alphas WHERE id IN ({q})", ids):
+                    conn.execute("INSERT INTO alphas_fts(alphas_fts, rowid, expression) "
+                                 "VALUES('delete', ?, ?)", (rowid, expr))
+                conn.execute(f"DELETE FROM alpha_tokens WHERE alpha_id IN ({q})", ids)
+
+            conn.executemany(
+                "INSERT OR REPLACE INTO alphas VALUES (" + ",".join(["?"] * self.COLUMNS) + ")",
+                rows)
+
+            if index:
+                ids = [r[0] for r in rows]
+                q = ",".join("?" * len(ids))
+                token_rows = []
+                for rowid, aid, expr in conn.execute(
+                        f"SELECT rowid, id, expression FROM alphas WHERE id IN ({q})", ids):
+                    conn.execute("INSERT INTO alphas_fts(rowid, expression) VALUES (?,?)",
+                                 (rowid, expr))
+                    seen = set()
+                    for tok in AlphaStore._TOKEN_RE.findall(expr or ""):
+                        low = tok.lower()
+                        if low in seen:
+                            continue
+                        seen.add(low)
+                        kind = ('operator' if low in op_set
+                                else 'field' if low in field_set else None)
+                        if kind:
+                            token_rows.append((aid, low, kind))
+                if token_rows:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO alpha_tokens VALUES (?,?,?)", token_rows)
+                # Keep the coverage marker honest as the corpus grows.
+                total = conn.execute("SELECT COUNT(*) n FROM alphas").fetchone()["n"]
+                cur = conn.execute(
+                    "SELECT value FROM sync_state WHERE key='token_index_alphas'").fetchone()
+                if cur is not None:
+                    conn.execute("INSERT OR REPLACE INTO sync_state VALUES (?,?)",
+                                 ('token_index_alphas', str(total)))
+            conn.commit()
+            return len(rows)
+        finally:
+            conn.close()
+
+    async def upsert_many(self, alphas: List[Dict[str, Any]], index: bool = False,
+                          op_set: Optional[set] = None,
+                          field_set: Optional[set] = None) -> int:
+        """Store a batch of alphas.
+
+        ``index`` also maintains the FTS and token indexes for these rows. The
+        bulk sync leaves it off and rebuilds both once at the end (cheaper across
+        hundreds of thousands of rows); a single alpha arriving from a finished
+        backtest turns it on, so it is searchable and counted immediately rather
+        than only after the next sync.
+        """
+        await self.ensure_ready()
+        rows = [r for r in (self.row_from_alpha(a) for a in alphas) if r]
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._upsert_sync, rows, index, op_set or set(), field_set or set())
+
+    async def rebuild_fts(self) -> None:
+        await self.ensure_ready()
+
+        def _rb():
+            conn = self._connect()
+            try:
+                conn.execute("INSERT INTO alphas_fts(alphas_fts) VALUES('rebuild')")
+                conn.commit()
+            finally:
+                conn.close()
+        async with self._lock:
+            await asyncio.to_thread(_rb)
+
+    async def get_state(self, key: str) -> Optional[str]:
+        await self.ensure_ready()
+
+        def _g():
+            conn = self._connect()
+            try:
+                r = conn.execute("SELECT value FROM sync_state WHERE key=?", (key,)).fetchone()
+                return r["value"] if r else None
+            finally:
+                conn.close()
+        return await asyncio.to_thread(_g)
+
+    async def set_state(self, key: str, value: str) -> None:
+        await self.ensure_ready()
+
+        def _s():
+            conn = self._connect()
+            try:
+                conn.execute("INSERT OR REPLACE INTO sync_state VALUES (?,?)", (key, value))
+                conn.commit()
+            finally:
+                conn.close()
+        async with self._lock:
+            await asyncio.to_thread(_s)
+
+    async def query(self, sql: str, params: Sequence[Any] = ()) -> List[Dict[str, Any]]:
+        """Run a read-only query and return dict rows."""
+        await self.ensure_ready()
+
+        def _q():
+            conn = self._connect()
+            try:
+                return [dict(r) for r in conn.execute(sql, tuple(params)).fetchall()]
+            finally:
+                conn.close()
+        return await asyncio.to_thread(_q)
+
+    async def build_token_index(self, operators: Sequence[str] = (),
+                                fields: Sequence[str] = ()) -> Dict[str, Any]:
+        """Index which operators and datafields each expression references.
+
+        Classification is by lookup, not by parsing: the operator catalogue and
+        the datafield catalogue are both already on disk, so a token is whatever
+        those two sets say it is. Anything in neither is ignored rather than
+        guessed at.
+        """
+        await self.ensure_ready()
+        op_set = {o.lower() for o in operators if o}
+        field_set = {f.lower() for f in fields if f}
+
+        def _build():
+            conn = self._connect()
+            try:
+                conn.execute("DELETE FROM alpha_tokens")
+                rows = []
+                seen_pairs = set()
+                cur = conn.execute(
+                    "SELECT id, expression FROM alphas WHERE expression IS NOT NULL")
+                n_alphas = 0
+                for aid, expr in cur:
+                    n_alphas += 1
+                    for tok in set(AlphaStore._TOKEN_RE.findall(expr or "")):
+                        low = tok.lower()
+                        if low in op_set:
+                            kind = 'operator'
+                        elif low in field_set:
+                            kind = 'field'
+                        else:
+                            continue
+                        pair = (aid, low)
+                        if pair in seen_pairs:
+                            continue
+                        seen_pairs.add(pair)
+                        rows.append((aid, low, kind))
+                        if len(rows) >= 50000:
+                            conn.executemany(
+                                "INSERT OR IGNORE INTO alpha_tokens VALUES (?,?,?)", rows)
+                            rows.clear()
+                            seen_pairs.clear()
+                if rows:
+                    conn.executemany("INSERT OR IGNORE INTO alpha_tokens VALUES (?,?,?)", rows)
+                conn.commit()
+                total = conn.execute("SELECT COUNT(*) n FROM alpha_tokens").fetchone()["n"]
+                corpus = conn.execute("SELECT COUNT(*) n FROM alphas").fetchone()["n"]
+                # Remember the corpus size this index covers. A stale index does
+                # not fail — it silently undercounts (measured: 15% low when the
+                # corpus had grown from 92k to 116k), so the gap must be visible.
+                conn.execute("INSERT OR REPLACE INTO sync_state VALUES (?,?)",
+                             ('token_index_alphas', str(corpus)))
+                conn.execute("INSERT OR REPLACE INTO sync_state VALUES (?,?)",
+                             ('token_index_built_at', str(time.time())))
+                conn.commit()
+                return {'alphas_scanned': n_alphas, 'token_rows': total,
+                        'covers_alphas': corpus,
+                        'known_operators': len(op_set), 'known_fields': len(field_set)}
+            finally:
+                conn.close()
+        async with self._lock:
+            return await asyncio.to_thread(_build)
+
+    async def stats(self) -> Dict[str, Any]:
+        await self.ensure_ready()
+
+        def _s():
+            conn = self._connect()
+            try:
+                size = self.path.stat().st_size if self.path.exists() else 0
+                total = conn.execute("SELECT COUNT(*) n FROM alphas").fetchone()["n"]
+                if not total:
+                    return {"alphas": 0, "bytes": size}
+                span = conn.execute(
+                    "SELECT MIN(date_created) lo, MAX(date_created) hi FROM alphas").fetchone()
+                by_stage = {r["stage"]: r["n"] for r in conn.execute(
+                    "SELECT stage, COUNT(*) n FROM alphas GROUP BY stage")}
+                graded = conn.execute(
+                    "SELECT COUNT(*) n FROM alphas WHERE sharpe IS NOT NULL").fetchone()["n"]
+                tokens = conn.execute("SELECT COUNT(*) n FROM alpha_tokens").fetchone()["n"]
+                covered = conn.execute(
+                    "SELECT value FROM sync_state WHERE key='token_index_alphas'").fetchone()
+                covered = int(covered["value"]) if covered else 0
+                out = {
+                    "alphas": total,
+                    "with_metrics": graded,
+                    "date_range": [span["lo"], span["hi"]],
+                    "by_stage": by_stage,
+                    "token_rows": tokens,
+                    "token_index_covers": covered,
+                    "bytes": size,
+                }
+                if tokens and covered < total:
+                    out["token_index_stale_by"] = total - covered
+                return out
+            finally:
+                conn.close()
+        return await asyncio.to_thread(_s)
+
+
+class EndpointRateLimiter:
+
+    """Adaptive, per-endpoint-family throttle driven by BRAIN's own headers.
+
+    Live probes show the platform publishes hard quotas that differ sharply per
+    endpoint family, e.g. ``/data-fields`` allows 1 req/second and 30 req/minute
+    while ``/alphas/{id}`` allows 2000 req/hour. Absorbing 429s and retrying is
+    pure wasted traffic, so requests are paced *before* they are sent using the
+    ``X-RateLimit-Limit-{Second,Minute,Hour}`` values learned from every
+    response, plus an explicit cooldown whenever the server answers 429.
+
+    Limits start unknown (no throttling) and are learned on the first response
+    from each family, so a quota change on the platform side is picked up
+    automatically instead of being baked into the client.
+    """
+
+    _WINDOWS = (("second", 1.0), ("minute", 60.0), ("hour", 3600.0))
+
+    # One sliding window per (bucket, window) as a ZSET scored by wall-clock time.
+    # Prune-count-admit has to be atomic or two processes both read "under quota"
+    # and both send; a Lua body is the only way to get that in one round trip.
+    # Returns 0 to admit, otherwise the seconds to wait.
+    _ADMIT_LUA = """
+    local now    = tonumber(ARGV[1])
+    local span   = tonumber(ARGV[2])
+    local budget = tonumber(ARGV[3])
+    local member = ARGV[4]
+    redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, now - span)
+    local used = redis.call('ZCARD', KEYS[1])
+    if used >= budget then
+        local oldest = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+        local wait = span - (now - tonumber(oldest[2]))
+        if wait < 0.05 then wait = 0.05 end
+        return tostring(wait)
+    end
+    redis.call('ZADD', KEYS[1], now, member)
+    redis.call('EXPIRE', KEYS[1], math.ceil(span) + 5)
+    return "0"
+    """
+
+    def __init__(self, log, safety: float = 0.9, redis_client: Any = None):
+        self._log = log
+        self._safety = max(0.1, min(1.0, safety))
+        self._state: Dict[str, Dict[str, Any]] = {}
+        self._locks: Dict[str, asyncio.Lock] = {}
+        self._guard = asyncio.Lock()
+        # Shared backend. Without it every process runs its own window and each
+        # believes it owns the whole quota — measured: a standalone script and the
+        # server together tripped "429 on data-sets" that neither would have hit
+        # alone. Redis makes the budget one shared pool.
+        self._redis = redis_client
+        self._redis_ok = redis_client is not None
+        self._admit_sha: Optional[str] = None
+        self._degraded_logged = False
+        # A transient Redis blip must not strand a long-lived server in
+        # per-process mode forever, so degradation is re-probed periodically.
+        self._redis_retry_at = 0.0
+        try:
+            self._redis_retry_seconds = max(5.0, float(
+                os.environ.get("BRAIN_RATE_LIMIT_REDIS_RETRY_SECONDS", "30")))
+        except Exception:
+            self._redis_retry_seconds = 30.0
+
+    @property
+    def backend(self) -> str:
+        if self._redis is None:
+            return 'in-process'
+        self._maybe_recover()
+        return 'redis' if self._redis_ok else 'in-process'
+
+    def _degrade(self, err: Exception) -> None:
+        """Fall back to the in-process window; the server must stay usable."""
+        self._redis_ok = False
+        self._admit_sha = None
+        self._redis_retry_at = time.time() + self._redis_retry_seconds
+        if not self._degraded_logged:
+            self._degraded_logged = True
+            self._log(f"[rate-limit] Redis unavailable ({err}); pacing per-process "
+                      "until it returns. Concurrent processes may now exceed quota.", "WARNING")
+
+    def _maybe_recover(self) -> None:
+        """Re-probe a degraded Redis so the shared budget comes back on its own."""
+        if self._redis is None or self._redis_ok or time.time() < self._redis_retry_at:
+            return
+        self._redis_retry_at = time.time() + self._redis_retry_seconds
+        try:
+            self._redis.ping()
+        except Exception:
+            return
+        self._redis_ok = True
+        self._degraded_logged = False
+        self._log("[rate-limit] Redis is back; sharing the quota again.", "INFO")
+
+    def _redis_call(self, fn, *a, **kw):
+        """Run a Redis op, degrading (not raising) on failure."""
+        if self._redis is None or not self._redis_ok:
+            return None
+        try:
+            return fn(*a, **kw)
+        except Exception as e:
+            self._degrade(e)
+            return None
+
+    def _budget(self, quota: int) -> int:
+        return max(1, int(quota * self._safety)) if quota > 1 else quota
+
+    def _shared_limits(self, bucket: str) -> Dict[str, int]:
+        """Quotas learned by any process, so a fresh one need not rediscover them."""
+        raw = self._redis_call(self._redis.hgetall, f'rl:limits:{bucket}') if self._redis else None
+        out: Dict[str, int] = {}
+        for k, v in (raw or {}).items():
+            try:
+                out[k] = int(v)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    async def _redis_wait(self, bucket: str) -> Optional[float]:
+        """Seconds to wait per the shared windows, or None if Redis is unusable.
+
+        0.0 means the request was admitted and already recorded.
+        """
+        self._maybe_recover()
+        if self._redis is None or not self._redis_ok:
+            return None
+        cooldown = self._redis_call(self._redis.ttl, f'rl:cool:{bucket}')
+        if cooldown is None:
+            return None
+        if cooldown > 0:
+            return float(cooldown)
+
+        limits = self._shared_limits(bucket)
+        # Merge anything only this process has seen so far.
+        for name, quota in (self._bucket_state(bucket)['limits'] or {}).items():
+            limits.setdefault(name, quota)
+        if not limits:
+            return 0.0
+
+        if self._admit_sha is None:
+            self._admit_sha = self._redis_call(self._redis.script_load, self._ADMIT_LUA)
+            if self._admit_sha is None:
+                return None
+
+        now = time.time()
+        member = uuid.uuid4().hex
+        admitted: List[str] = []
+        for name, span in self._WINDOWS:
+            quota = limits.get(name)
+            if not quota:
+                continue
+            key = f'rl:hits:{bucket}:{name}'
+            try:
+                res = await asyncio.to_thread(
+                    self._redis.evalsha, self._admit_sha, 1, key,
+                    now, span, self._budget(quota), member)
+            except Exception as e:
+                # A flushed script cache is recoverable; anything else degrades.
+                if 'NOSCRIPT' in str(e):
+                    self._admit_sha = None
+                else:
+                    self._degrade(e)
+                self._undo(admitted, member)
+                return None
+            wait = float(res)
+            if wait > 0:
+                # Roll back the windows already admitted so this attempt costs nothing.
+                self._undo(admitted, member)
+                return wait
+            admitted.append(f'rl:hits:{bucket}:{name}')
+        return 0.0
+
+    def _undo(self, keys: List[str], member: str) -> None:
+        for key in keys:
+            self._redis_call(self._redis.zrem, key, member)
+
+    @staticmethod
+    def bucket_for(url: str) -> str:
+        """Group URLs into the families the platform actually meters."""
+        try:
+            path = urlparse(url).path.strip('/')
+        except Exception:
+            return 'default'
+        if not path:
+            return 'default'
+        parts = path.split('/')
+        head = parts[0]
+        if head == 'users':
+            # /users/self/alphas is metered separately from /users/self/*
+            if len(parts) >= 3 and parts[2] == 'alphas':
+                return 'users-alphas'
+            return 'users'
+        if head in ('alphas', 'simulations', 'data-fields', 'data-sets',
+                    'operators', 'events', 'competitions', 'consultant',
+                    'tutorials', 'tutorial-pages', 'authentication'):
+            return head
+        return head
+
+    async def _bucket_lock(self, bucket: str) -> asyncio.Lock:
+        async with self._guard:
+            lock = self._locks.get(bucket)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._locks[bucket] = lock
+            return lock
+
+    def _bucket_state(self, bucket: str) -> Dict[str, Any]:
+        state = self._state.get(bucket)
+        if state is None:
+            state = {
+                'limits': {},                 # window name -> int quota
+                'hits': deque(),              # monotonic timestamps of sent requests
+                'blocked_until': 0.0,         # server-mandated cooldown (monotonic)
+            }
+            self._state[bucket] = state
+        return state
+
+    def _wait_seconds(self, state: Dict[str, Any], now: float) -> float:
+        wait = max(0.0, state['blocked_until'] - now)
+        hits: deque = state['hits']
+        limits: Dict[str, int] = state['limits']
+        if not limits:
+            return wait
+        longest = max(span for name, span in self._WINDOWS if name in limits)
+        while hits and now - hits[0] > longest:
+            hits.popleft()
+        for name, span in self._WINDOWS:
+            quota = limits.get(name)
+            if not quota:
+                continue
+            # Keep a safety margin so a concurrent client/tab does not push us over.
+            budget = max(1, int(quota * self._safety)) if quota > 1 else quota
+            recent = [t for t in hits if now - t < span]
+            if len(recent) >= budget:
+                wait = max(wait, span - (now - recent[-budget]))
+        return wait
+
+    async def acquire(self, url: str) -> str:
+        """Block until sending a request to ``url``'s family is within quota.
+
+        Uses the Redis-shared windows when available so every process draws from
+        one budget; falls back to the in-process window if Redis is unreachable.
+        """
+        bucket = self.bucket_for(url)
+        lock = await self._bucket_lock(bucket)
+        async with lock:
+            state = self._bucket_state(bucket)
+            while True:
+                wait = await self._redis_wait(bucket)
+                if wait is None:
+                    # Redis unusable — pace locally.
+                    now = time.monotonic()
+                    wait = self._wait_seconds(state, now)
+                    if wait <= 0:
+                        state['hits'].append(now)
+                        return bucket
+                elif wait <= 0:
+                    # Admitted and already recorded in the shared window. Mirror it
+                    # locally so a later degrade still sees recent history.
+                    state['hits'].append(time.monotonic())
+                    return bucket
+                if wait > 1.0:
+                    self._log(
+                        f"[rate-limit] Pacing {bucket} ({self.backend}): sleeping "
+                        f"{wait:.1f}s to stay within {state['limits'] or self._shared_limits(bucket)}",
+                        "INFO",
+                    )
+                await asyncio.sleep(min(wait, 30.0))
+
+    def observe(self, bucket: str, response: Optional[requests.Response]) -> None:
+        """Learn quotas and cooldowns from a response's rate-limit headers."""
+        if response is None:
+            return
+        state = self._bucket_state(bucket)
+        headers = response.headers
+        for name, _span in self._WINDOWS:
+            raw = headers.get(f'X-RateLimit-Limit-{name.capitalize()}')
+            if raw is None:
+                continue
+            try:
+                value = int(float(raw))
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                state['limits'][name] = value
+                # Publish it so other processes inherit the quota immediately.
+                self._redis_call(self._redis.hset, f'rl:limits:{bucket}', name, value) \
+                    if self._redis else None
+        # Remaining==0 means the next request is guaranteed to 429; wait out the window.
+        for name, span in self._WINDOWS:
+            raw = headers.get(f'X-RateLimit-Remaining-{name.capitalize()}')
+            if raw is None:
+                continue
+            try:
+                remaining = int(float(raw))
+            except (TypeError, ValueError):
+                continue
+            if remaining <= 0:
+                state['blocked_until'] = max(state['blocked_until'], time.monotonic() + span)
+                if self._redis:
+                    self._redis_call(self._redis.set, f'rl:cool:{bucket}', '1',
+                                     ex=max(1, int(span)), nx=True)
+        if response.status_code == 429:
+            cooldown = 30.0
+            raw = headers.get('Retry-After') or headers.get('RateLimit-Reset')
+            try:
+                if raw is not None:
+                    cooldown = max(1.0, min(float(raw), 300.0))
+            except (TypeError, ValueError):
+                pass
+            state['blocked_until'] = max(state['blocked_until'], time.monotonic() + cooldown)
+            if self._redis:
+                # Share the cooldown: a 429 is account-wide, not process-wide.
+                self._redis_call(self._redis.set, f'rl:cool:{bucket}', '1',
+                                 ex=max(1, int(cooldown)))
+            self._log(f"[rate-limit] 429 on {bucket}; cooling down {cooldown:.0f}s", "WARNING")
+
+    def snapshot(self) -> Dict[str, Any]:
+        now = time.monotonic()
+        out: Dict[str, Any] = {}
+        # Touch Redis before reporting the backend: reading the flag first would
+        # report a stale 'redis' for one call after the connection dropped.
+        self._maybe_recover()
+        if self._redis is not None and self._redis_ok:
+            self._redis_call(self._redis.ping)
+        buckets = set(self._state)
+        if self._redis is not None and self._redis_ok:
+            keys = self._redis_call(self._redis.keys, 'rl:limits:*') or []
+            buckets |= {k.split(':', 2)[-1] for k in keys}
+        for bucket in sorted(buckets):
+            state = self._bucket_state(bucket)
+            row = {
+                'limits': dict(state['limits']) or self._shared_limits(bucket),
+                'sent_last_minute_this_process': sum(1 for t in state['hits'] if now - t < 60.0),
+                'cooldown_seconds': round(max(0.0, state['blocked_until'] - now), 1),
+            }
+            if self.backend == 'redis':
+                # What every process together has spent — the number that matters.
+                shared = self._redis_call(
+                    self._redis.zcount, f'rl:hits:{bucket}:minute', time.time() - 60, '+inf')
+                if shared is not None:
+                    row['sent_last_minute_all_processes'] = shared
+                ttl = self._redis_call(self._redis.ttl, f'rl:cool:{bucket}')
+                if ttl and ttl > 0:
+                    row['cooldown_seconds'] = float(ttl)
+            out[bucket] = row
+        out['_backend'] = self.backend
+        return out
+
+
 class BrainApiClient:
     """WorldQuant BRAIN API client with comprehensive functionality."""
     
@@ -128,9 +1079,20 @@ class BrainApiClient:
         self.session = requests.Session()
         self.auth_credentials = None
         self.is_authenticating = False
-        self._request_semaphore = asyncio.Semaphore(int(os.environ.get("BRAIN_MAX_CONCURRENCY", "8")))
-        self._session_lock = asyncio.Lock()
+        self._max_concurrency = int(os.environ.get("BRAIN_MAX_CONCURRENCY", "8"))
+        self._request_semaphore = asyncio.Semaphore(self._max_concurrency)
+        # Requests are paced per endpoint family from the platform's own
+        # RateLimit headers; the semaphore only bounds in-flight sockets.
+        try:
+            _rl_safety = float(os.environ.get("BRAIN_RATE_LIMIT_SAFETY", "0.9"))
+        except Exception:
+            _rl_safety = 0.9
+        # redis_client is created further down; the limiter is attached to it in
+        # _attach_rate_limiter_backend() once that connection exists.
+        self.rate_limiter = EndpointRateLimiter(self.log, safety=_rl_safety)
         self._auth_lock = asyncio.Lock()
+        self._self_user_id: Optional[str] = None
+        self._self_user_id_lock = asyncio.Lock()
         self._auth_validated_until = 0.0
         try:
             self._auth_check_ttl_seconds = max(0.0, float(os.environ.get("BRAIN_AUTH_CHECK_TTL_SECONDS", "300")))
@@ -147,6 +1109,19 @@ class BrainApiClient:
             )
         except Exception:
             self._os_pnl_pool_sync_debounce_seconds = 1.0
+        # The server-side OS alpha list is the ONLY request a warm self-correlation
+        # check still makes. Within this window the cached list is reused with no
+        # request at all; past it the list is *verified* with a single 1-row probe
+        # (see _os_list_probe) rather than re-paged. Set 0 to verify on every call.
+        try:
+            self._os_list_ttl_seconds = max(0, int(os.environ.get("BRAIN_OS_LIST_TTL_SECONDS", "300")))
+        except Exception:
+            self._os_list_ttl_seconds = 300
+        # How long a verified list entry is kept around to be re-verified against.
+        try:
+            self._os_list_retain_seconds = max(60, int(os.environ.get("BRAIN_OS_LIST_RETAIN_SECONDS", "86400")))
+        except Exception:
+            self._os_list_retain_seconds = 86400
         try:
             self._brain_correlation_busy_retry_after_seconds = max(
                 1,
@@ -171,15 +1146,63 @@ class BrainApiClient:
         # their progress is tracked here (keyed by alpha_id).
         self._submission_states: Dict[str, Dict[str, Any]] = {}
         self._submission_tasks: Dict[str, asyncio.Task] = {}
+        # Catalogue building runs for hours, so it lives as a background task in
+        # THIS process: that way it shares self.rate_limiter with foreground
+        # requests. A separate process would run a second limiter that believes
+        # it owns the whole 30/min budget, and the two would collide into 429s.
+        self._catalogue_state: Dict[str, Any] = {}
+        self._catalogue_task: Optional[asyncio.Task] = None
         # The platform processes one submission check at a time per account.
         self._submission_serialize_lock = asyncio.Lock()
         try:
             self._submit_max_seconds = max(300.0, float(os.environ.get("BRAIN_SUBMIT_MAX_SECONDS", "5400")))
         except Exception:
             self._submit_max_seconds = 5400.0
+        # Permanent on-disk store for immutable platform data. Redis stays the
+        # hot tier for things that actually change (alpha lists, pyramid stats).
+        store_root = os.environ.get("BRAIN_CACHE_DIR") or str(Path(__file__).parent / "cache")
+        self.store = PersistentStore(Path(store_root), self.log)
+        # Structured corpus of this account's own alphas. Separate from the file
+        # store because 678k records need indexes, not 678k files.
+        self.alpha_store = AlphaStore(Path(store_root) / "alphas.db", self.log)
+        self._alpha_sync_state: Dict[str, Any] = {}
+        self._alpha_sync_task: Optional[asyncio.Task] = None
+        # Operator/datafield name sets used to classify expression tokens.
+        # Reading 73k field names off disk on every finished backtest would be
+        # absurd, so they are loaded once and refreshed on a long interval.
+        self._token_vocab: Optional[Dict[str, set]] = None
+        self._token_vocab_at = 0.0
+        try:
+            self._token_vocab_ttl = max(60, int(
+                os.environ.get("BRAIN_TOKEN_VOCAB_TTL_SECONDS", "3600")))
+        except Exception:
+            self._token_vocab_ttl = 3600
+        # An IS alpha is still editable, so it gets a short Redis TTL rather than
+        # a permanent record; OS alphas go to the store.
+        try:
+            self._alpha_details_is_ttl = max(0, int(os.environ.get("BRAIN_ALPHA_DETAILS_IS_TTL", "120")))
+        except Exception:
+            self._alpha_details_is_ttl = 120
+        # A submitted alpha's expression, settings and IS metrics are frozen, but
+        # its `os` block is NOT: osISSharpeRatio / preCloseSharpeRatio fill in and
+        # keep moving as out-of-sample performance accrues (verified: alphas
+        # submitted 2025-03 report osISSharpeRatio while one submitted today
+        # reports null). So the stored record is served only while it is younger
+        # than this window; 0 disables the check and makes it truly permanent.
+        try:
+            self._alpha_details_max_age = max(0, int(os.environ.get("BRAIN_ALPHA_DETAILS_MAX_AGE", "604800")))
+        except Exception:
+            self._alpha_details_max_age = 604800
         
-        # Configure session
-        self.session.timeout = self._default_timeout_seconds
+        # Configure session. The default HTTPAdapter pool holds only 10
+        # connections; with concurrent requests a smaller pool silently discards
+        # and re-establishes sockets, paying a TLS handshake per call.
+        _pool = max(10, self._max_concurrency * 2)
+        _adapter = requests.adapters.HTTPAdapter(
+            pool_connections=_pool, pool_maxsize=_pool, max_retries=0
+        )
+        self.session.mount('https://', _adapter)
+        self.session.mount('http://', _adapter)
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
@@ -218,6 +1241,12 @@ class BrainApiClient:
         except Exception as e:
             self.log(f"Redis connection failed: {str(e)}, caching disabled", "WARNING")
             self.redis_client = None
+
+        # Share the rate-limit budget across processes now that Redis is known.
+        if self.redis_client is not None:
+            self.rate_limiter._redis = self.redis_client
+            self.rate_limiter._redis_ok = True
+            self.log(f"Rate limiting backend: {self.rate_limiter.backend}", "INFO")
     
     def log(self, message: str, level: str = "INFO"):
         """Log messages to stderr to avoid MCP protocol interference."""
@@ -426,48 +1455,72 @@ class BrainApiClient:
             return None
     
     async def _request(self, method: str, url: str, **kwargs) -> requests.Response:
-        """Run blocking requests I/O in a worker thread to avoid blocking the asyncio event loop."""
+        """Run blocking requests I/O in a worker thread to avoid blocking the asyncio event loop.
+
+        Requests are paced by ``self.rate_limiter`` using the platform's own
+        RateLimit headers, so concurrent callers stay inside BRAIN's per-family
+        quotas instead of generating 429s and retry traffic. ``requests.Session``
+        is used concurrently here on purpose: connection pooling and the cookie
+        jar are only mutated during authentication, which holds ``_auth_lock``.
+        """
         absolute_url = self._to_absolute_url(url)
         timeout = kwargs.pop("timeout", self._default_timeout_seconds)
         # Add extra buffer for asyncio timeout to catch stuck threads
         asyncio_timeout = timeout + 10
-        
+
+        bucket = await self.rate_limiter.acquire(absolute_url)
+
         async with self._request_semaphore:
-            async with self._session_lock:
-                try:
-                    # Wrap asyncio.to_thread with wait_for to prevent infinite hangs
-                    return await asyncio.wait_for(
-                        asyncio.to_thread(
-                            self.session.request,
-                            method,
-                            absolute_url,
-                            timeout=timeout,
-                            **kwargs,
-                        ),
-                        timeout=asyncio_timeout
-                    )
-                except asyncio.TimeoutError:
-                    self.log(f"Request asyncio timeout for {method} {absolute_url} after {asyncio_timeout}s", "ERROR")
-                    raise TimeoutError(f"Request timed out after {asyncio_timeout}s")
-                except asyncio.CancelledError:
-                    self.log(f"Request cancelled for {method} {absolute_url}", "WARNING")
-                    raise
-                except requests.Timeout as e:
-                    self.log(f"Request timeout for {method} {absolute_url}: {str(e)}", "ERROR")
-                    raise TimeoutError(f"Request timed out after {timeout}s") from e
-                except requests.ConnectionError as e:
-                    self.log(f"Connection error for {method} {absolute_url}: {str(e)}", "ERROR")
-                    raise ConnectionError(f"Failed to connect to {absolute_url}") from e
-                except requests.HTTPError as e:
-                    self.log(f"HTTP error for {method} {absolute_url}: {str(e)}", "ERROR")
-                    raise
-                except Exception as e:
-                    # Catch other unexpected errors (e.g., RemoteDisconnected wrapped in other exceptions)
-                    error_str = str(e)
-                    if "RemoteDisconnected" in error_str or "Connection aborted" in error_str:
-                        self.log(f"Remote disconnected for {method} {absolute_url}: {error_str}", "ERROR")
-                        raise ConnectionError(f"Remote server disconnected: {absolute_url}") from e
-                    raise
+            try:
+                # Wrap asyncio.to_thread with wait_for to prevent infinite hangs
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.session.request,
+                        method,
+                        absolute_url,
+                        timeout=timeout,
+                        **kwargs,
+                    ),
+                    timeout=asyncio_timeout
+                )
+                self.rate_limiter.observe(bucket, response)
+                return response
+            except asyncio.TimeoutError:
+                self.log(f"Request asyncio timeout for {method} {absolute_url} after {asyncio_timeout}s", "ERROR")
+                raise TimeoutError(f"Request timed out after {asyncio_timeout}s")
+            except asyncio.CancelledError:
+                self.log(f"Request cancelled for {method} {absolute_url}", "WARNING")
+                raise
+            except requests.Timeout as e:
+                self.log(f"Request timeout for {method} {absolute_url}: {str(e)}", "ERROR")
+                raise TimeoutError(f"Request timed out after {timeout}s") from e
+            except requests.ConnectionError as e:
+                self.log(f"Connection error for {method} {absolute_url}: {str(e)}", "ERROR")
+                raise ConnectionError(f"Failed to connect to {absolute_url}") from e
+            except requests.HTTPError as e:
+                self.log(f"HTTP error for {method} {absolute_url}: {str(e)}", "ERROR")
+                raise
+            except Exception as e:
+                # Catch other unexpected errors (e.g., RemoteDisconnected wrapped in other exceptions)
+                error_str = str(e)
+                if "RemoteDisconnected" in error_str or "Connection aborted" in error_str:
+                    self.log(f"Remote disconnected for {method} {absolute_url}: {error_str}", "ERROR")
+                    raise ConnectionError(f"Remote server disconnected: {absolute_url}") from e
+                raise
+
+    @staticmethod
+    def _recordset_retry_after(response: Optional[requests.Response], fallback: float) -> float:
+        """Wait BRAIN asks for while it materialises a recordset.
+
+        The /alphas/{id}/recordsets/* endpoints answer 200 with an EMPTY body and
+        a Retry-After header (observed: 1.0) until the record is built. Obeying
+        the header instead of a fixed backoff halves the wait on every cold read.
+        """
+        try:
+            value = float(response.headers.get('Retry-After'))
+        except (TypeError, ValueError, AttributeError):
+            return fallback
+        return max(0.25, min(value, 30.0))
 
     def _retry_wait_seconds(self, response: Optional[requests.Response], attempt: int, base_delay: float = 2.0, max_delay: float = 60.0) -> float:
         if response is not None:
@@ -579,6 +1632,7 @@ class BrainApiClient:
             # Clear any existing session data (quick operation, no lock needed for this)
             self.session.cookies.clear()
             self.session.auth = None
+            self._self_user_id = None
             
             # Create Basic Authentication header (base64 encoded credentials)
             import base64
@@ -816,6 +1870,26 @@ class BrainApiClient:
             self.log("🔄 Re-authenticating...", "INFO")
             await self._authenticate_unlocked(self.auth_credentials['email'], self.auth_credentials['password'])
     
+    async def get_self_user_id(self) -> Optional[str]:
+        """The account's own user id, fetched once per process.
+
+        Three tools each spent a whole /users/self round trip purely to learn an
+        id that cannot change while the session is authenticated.
+        """
+        if self._self_user_id:
+            return self._self_user_id
+        async with self._self_user_id_lock:
+            if self._self_user_id:
+                return self._self_user_id
+            try:
+                data = await self._request_json_with_retries(
+                    'GET', f"{self.base_url}/users/self", op_name='get_self_user_id')
+                self._self_user_id = data.get('id')
+            except Exception as e:
+                self.log(f"Failed to resolve own user id: {e}", "WARNING")
+                return None
+            return self._self_user_id
+
     async def get_authentication_status(self) -> Optional[Dict[str, Any]]:
         """Get current authentication status and user info."""
         try:
@@ -826,8 +1900,13 @@ class BrainApiClient:
             self.log(f"Failed to get auth status: {str(e)}", "ERROR")
             return None
     
-    async def create_simulation(self, simulation_data: SimulationData) -> Dict[str, str]:
-        """Create a new simulation on BRAIN platform."""
+    async def create_simulation(self, simulation_data: SimulationData,
+                                reuse_existing: bool = True) -> Dict[str, str]:
+        """Create a new simulation on BRAIN platform.
+
+        Every completed simulation is recorded in the local ledger; an identical
+        request is served from it unless ``reuse_existing`` is False.
+        """
         await self._create_simulation_semaphore.acquire()
         try:
             await self.ensure_authenticated()
@@ -865,7 +1944,37 @@ class BrainApiClient:
             
             # Filter out None values from entire payload
             payload = {k: v for k, v in payload.items() if v is not None}
-            
+
+            # An identical request was already paid for once: the platform is
+            # deterministic on the same expression, settings and data vintage, so
+            # replay the recorded alpha instead of burning several minutes and a
+            # simulation slot. The caller always sees that this happened.
+            fingerprint = self._simulation_fingerprint(payload)
+            if reuse_existing:
+                prior = await self._ledger_lookup(fingerprint)
+                if prior and prior.get('alpha_id'):
+                    try:
+                        alpha = await self.get_alpha_details(prior['alpha_id'])
+                    except Exception:
+                        alpha = None
+                    if alpha:
+                        self.log(
+                            f"[ledger] Reusing alpha {prior['alpha_id']} for an identical "
+                            f"simulation request (first run "
+                            f"{datetime.fromtimestamp(prior.get('simulated_at') or 0):%Y-%m-%d %H:%M})",
+                            "INFO",
+                        )
+                        return {
+                            **alpha,
+                            'from_local_ledger': True,
+                            'previously_simulated_at': datetime.fromtimestamp(
+                                prior.get('simulated_at') or 0).isoformat(),
+                            'ledger_note': ('Identical expression+settings were simulated before; '
+                                            'no platform simulation was run. Pass '
+                                            'reuse_existing=false to force a fresh backtest '
+                                            '(e.g. after a monthly data release).'),
+                        }
+
             response = await self._request('POST', f"{self.base_url}/simulations", json=payload)
             if response.status_code >= 400:
                 return {
@@ -951,11 +2060,15 @@ class BrainApiClient:
             alpha_id = progress_data["alpha"]
             
             # Fetch alpha details with retry logic
-            alpha_response = None
             for alpha_attempt in range(max_poll_retries):
                 try:
-                    alpha_response = await self._request('GET', f"https://api.worldquantbrain.com/alphas/{alpha_id}")
-                    break
+                    # Through get_alpha_details so the fresh record lands in the
+                    # cache and the follow-up reads this workflow always makes
+                    # (correlation setup, pool admission) cost nothing.
+                    alpha = await self.get_alpha_details(alpha_id, force_refresh=True)
+                    await self._ledger_record(fingerprint, payload, alpha)
+                    await self.record_alpha_locally(alpha)
+                    return alpha
                 except (ConnectionError, TimeoutError) as e:
                     if alpha_attempt < max_poll_retries - 1:
                         retry_wait = poll_retry_delay * (1.5 ** alpha_attempt)
@@ -964,8 +2077,8 @@ class BrainApiClient:
                     else:
                         self.log(f"❌ Failed to fetch alpha details after {max_poll_retries} attempts: {str(e)}", "ERROR")
                         raise
-            
-            return alpha_response.json()
+
+            raise RuntimeError(f"Could not fetch alpha {alpha_id} after {max_poll_retries} attempts")
             
         except Exception as e:
             self.log(f"❌ Failed to create simulation: {str(e)}", "ERROR")
@@ -973,21 +2086,207 @@ class BrainApiClient:
         finally:
             self._create_simulation_semaphore.release()
     
-    async def get_alpha_details(self, alpha_id: str) -> Dict[str, Any]:
-        """Get detailed information about an alpha."""
-        await self.ensure_authenticated()
-        
+    # --- Simulation ledger -------------------------------------------------- #
+    #
+    # Every backtest this server runs is recorded locally. Two things fall out:
+    # an identical request never has to be paid for twice (a simulation costs
+    # minutes and platform quota, and the same expression on the same settings
+    # produces the same alpha), and the account's own research history becomes
+    # queryable without paging /users/self/alphas.
+
+    @staticmethod
+    def _simulation_fingerprint(payload: Dict[str, Any]) -> str:
+        """Stable hash of a simulation request (type + settings + expression)."""
+        return hashlib.sha1(
+            json.dumps(payload, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        ).hexdigest()
+
+    def _ledger_path(self) -> Path:
+        return self.store.root / 'simulations' / 'ledger.jsonl'
+
+    async def _ledger_lookup(self, fingerprint: str) -> Optional[Dict[str, Any]]:
+        entry = await self.store.get('simulation', fingerprint)
+        return entry if isinstance(entry, dict) else None
+
+    async def _ledger_record(self, fingerprint: str, payload: Dict[str, Any],
+                             alpha: Dict[str, Any]) -> None:
+        """Persist one simulation, keyed by request and appended to the ledger."""
+        settings = payload.get('settings') or {}
+        is_block = alpha.get('is') or {}
+        row = {
+            'fingerprint': fingerprint,
+            'alpha_id': alpha.get('id'),
+            'type': payload.get('type'),
+            'expression': payload.get('regular') or payload.get('combo'),
+            'selection': payload.get('selection'),
+            'settings': settings,
+            'region': settings.get('region'),
+            'universe': settings.get('universe'),
+            'delay': settings.get('delay'),
+            'neutralization': settings.get('neutralization'),
+            'metrics': {k: is_block.get(k) for k in
+                        ('sharpe', 'fitness', 'turnover', 'returns', 'margin', 'drawdown',
+                         'longCount', 'shortCount')},
+            'simulated_at': time.time(),
+        }
         try:
-            response = await self._request('GET', f"{self.base_url}/alphas/{alpha_id}")
-            response.raise_for_status()
-            return response.json()
+            await self.store.put('simulation', fingerprint, row)
+            path = self._ledger_path()
+
+            def _append():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with open(path, 'a', encoding='utf-8') as fh:
+                    fh.write(json.dumps(row, ensure_ascii=False) + '\n')
+
+            await asyncio.to_thread(_append)
+        except Exception as e:
+            self.log(f"[ledger] Failed to record simulation {alpha.get('id')}: {e}", "WARNING")
+
+    async def read_simulation_ledger(self) -> List[Dict[str, Any]]:
+        """All recorded simulations, newest first (append-only JSONL)."""
+        path = self._ledger_path()
+
+        def _read() -> List[Dict[str, Any]]:
+            if not path.exists():
+                return []
+            rows = []
+            with open(path, encoding='utf-8') as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rows.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+            rows.sort(key=lambda r: r.get('simulated_at') or 0, reverse=True)
+            return rows
+
+        return await asyncio.to_thread(_read)
+
+    async def _cached_get(
+        self,
+        url: str,
+        *,
+        namespace: str,
+        key: str,
+        params: Optional[Dict[str, Any]] = None,
+        permanent: bool = False,
+        max_age: Optional[float] = None,
+        redis_ttl: Optional[int] = None,
+        force_refresh: bool = False,
+        op_name: Optional[str] = None,
+    ) -> Any:
+        """GET a resource through the cache tiers, with retries and 429 handling.
+
+        ``permanent`` routes the payload to the on-disk store (optionally with a
+        ``max_age`` freshness window); otherwise it lands in Redis under
+        ``redis_ttl``. Empty payloads are never stored — several BRAIN endpoints
+        answer 200 with an empty body while they materialise a resource, and
+        caching that would make the emptiness stick.
+        """
+        if not force_refresh:
+            if permanent:
+                envelope = await self.store.get_envelope(namespace, key)
+                if envelope and envelope.get('payload'):
+                    age = time.time() - (envelope.get('fetched_at') or 0)
+                    if max_age is None or age <= max_age:
+                        return envelope['payload']
+            else:
+                cached = self._get_cached_data(f"{namespace}:{key}")
+                if cached:
+                    return cached.get('payload') if isinstance(cached, dict) and set(cached) == {'payload'} else cached
+
+        data = await self._request_json_with_retries(
+            'GET', url, params=params, op_name=op_name or f"{namespace}({key})",
+        )
+        if data:
+            if permanent:
+                await self.store.put(namespace, key, data)
+            elif redis_ttl:
+                payload = data if isinstance(data, dict) else {'payload': data}
+                self._set_cached_data(f"{namespace}:{key}", payload, ttl=redis_ttl)
+        return data
+
+    async def _store_get_with_params(
+        self, namespace: str, key: str, key_params: Dict[str, Any]
+    ) -> Optional[Any]:
+        """Read a stored catalogue, backfilling its parameter metadata if missing.
+
+        Entries migrated out of Redis carry only the hashed key, so the refresh
+        tool cannot tell what to refetch for them. The parameters are known here,
+        so the first read after a migration rewrites the entry with them and the
+        entry becomes refreshable from then on.
+        """
+        envelope = await self.store.get_envelope(namespace, key)
+        if not envelope:
+            return None
+        payload = envelope.get('payload')
+        if not envelope.get('key_params') and payload:
+            await self.store.put(namespace, key, payload, key_params=key_params)
+        return payload
+
+    @staticmethod
+    def _is_frozen_alpha(details: Dict[str, Any]) -> bool:
+        """True once an alpha is submitted: its record no longer changes."""
+        if not isinstance(details, dict):
+            return False
+        return details.get('stage') == 'OS' or bool(details.get('dateSubmitted'))
+
+    async def get_alpha_details(self, alpha_id: str, force_refresh: bool = False) -> Dict[str, Any]:
+        """Get detailed information about an alpha.
+
+        /alphas/{id} is metered at 2000 requests/hour and the bulk paths
+        (diversity scoring, candidate-pool sync, correlation setup) re-read the
+        same records repeatedly.
+
+        A submitted (OS) alpha goes to the permanent on-disk store, but is served
+        from it only while younger than ``BRAIN_ALPHA_DETAILS_MAX_AGE`` (default
+        7 days): the expression, settings and IS metrics are frozen, yet the `os`
+        block keeps accruing out-of-sample performance. An IS alpha is still
+        editable, so it only gets a short Redis TTL that de-duplicates reads
+        inside one workflow. Pass ``force_refresh`` to bypass both.
+        """
+        await self.ensure_authenticated()
+
+        redis_key = f"alpha_details:{alpha_id}"
+        if not force_refresh:
+            envelope = await self.store.get_envelope('alpha_details', alpha_id)
+            if envelope and envelope.get('payload'):
+                age = time.time() - (envelope.get('fetched_at') or 0)
+                if not self._alpha_details_max_age or age <= self._alpha_details_max_age:
+                    return envelope['payload']
+            else:
+                cached = self._get_cached_data(redis_key)
+                if cached:
+                    return cached
+
+        try:
+            response = await self._request_json_with_retries(
+                'GET',
+                f"{self.base_url}/alphas/{alpha_id}",
+                op_name=f"get_alpha_details({alpha_id})",
+            )
+            if response:
+                if self._is_frozen_alpha(response):
+                    await self.store.put('alpha_details', alpha_id, response)
+                    # Drop any short-lived Redis copy so there is one source of truth.
+                    if self.redis_client:
+                        try:
+                            self.redis_client.delete(redis_key)
+                        except Exception:
+                            pass
+                elif self._alpha_details_is_ttl:
+                    self._set_cached_data(redis_key, response, ttl=self._alpha_details_is_ttl)
+            return response
         except Exception as e:
             self.log(f"Failed to get alpha details: {str(e)}", "ERROR")
             raise
     
     async def get_datasets(self, category: Optional[str] = None, region: str = "USA",
-                          delay: int = 1, universe: str = "TOP3000", theme: str = "false", search: Optional[str] = None) -> Dict[str, Any]:
-        """Get available datasets with Redis caching (1 day TTL) and fetch all data at once."""
+                          delay: int = 1, universe: str = "TOP3000", theme: str = "false",
+                          search: Optional[str] = None, force_refresh: bool = False) -> Dict[str, Any]:
+        """Get available datasets, stored permanently on disk after the first fetch."""
         await self.ensure_authenticated()
         
         try:
@@ -1000,9 +2299,10 @@ class BrainApiClient:
                 'theme': theme
             }
             cache_key = self._generate_cache_key('datasets', cache_params)
-            
-            # Try to get from cache
-            cached_data = self._get_cached_data(cache_key)
+
+            # Permanent on-disk record; refreshed on demand via sync_platform_cache.
+            cached_data = None if force_refresh else await self._store_get_with_params(
+                'datasets', cache_key, cache_params)
             if cached_data:
                 # Apply search filter if needed
                 if search:
@@ -1062,12 +2362,11 @@ class BrainApiClient:
                 'from_cache': False
             }
             
-            # Cache the complete data (1 week TTL). Never cache empty result
-            # sets: newly launched regions (e.g. GBR) can transiently return
-            # count=0 from /data-sets while the platform index catches up, and
-            # caching that makes the emptiness sticky for the whole TTL.
+            # Never store empty result sets: newly launched regions (e.g. GBR) can
+            # transiently return count=0 from /data-sets while the platform index
+            # catches up, and a permanent record of that would be sticky forever.
             if all_results:
-                self._set_cached_data(cache_key, complete_data, ttl=604800)
+                await self.store.put('datasets', cache_key, complete_data, key_params=cache_params)
 
             # Apply search filter if needed
             if search:
@@ -1088,8 +2387,9 @@ class BrainApiClient:
                             delay: int = 1, universe: str = "TOP3000", theme: str = "false",
                             dataset_id: Optional[str] = None, data_type: str = "",
                             search: Optional[str] = None,
-                            filter_sharpe: bool = True) -> Dict[str, Any]:
-        """Get available data fields with Redis caching (1 day TTL) and fetch all data at once.
+                            filter_sharpe: bool = True,
+                            force_refresh: bool = False) -> Dict[str, Any]:
+        """Get available data fields, stored permanently on disk after the first fetch.
         
         Search supports fuzzy matching across multiple fields:
         - Searches in: name, description, dataset.name, dataset.vendor, id
@@ -1106,15 +2406,60 @@ class BrainApiClient:
         - search="stock volume" -> matches fields containing both "stock" AND "volume"
         """
         await self.ensure_authenticated()
-        
-        # Redis-based distributed lock for concurrency control (limit to 1)
-        lock_key = "lock:get_datafields"
+
+        # Cache key is derived from the request parameters only (``search`` and
+        # ``filter_sharpe`` are applied to the cached rows), so it can be
+        # computed before anything else and used to skip the lock entirely.
+        cache_params = {
+            'instrumentType': instrument_type,
+            'region': region,
+            'delay': delay,
+            'universe': universe,
+            'theme': theme,
+            'dataset_id': dataset_id,
+            'data_type': data_type,
+        }
+        # A dataset-scoped query is the one shape the API serves completely, so
+        # it gets its own complete, permanently stored catalogue.
+        if dataset_id:
+            block = await self.get_dataset_fields(
+                dataset_id, instrument_type, region, delay, universe, force_refresh=force_refresh)
+            rows = block.get('results') or []
+            if data_type and data_type != 'ALL':
+                rows = [f for f in rows if f.get('type') == data_type]
+            out = {'results': rows, 'count': len(rows), 'from_cache': not force_refresh,
+                   'dataset_id': dataset_id, 'declared_count': block.get('declared_count'),
+                   'complete': block.get('complete')}
+            if search:
+                out['results'] = [f for f in rows if _dataset_field_matches(f, search)]
+                out['count'] = len(out['results'])
+            if filter_sharpe:
+                filtered, removed, applied = self._sharpe_filter_rows(out['results'], region, delay)
+                out['results'] = filtered
+                out['count'] = len(filtered)
+                out['sharpe_filter_applied'] = applied
+                out['sharpe_filter_removed'] = removed
+            return out
+
+        cache_key = self._generate_cache_key('datafields', cache_params)
+        # Permanent on-disk record. A full USA/TOP3000 catalogue is 10 000 rows /
+        # 5.3 MB of JSON that compresses to 226 KB (4.3%), and reading it back
+        # from disk is cheaper than a Redis GET of the raw string — so it is kept
+        # forever and refreshed only on demand via sync_platform_cache.
+        precheck = None if force_refresh else await self._store_get_with_params(
+            'datafields', cache_key, cache_params)
+
+        # Redis-based distributed lock, taken ONLY on a store miss: /data-fields
+        # is metered at 1 req/s and a full sweep is ~200 pages, so one sweep must
+        # not fan out — but a hit has no business queueing behind it. The key is
+        # per parameter set so unrelated regions never block each other.
+        lock_key = f"lock:get_datafields:{cache_key.split(':', 1)[-1]}"
         lock_acquired = False
-        lock_timeout = 300  # Lock expires after 5 minutes to prevent deadlock
+        lock_timeout = 900  # Lock expires to prevent deadlock
         max_wait_time = 600  # Maximum wait time for acquiring lock (10 minutes)
         wait_interval = 2  # Check every 2 seconds
-        
-        if self.redis_client:
+
+        if self.redis_client and precheck is None:
             start_wait = time.time()
             while time.time() - start_wait < max_wait_time:
                 try:
@@ -1177,18 +2522,6 @@ class BrainApiClient:
                 # Check if ALL keywords match (AND logic)
                 return all(keyword in combined_text for keyword in keywords)
             
-            # Generate cache key from parameters (excluding search for cache key)
-            cache_params = {
-                'instrumentType': instrument_type,
-                'region': region,
-                'delay': delay,
-                'universe': universe,
-                'theme': theme,
-                'dataset_id': dataset_id,
-                'data_type': data_type
-            }
-            cache_key = self._generate_cache_key('datafields', cache_params)
-            
             def sharpe_filter(items: list, rgn: str, dly: int) -> tuple:
                 """Filter out datafields with OS/IS sharpe < 0. Returns (filtered_items, removed_count, applied)."""
                 if not self._isos_data:
@@ -1219,9 +2552,14 @@ class BrainApiClient:
                     filtered.append(item)
                 return filtered, len(items) - len(filtered), True
 
-            # Try to get from cache
-            cached_data = self._get_cached_data(cache_key)
+            # Double-checked: another waiter may have filled the store while we
+            # queued for the lock, which turns a 200-page sweep into zero calls.
+            cached_data = precheck if precheck is not None else (
+                None if force_refresh
+                else await self._store_get_with_params('datafields', cache_key, cache_params)
+            )
             if cached_data:
+                _annotate_catalogue_completeness(cached_data)
                 result = {**cached_data, 'from_cache': True}
                 results = result.get('results', [])
                 # Apply fuzzy search filter if needed
@@ -1266,8 +2604,9 @@ class BrainApiClient:
                 )
                 
                 results = data.get('results', [])
-                # 等待2秒
-                await asyncio.sleep(2)
+                # Pacing is handled by self.rate_limiter, which learns the real
+                # quota (currently 1/s + 30/min on this endpoint) from response
+                # headers instead of guessing with a fixed sleep.
                 all_results.extend(results)
                 
                 if total_count is None:
@@ -1286,11 +2625,18 @@ class BrainApiClient:
                 'extraNote': "if your returned result is 0, you may want to check your parameter by using get_platform_setting_options tool to got correct parameter. Search supports fuzzy matching with multiple keywords (space-separated, AND logic).",
                 'from_cache': False
             }
+            # The unfiltered window is hard-capped: `count` saturates at 10000 and
+            # offset=10000 is rejected with "Invalid offset. Please use filters to
+            # narrow down the result." For USA/TOP3000 the datasets declare 91076
+            # fields, so a sweep reaches 11% of them and 267 datasets come back
+            # empty -- with nothing in the payload to say so. Say so.
+            _annotate_catalogue_completeness(complete_data)
             
-            # Cache the complete data (1 week TTL). Never cache empty result
-            # sets (new-region index lag would otherwise stick for the TTL).
+            # Never store empty result sets: newly launched regions can transiently
+            # return count=0 while the platform index catches up, and a permanent
+            # record of that emptiness would be far worse than a TTL'd one.
             if all_results:
-                self._set_cached_data(cache_key, complete_data, ttl=604800)
+                await self.store.put('datafields', cache_key, complete_data, key_params=cache_params)
 
             # Apply fuzzy search filter if needed
             if search:
@@ -1325,25 +2671,703 @@ class BrainApiClient:
                 except Exception as e:
                     self.log(f"Failed to release Redis lock: {str(e)}", "WARNING")
     
-    async def get_alpha_pnl(self, alpha_id: str) -> Dict[str, Any]:
-        """Get PnL data for an alpha with retry logic."""
+    def _sharpe_filter_rows(self, items: list, region: str, delay: int) -> tuple:
+        """Drop datafields whose OS/IS Sharpe is negative. Returns
+        (kept, removed_count, applied)."""
+        if not self._isos_data:
+            return items, 0, False
+        isos = (self._isos_data.get(f"{region}_{delay}") or {}).get('isos', {})
+        field_sharpe = isos.get('datafield', {})
+        dataset_sharpe = isos.get('dataset', {})
+        if not field_sharpe and not dataset_sharpe:
+            return items, 0, False
+        kept = []
+        for item in items:
+            name = item.get('id', '') or item.get('name', '')
+            ds = item.get('dataset', {})
+            ds_id = ds.get('id', '') if isinstance(ds, dict) else ''
+            stats = field_sharpe.get(name)
+            if stats is not None:
+                sr = stats.get('sharpe_ratio')
+                if sr is not None and sr < 0:
+                    continue
+            if stats is None and ds_id:
+                ds_stats = dataset_sharpe.get(ds_id)
+                if ds_stats is not None:
+                    sr = ds_stats.get('sharpe_ratio')
+                    if sr is not None and sr < 0:
+                        continue
+            kept.append(item)
+        return kept, len(items) - len(kept), True
+
+    def _df_config_key(self, instrument_type: str, region: str, delay: Union[int, str],
+                       universe: str) -> str:
+        return f"{instrument_type}:{region}:{universe}:{delay}"
+
+    async def get_dataset_fields(
+        self,
+        dataset_id: str,
+        instrument_type: str = "EQUITY",
+        region: str = "USA",
+        delay: int = 1,
+        universe: str = "TOP3000",
+        force_refresh: bool = False,
+    ) -> Dict[str, Any]:
+        """Every datafield of ONE dataset, paged to completion and stored forever.
+
+        This is the only way to see the whole catalogue. A global /data-fields
+        sweep is hard-capped: `count` saturates at 10000 and `offset=10000` is
+        rejected with ["Invalid offset. Please use filters to narrow down the
+        result."]. For USA/TOP3000 the datasets declare 91076 fields in total, so
+        an unfiltered sweep reaches 11% of them and 267 datasets come back with
+        nothing at all — silently. Filtering by dataset.id lifts the cap
+        (dataset.id=pv87 returns its full 6666), which makes the dataset the
+        right unit to fetch and cache.
+        """
         await self.ensure_authenticated()
-        
+        cfg = self._df_config_key(instrument_type, region, delay, universe)
+        key = f"{cfg}:{dataset_id}"
+
+        if not force_refresh:
+            stored = await self.store.get('datafields_ds', key)
+            if stored:
+                return stored
+
+        all_results: List[Dict[str, Any]] = []
+        offset, page_size, total = 0, 50, None
+        while True:
+            data = await self._request_json_with_retries(
+                'GET', f"{self.base_url}/data-fields",
+                params={'instrumentType': instrument_type, 'region': region, 'delay': delay,
+                        'universe': universe, 'dataset.id': dataset_id,
+                        'limit': page_size, 'offset': offset},
+                op_name=f"get_dataset_fields({dataset_id}@{offset})",
+            )
+            results = data.get('results') or []
+            if total is None:
+                total = data.get('count')
+            all_results.extend(results)
+            if len(results) < page_size or (total and len(all_results) >= total):
+                break
+            offset += page_size
+            if offset >= _DATAFIELDS_WINDOW_CAP:
+                # Same cap applies within a dataset; nothing more is reachable.
+                self.log(f"[catalogue] {dataset_id} exceeds the 10000-row window at "
+                         f"{len(all_results)} fields", "WARNING")
+                break
+
+        payload = {
+            'dataset_id': dataset_id,
+            'results': all_results,
+            'count': len(all_results),
+            'declared_count': total,
+            'complete': total is None or len(all_results) >= total,
+        }
+        # Store a definitive empty answer too (the server said count=0), otherwise
+        # every resume re-asks about datasets that have no fields in this
+        # configuration. A blank body with no count is NOT definitive and is left
+        # unstored so it gets retried.
+        if all_results or total == 0:
+            await self.store.put('datafields_ds', key, payload,
+                                 key_params={'instrumentType': instrument_type, 'region': region,
+                                             'delay': delay, 'universe': universe,
+                                             'dataset_id': dataset_id})
+        return payload
+
+    async def build_full_datafield_catalogue(
+        self,
+        instrument_type: str = "EQUITY",
+        region: str = "USA",
+        delay: int = 1,
+        universe: str = "TOP3000",
+        force_refresh: bool = False,
+        progress: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Assemble the COMPLETE datafield catalogue, dataset by dataset.
+
+        Resumable: datasets already stored are skipped unless force_refresh.
+        """
+        datasets = await self.get_datasets(None, region, delay, universe, 'false', None)
+        drows = [x for x in (datasets.get('results') or []) if isinstance(x, dict)]
+        cfg = self._df_config_key(instrument_type, region, delay, universe)
+
+        merged: List[Dict[str, Any]] = []
+        seen: set = set()
+        per_dataset: Dict[str, Any] = {}
+        incomplete: List[str] = []
+        fetched_rows = 0
+        shared_ids: List[str] = []
+
+        for i, ds in enumerate(drows, 1):
+            dsid = ds.get('id')
+            if not dsid:
+                continue
+            try:
+                block = await self.get_dataset_fields(
+                    dsid, instrument_type, region, delay, universe, force_refresh=force_refresh)
+            except Exception as e:
+                self.log(f"[catalogue] {dsid} failed: {e}", "WARNING")
+                per_dataset[dsid] = {'error': str(e)}
+                continue
+            rows = block.get('results') or []
+            fetched_rows += len(rows)
+            for f in rows:
+                fid = f.get('id')
+                if not fid:
+                    continue
+                if fid in seen:
+                    shared_ids.append(fid)
+                    continue
+                seen.add(fid)
+                merged.append(f)
+            per_dataset[dsid] = {'fields': len(rows), 'declared': ds.get('fieldCount'),
+                                 'complete': block.get('complete')}
+            if (ds.get('fieldCount') or 0) > len(rows):
+                incomplete.append(dsid)
+            if progress and i % 10 == 0:
+                self.log(f"[catalogue] {i}/{len(drows)} datasets, {len(merged)} fields", "INFO")
+
+        declared_total = sum(x.get('fieldCount') or 0 for x in drows)
+        complete_payload = {
+            'results': merged,
+            'count': len(merged),
+            'fetched_rows': fetched_rows,
+            'declared_total': declared_total,
+            'coverage': round(fetched_rows / declared_total, 4) if declared_total else None,
+            'datasets': len(drows),
+            'incomplete_datasets': incomplete,
+            'fields_in_two_datasets': sorted(set(shared_ids)),
+            'built_via': 'per-dataset sweep (bypasses the 10000-row global cap)',
+            'from_cache': False,
+        }
+        # Write it to the same key the normal reads use, so every existing caller
+        # transparently gets the complete catalogue from here on.
+        cache_params = {'instrumentType': instrument_type, 'region': region, 'delay': delay,
+                        'universe': universe, 'theme': 'false', 'dataset_id': None, 'data_type': ''}
+        await self.store.put('datafields', self._generate_cache_key('datafields', cache_params),
+                             complete_payload, key_params=cache_params)
+        return complete_payload
+
+    # --- Alpha corpus sync (background) ------------------------------------- #
+
+    ALPHA_SYNC_CURSOR = 'alpha_sync_cursor'
+
+    def _alpha_sync_snapshot(self) -> Dict[str, Any]:
+        snap = dict(self._alpha_sync_state)
+        task = self._alpha_sync_task
+        snap['running'] = bool(task and not task.done())
+        # Progress lives in the process; the corpus and cursor live on disk. After
+        # a restart there is no in-flight sync, which is 'idle' — not an absent
+        # status that reads like something went wrong.
+        snap.setdefault('status', 'idle')
+        started = snap.get('started_at')
+        if started:
+            elapsed = time.time() - started
+            snap['elapsed_seconds'] = round(elapsed, 1)
+            fetched = snap.get('fetched') or 0
+            if fetched and elapsed > 0:
+                snap['alphas_per_minute'] = round(fetched / elapsed * 60, 1)
+        return snap
+
+    async def start_alpha_sync(self, since: str = '2026-01-01',
+                               restart: bool = False) -> Dict[str, Any]:
+        """Begin mirroring the account's alphas into the local corpus."""
+        if self._alpha_sync_task and not self._alpha_sync_task.done():
+            return {'started': False, 'reason': 'already running', **self._alpha_sync_snapshot()}
+        await self.alpha_store.ensure_ready()
+        if restart:
+            await self.alpha_store.set_state(self.ALPHA_SYNC_CURSOR, '')
+        self._alpha_sync_state = {
+            'started_at': time.time(), 'since': since, 'fetched': 0, 'stored': 0,
+            'pages': 0, 'cursor': None, 'status': 'starting',
+        }
+        self._alpha_sync_task = asyncio.create_task(self._run_alpha_sync(since))
+        return {'started': True, **self._alpha_sync_snapshot()}
+
+    async def _run_alpha_sync(self, since: str) -> None:
+        """Cursor-paginate the whole alpha history into SQLite.
+
+        offset cannot be used: the platform rejects offset>=1000 outright with
+        "Cannot display more than the first 1,000 alphas. Apply filters to narrow
+        results and see more." So the sweep walks forward on dateCreated instead,
+        taking up to 1000 rows per cursor position.
+
+        dateCreated has one-second resolution and up to 8 alphas can share a
+        second, so each new cursor is set one second BEFORE the batch maximum and
+        the overlap is absorbed by the primary key. Without that rewind the rows
+        sharing the boundary second would be skipped silently.
+        """
+        st = self._alpha_sync_state
+        store = self.alpha_store
+        try:
+            st['status'] = 'running'
+            cursor = await store.get_state(self.ALPHA_SYNC_CURSOR)
+            if not cursor:
+                cursor = AlphaStore._utc(self._normalize_brain_datetime(since)) \
+                    or self._normalize_brain_datetime(since)
+            st['cursor'] = cursor
+
+            page_size = 100
+            max_offset = 1000  # platform hard limit for this endpoint
+            stall_guard = 0
+
+            async def page(off: int) -> List[Dict[str, Any]]:
+                data = await self._request_json_with_retries(
+                    'GET', f"{self.base_url}/users/self/alphas",
+                    params={'dateCreated>': cursor, 'order': 'dateCreated',
+                            'limit': page_size, 'offset': off},
+                    op_name=f"alpha_sync(cursor={cursor[:19]},offset={off})",
+                )
+                st['pages'] += 1
+                return data.get('results') or []
+
+            while True:
+                # Each page costs ~5s of server time but the family allows 27
+                # requests/minute, so fetching one page at a time leaves most of
+                # the budget unused (measured: 9 req/min sequential). The offsets
+                # inside one cursor window are independent, so they go out
+                # together and the rate limiter — not latency — sets the pace.
+                first = await page(0)
+                batch: List[Dict[str, Any]] = list(first)
+                if len(first) == page_size:
+                    rest = await asyncio.gather(
+                        *[page(off) for off in range(page_size, max_offset, page_size)])
+                    for rows in rest:
+                        batch.extend(rows)
+
+                if not batch:
+                    st['status'] = 'complete'
+                    break
+
+                stored = await store.upsert_many(batch)
+                st['fetched'] += len(batch)
+                st['stored'] += stored
+
+                # Compare in UTC: raw values carry local offsets and text order
+                # would not match chronological order.
+                stamps = [AlphaStore._utc(a.get('dateCreated')) for a in batch]
+                stamps = [s for s in stamps if s]
+                if not stamps:
+                    st['status'] = 'error'
+                    st['error'] = 'batch had no dateCreated values'
+                    break
+                newest = max(stamps)
+                next_cursor = self._rewind_one_second(newest)
+                if next_cursor <= cursor:
+                    # Guard against a cursor that cannot advance (would spin).
+                    stall_guard += 1
+                    if stall_guard > 3:
+                        st['status'] = 'error'
+                        st['error'] = f'cursor stalled at {cursor}'
+                        break
+                    next_cursor = self._advance_one_second(cursor)
+                else:
+                    stall_guard = 0
+
+                cursor = next_cursor
+                st['cursor'] = cursor
+                await store.set_state(self.ALPHA_SYNC_CURSOR, cursor)
+
+                if st['fetched'] % 5000 < len(batch):
+                    self.log(f"[alpha-sync] {st['fetched']} alphas, cursor {cursor[:19]}", "INFO")
+
+                if len(batch) < max_offset:
+                    # The window was not saturated, so we have caught up to now.
+                    st['status'] = 'complete'
+                    break
+
+            if st['status'] == 'complete':
+                self.log("[alpha-sync] Rebuilding expression index...", "INFO")
+                await store.rebuild_fts()
+                st['status'] = 'indexing'
+                try:
+                    operators = await self.get_operators()
+                    op_names = [o.get('name') or o.get('id') for o in (operators or [])
+                                if isinstance(o, dict)]
+                    field_names = await self._known_field_names()
+                    st['token_index'] = await store.build_token_index(op_names, field_names)
+                except Exception as e:
+                    self.log(f"[alpha-sync] Token index failed: {e}", "WARNING")
+                    st['token_index'] = {'error': str(e)}
+                st['status'] = 'complete'
+                st['stats'] = await store.stats()
+                self.log(f"[alpha-sync] Done: {st['fetched']} alphas", "INFO")
+        except asyncio.CancelledError:
+            st['status'] = 'stopped'
+            self.log("[alpha-sync] Stopped; cursor is saved and will resume.", "INFO")
+            raise
+        except Exception as e:
+            st['status'] = 'error'
+            st['error'] = str(e)
+            self.log(f"[alpha-sync] Failed: {e}", "ERROR")
+
+    async def _token_vocabulary(self) -> Dict[str, set]:
+        """Cached {operators, fields} name sets for expression tokenisation."""
+        if self._token_vocab and time.time() - self._token_vocab_at < self._token_vocab_ttl:
+            return self._token_vocab
+        try:
+            ops = await self.get_operators()
+            op_set = {(o.get('name') or o.get('id') or '').lower()
+                      for o in (ops or []) if isinstance(o, dict)}
+            op_set.discard('')
+            field_set = {n.lower() for n in await self._known_field_names()}
+        except Exception as e:
+            self.log(f"[corpus] Could not load token vocabulary: {e}", "WARNING")
+            return self._token_vocab or {'operators': set(), 'fields': set()}
+        self._token_vocab = {'operators': op_set, 'fields': field_set}
+        self._token_vocab_at = time.time()
+        return self._token_vocab
+
+    async def record_alpha_locally(self, alpha: Dict[str, Any]) -> None:
+        """Put a freshly produced alpha into the searchable corpus immediately.
+
+        A backtest run through this server already holds the full record, so
+        writing it locally costs no platform request — and without it the alpha
+        stays invisible to analyze_my_research until the next sync, which is
+        exactly when you most want to ask "have I tried this".
+        """
+        if not isinstance(alpha, dict) or not alpha.get('id'):
+            return
+        try:
+            vocab = await self._token_vocabulary()
+            await self.alpha_store.upsert_many(
+                [alpha], index=True,
+                op_set=vocab['operators'], field_set=vocab['fields'])
+        except Exception as e:
+            self.log(f"[corpus] Failed to record alpha {alpha.get('id')}: {e}", "WARNING")
+
+    async def _known_field_names(self) -> List[str]:
+        """Every datafield id in the local catalogues, across all configurations.
+
+        Used to classify expression tokens. Reading the stored catalogues costs
+        nothing; there is no need to ask the platform what its fields are called.
+        """
+        names: set = set()
+        try:
+            for entry in await self.store.list_entries('datafields_ds'):
+                payload = await self.store.get('datafields_ds', entry.get('key'))
+                for f in ((payload or {}).get('results') or []):
+                    fid = f.get('id')
+                    if fid:
+                        names.add(fid)
+            if not names:
+                for entry in await self.store.list_entries('datafields'):
+                    payload = await self.store.get('datafields', entry.get('key'))
+                    for f in ((payload or {}).get('results') or []):
+                        fid = f.get('id')
+                        if fid:
+                            names.add(fid)
+        except Exception as e:
+            self.log(f"[alpha-sync] Could not read field catalogues: {e}", "WARNING")
+        return sorted(names)
+
+    @staticmethod
+    def _rewind_one_second(value: str) -> str:
+        return BrainApiClient._shift_seconds(value, -1)
+
+    @staticmethod
+    def _advance_one_second(value: str) -> str:
+        return BrainApiClient._shift_seconds(value, +1)
+
+    @staticmethod
+    def _shift_seconds(value: str, delta: int) -> str:
+        """Shift an ISO 8601 timestamp and return it normalised to UTC.
+
+        Normalising is not cosmetic. The cursor is compared as a string to decide
+        whether the sweep advanced, and the platform answers with local offsets
+        ("2026-08-14T22:49:42-04:00") while the cursor starts as UTC
+        ("2026-08-15T00:00:00Z"). Comparing those as text says 08-14 < 08-15 and
+        the sweep concludes it went backwards — which silently degraded it into
+        advancing one second per batch, i.e. 86400 batches for a single day.
+        """
+        try:
+            dt = datetime.fromisoformat(value)
+        except (ValueError, TypeError):
+            return value
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        shifted = (dt + timedelta(seconds=delta)).astimezone(timezone.utc)
+        return shifted.isoformat().replace('+00:00', 'Z')
+
+    async def stop_alpha_sync(self) -> Dict[str, Any]:
+        task = self._alpha_sync_task
+        if not task or task.done():
+            return {'stopped': False, 'reason': 'not running', **self._alpha_sync_snapshot()}
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+        return {'stopped': True, **self._alpha_sync_snapshot()}
+
+    # --- Full catalogue build (background) ---------------------------------- #
+
+    @staticmethod
+    def _configs_in_use() -> List[Dict[str, Any]]:
+        """Market configurations this account actually researches.
+
+        Derived from the OS PnL pool filenames, which are written per
+        instrument/region/universe/delay as self-correlation runs — a far better
+        signal of what matters than the full cross product of platform options.
+        """
+        configs = []
+        seen = set()
+        for path in sorted(Path(__file__).parent.joinpath('downloads').glob('os_pnl_pool_*.pkl')):
+            stem = path.stem  # os_pnl_pool_equity_usa_top3000_delay1
+            parts = stem.split('_')
+            if len(parts) < 6 or parts[:3] != ['os', 'pnl', 'pool']:
+                continue
+            if not parts[-1].startswith('delay'):
+                continue
+            try:
+                delay = int(parts[-1][len('delay'):])
+            except ValueError:
+                continue
+            instrument = parts[3].upper()
+            region = parts[4].upper()
+            universe = '_'.join(parts[5:-1]).upper()
+            if not universe:
+                continue
+            key = (instrument, region, universe, delay)
+            if key in seen:
+                continue
+            seen.add(key)
+            configs.append({'instrumentType': instrument, 'region': region,
+                            'universe': universe, 'delay': delay})
+        return configs
+
+    def _catalogue_snapshot(self) -> Dict[str, Any]:
+        snap = dict(self._catalogue_state)
+        task = self._catalogue_task
+        snap['running'] = bool(task and not task.done())
+        started = snap.get('started_at')
+        if started:
+            snap['elapsed_seconds'] = round(time.time() - started, 1)
+        done = snap.get('fields_done') or 0
+        declared = snap.get('fields_declared') or 0
+        if declared:
+            snap['coverage'] = round(done / declared, 4)
+            rate = done / max(1.0, snap.get('elapsed_seconds') or 1.0)
+            if rate > 0:
+                snap['eta_minutes'] = round((declared - done) / rate / 60.0, 1)
+        return snap
+
+    async def start_catalogue_build(self, configs: Optional[List[Dict[str, Any]]] = None,
+                                    mode: str = 'dedup') -> Dict[str, Any]:
+        """Kick off the complete per-dataset catalogue build in the background."""
+        if self._catalogue_task and not self._catalogue_task.done():
+            return {'started': False, 'reason': 'already running', **self._catalogue_snapshot()}
+
+        targets = configs or self._configs_in_use()
+        if not targets:
+            return {'started': False, 'reason': 'no market configurations found'}
+
+        self._catalogue_state = {
+            'started_at': time.time(),
+            'configs_total': len(targets),
+            'configs_done': 0,
+            'current': None,
+            'fields_done': 0,
+            'fields_declared': 0,
+            'datasets_done': 0,
+            'datasets_total': 0,
+            'per_config': {},
+            'status': 'starting',
+        }
+        self._catalogue_state['mode'] = mode
+        self._catalogue_task = asyncio.create_task(self._run_catalogue_build(targets, mode))
+        return {'started': True, 'mode': mode, 'configs': targets, **self._catalogue_snapshot()}
+
+    async def _run_catalogue_build(self, targets: List[Dict[str, Any]], mode: str = 'dedup') -> None:
+        st = self._catalogue_state
+        # Which field ids exist is a property of (region, delay) -- verified live:
+        # option4 returns the same 1298 ids for USA/TOP500 and USA/TOP3000, and
+        # every USA universe declares the same 345 datasets / 91076 fields. Only
+        # the per-field usage metrics (userCount, alphaCount, coverage) differ.
+        # In 'dedup' mode a configuration whose dataset list is identical to one
+        # already built reuses that catalogue instead of re-downloading it, which
+        # halves the work; the payload records which universe the metrics came from.
+        built_by_signature: Dict[Any, Dict[str, Any]] = {}
+        try:
+            st['status'] = 'running'
+            for cfg in targets:
+                label = f"{cfg['region']}/{cfg['universe']}/delay{cfg['delay']}"
+                st['current'] = label
+                try:
+                    datasets = await self.get_datasets(
+                        None, cfg['region'], cfg['delay'], cfg['universe'], 'false', None)
+                except Exception as e:
+                    st['per_config'][label] = {'error': f'dataset list failed: {e}'}
+                    st['configs_done'] += 1
+                    continue
+                drows = [x for x in (datasets.get('results') or []) if isinstance(x, dict) and x.get('id')]
+                declared = sum(x.get('fieldCount') or 0 for x in drows)
+
+                if not drows:
+                    # The platform serves no datasets for this configuration.
+                    st['per_config'][label] = {'datasets': 0, 'declared': 0, 'fields': 0,
+                                               'status': 'empty',
+                                               'note': 'platform returns no datasets for this configuration'}
+                    st['configs_done'] += 1
+                    continue
+
+                signature = (cfg['instrumentType'], cfg['region'], cfg['delay'],
+                             len(drows), declared, tuple(sorted(x['id'] for x in drows)))
+                prior = built_by_signature.get(signature)
+                if mode == 'dedup' and prior is not None:
+                    payload = dict(prior['payload'])
+                    payload['metrics_from_universe'] = prior['universe']
+                    payload['note'] = (
+                        f"Field set is identical to {cfg['region']}/{prior['universe']}; reused to "
+                        "avoid re-downloading it. The per-field userCount / alphaCount / coverage "
+                        f"in this payload are {prior['universe']}'s. Rebuild this configuration on "
+                        "its own if you need its real usage metrics."
+                    )
+                    cache_params = {'instrumentType': cfg['instrumentType'], 'region': cfg['region'],
+                                    'delay': cfg['delay'], 'universe': cfg['universe'],
+                                    'theme': 'false', 'dataset_id': None, 'data_type': ''}
+                    await self.store.put('datafields',
+                                         self._generate_cache_key('datafields', cache_params),
+                                         payload, key_params=cache_params)
+                    st['per_config'][label] = {
+                        'datasets': len(drows), 'declared': declared,
+                        'fields': payload.get('count'), 'status': 'reused',
+                        'reused_from': f"{cfg['region']}/{prior['universe']}",
+                        'coverage': payload.get('coverage'),
+                    }
+                    st['configs_done'] += 1
+                    self.log(f"[catalogue] {label} reused from {prior['universe']} "
+                             f"({payload.get('count')} fields, no download)", "INFO")
+                    continue
+
+                st['fields_declared'] += declared
+                st['datasets_total'] += len(drows)
+                st['per_config'][label] = {'datasets': len(drows), 'declared': declared,
+                                           'fields': 0, 'status': 'running'}
+
+                merged: List[Dict[str, Any]] = []
+                seen: set = set()
+                incomplete: List[str] = []
+                fetched_rows = 0
+                shared_ids: List[str] = []
+                for ds in drows:
+                    dsid = ds['id']
+                    try:
+                        block = await self.get_dataset_fields(
+                            dsid, cfg['instrumentType'], cfg['region'], cfg['delay'], cfg['universe'])
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        self.log(f"[catalogue] {label} {dsid} failed: {e}", "WARNING")
+                        incomplete.append(dsid)
+                        st['datasets_done'] += 1
+                        continue
+                    rows = block.get('results') or []
+                    fetched_rows += len(rows)
+                    for f in rows:
+                        fid = f.get('id')
+                        if not fid:
+                            continue
+                        if fid in seen:
+                            # The same field id can be published under two
+                            # datasets; that is not a duplicate download.
+                            shared_ids.append(fid)
+                            continue
+                        seen.add(fid)
+                        merged.append(f)
+                    if (ds.get('fieldCount') or 0) > len(rows):
+                        incomplete.append(dsid)
+                    st['datasets_done'] += 1
+                    st['fields_done'] += len(rows)
+                    st['per_config'][label]['fields'] = len(merged)
+
+                payload = {
+                    'results': merged,
+                    'count': len(merged),
+                    'fetched_rows': fetched_rows,
+                    'declared_total': declared,
+                    'coverage': round(fetched_rows / declared, 4) if declared else None,
+                    'datasets': len(drows),
+                    'incomplete_datasets': incomplete,
+                    'fields_in_two_datasets': sorted(set(shared_ids)),
+                    'built_via': 'per-dataset sweep (bypasses the 10000-row global cap)',
+                    'from_cache': False,
+                }
+                cache_params = {'instrumentType': cfg['instrumentType'], 'region': cfg['region'],
+                                'delay': cfg['delay'], 'universe': cfg['universe'],
+                                'theme': 'false', 'dataset_id': None, 'data_type': ''}
+                await self.store.put('datafields',
+                                     self._generate_cache_key('datafields', cache_params),
+                                     payload, key_params=cache_params)
+                built_by_signature[signature] = {'universe': cfg['universe'], 'payload': payload}
+                st['per_config'][label].update(
+                    {'status': 'done', 'fields': len(merged),
+                     'coverage': payload['coverage'], 'incomplete': len(incomplete)})
+                st['configs_done'] += 1
+                self.log(f"[catalogue] {label} complete: {len(merged)}/{declared} fields", "INFO")
+            st['status'] = 'complete'
+            st['current'] = None
+        except asyncio.CancelledError:
+            st['status'] = 'stopped'
+            self.log("[catalogue] Build stopped; progress is on disk and will resume.", "INFO")
+            raise
+        except Exception as e:
+            st['status'] = 'error'
+            st['error'] = str(e)
+            self.log(f"[catalogue] Build failed: {e}", "ERROR")
+
+    async def stop_catalogue_build(self) -> Dict[str, Any]:
+        task = self._catalogue_task
+        if not task or task.done():
+            return {'stopped': False, 'reason': 'not running', **self._catalogue_snapshot()}
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+        return {'stopped': True, **self._catalogue_snapshot()}
+
+    async def get_alpha_pnl(self, alpha_id: str, force_refresh: bool = False) -> Dict[str, Any]:
+        """Get PnL data for an alpha with retry logic.
+
+        A given alpha id's PnL never changes (a re-simulation produces a new id),
+        so the payload is stored permanently on disk. Mutual-correlation and
+        self-correlation runs re-request the same series for every candidate
+        comparison, which is the single largest repeated download against the
+        platform. ~100 KB of JSON compresses to ~30 KB per alpha.
+        """
+        await self.ensure_authenticated()
+
+        if not force_refresh:
+            stored = await self.store.get('alpha_pnl', alpha_id)
+            if stored:
+                return stored
+
         max_retries = 5
         retry_delay = 2  # seconds
-        
+
         for attempt in range(max_retries):
             try:
                 self.log(f"Attempting to get PnL for alpha {alpha_id} (attempt {attempt + 1}/{max_retries})", "INFO")
                 
                 response = await self._request('GET', f"{self.base_url}/alphas/{alpha_id}/recordsets/pnl")
+                if response.status_code in (429, 500, 502, 503, 504) and attempt < max_retries - 1:
+                    wait = self._retry_wait_seconds(response, attempt)
+                    self.log(f"PnL HTTP {response.status_code} for {alpha_id}, retrying in {wait:.1f}s", "WARNING")
+                    await asyncio.sleep(wait)
+                    continue
                 response.raise_for_status()
                 
                 text = (response.text or "").strip()
                 if not text:
                     if attempt < max_retries - 1:
-                        self.log(f"Empty PnL response for {alpha_id}, retrying in {retry_delay} seconds...", "WARNING")
-                        await asyncio.sleep(retry_delay)
+                        # BRAIN answers 200 + EMPTY BODY while it materialises the
+                        # recordset and states the wait in Retry-After (observed:
+                        # 1.0s). Honour it instead of a blind 2s that grows 1.5x —
+                        # every uncached PnL pays this wait exactly once.
+                        wait = self._recordset_retry_after(response, retry_delay)
+                        self.log(f"Empty PnL response for {alpha_id}, retrying in {wait:.1f}s...", "WARNING")
+                        await asyncio.sleep(wait)
                         retry_delay *= 1.5
                         continue
                     else:
@@ -1354,6 +3378,8 @@ class BrainApiClient:
                     pnl_data = response.json()
                     if pnl_data:
                         self.log(f"Successfully retrieved PnL data for alpha {alpha_id}", "SUCCESS")
+                        if isinstance(pnl_data, dict):
+                            await self.store.put('alpha_pnl', alpha_id, pnl_data)
                         return pnl_data
                     else:
                         if attempt < max_retries - 1:
@@ -1423,6 +3449,9 @@ class BrainApiClient:
         name: Optional[str] = None,
         tag: Optional[str] = None,
         language: Optional[str] = None,
+        min_sharpe: Optional[float] = None,
+        min_fitness: Optional[float] = None,
+        max_turnover: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Get user's alphas with server-side filtering and Redis caching (1 day TTL).
 
@@ -1439,6 +3468,8 @@ class BrainApiClient:
                          (values MUST be ISO 8601 with timezone; naive values are
                          normalized via _normalize_brain_datetime; '>=' does not exist)
         - order supports nested fields too (e.g. '-is.sharpe'), hidden is true/false
+        - IS metrics -> is.sharpe>/is.fitness>/is.turnover< (verified live: on one
+          day's 6300 alphas, is.sharpe>1.0 returned 2411 and is.fitness>1.0 1016)
         """
         await self.ensure_authenticated()
 
@@ -1468,6 +3499,15 @@ class BrainApiClient:
                 api_params["tag"] = tag
             if language:
                 api_params["settings.language"] = language.upper()
+            # IS metric filters are applied server-side, which is by far the
+            # cheapest way to narrow a result set: measured on one day's alphas,
+            # is.sharpe>1.0 cut 6300 rows to 2411 and is.fitness>1.0 to 1016.
+            if min_sharpe is not None:
+                api_params["is.sharpe>"] = min_sharpe
+            if min_fitness is not None:
+                api_params["is.fitness>"] = min_fitness
+            if max_turnover is not None:
+                api_params["is.turnover<"] = max_turnover
             if alpha_type:
                 api_params["type"] = alpha_type.upper()
             if is_super is not None:
@@ -1713,6 +3753,9 @@ class BrainApiClient:
                                 'attempts': attempt}
 
                 self.log(f"Alpha {alpha_id} submission successful!", "INFO")
+                # The OS pool just gained a member: drop the cached lists so the
+                # next self-correlation check sees it immediately.
+                self._invalidate_os_list_cache(f"alpha {alpha_id} submitted")
                 return {'status': 'SUCCESS',
                         'message': f'Alpha {alpha_id} submitted successfully',
                         'attempts': attempt}
@@ -1802,8 +3845,9 @@ class BrainApiClient:
             done = snap.get('status') in self._SUBMISSION_TERMINAL_STATUSES
             return {'source': 'tracker', 'done': done, **snap}
 
-        # No in-memory record — probe the platform directly
-        details = await self.get_alpha_details(alpha_id)
+        # No in-memory record — probe the platform directly (bypass the cache:
+        # the whole point of this call is to observe a stage transition)
+        details = await self.get_alpha_details(alpha_id, force_refresh=True)
         stage = details.get('stage')
         date_submitted = details.get('dateSubmitted')
         submitted = stage == 'OS' or bool(date_submitted)
@@ -1821,18 +3865,17 @@ class BrainApiClient:
             ),
         }
     
-    async def get_events(self) -> Dict[str, Any]:
-        """Get available events and competitions."""
+    async def get_events(self, force_refresh: bool = False) -> Dict[str, Any]:
+        """Get available events and competitions (announcement-driven; cached 1h)."""
         await self.ensure_authenticated()
-        
         try:
-            response = await self._request('GET', f"{self.base_url}/events")
-            response.raise_for_status()
-            return response.json()
+            return await self._cached_get(
+                f"{self.base_url}/events", namespace='events', key='all',
+                redis_ttl=3600, force_refresh=force_refresh)
         except Exception as e:
             self.log(f"Failed to get events: {str(e)}", "ERROR")
             raise
-    
+
     async def get_leaderboard(self, user_id: Optional[str] = None) -> Dict[str, Any]:
         """Get leaderboard data."""
         await self.ensure_authenticated()
@@ -1843,11 +3886,9 @@ class BrainApiClient:
             if user_id:
                 params['user'] = user_id
             else:
-                # Get current user ID if not specified
-                user_response = await self._request('GET', f"{self.base_url}/users/self")
-                if user_response.status_code == 200:
-                    user_data = user_response.json()
-                    params['user'] = user_data.get('id')
+                resolved = await self.get_self_user_id()
+                if resolved:
+                    params['user'] = resolved
             
             response = await self._request('GET', f"{self.base_url}/consultant/boards/leader", params=params)
             response.raise_for_status()
@@ -2108,22 +4149,50 @@ class BrainApiClient:
         """
         # Fetch user alphas (always use OS / submission dates per product policy)
         await self.ensure_authenticated()
-        alphas_resp = await self.get_user_alphas(stage='OS', limit=500, submission_start_date=start_date, submission_end_date=end_date)
-
-        if not isinstance(alphas_resp, dict) or 'results' not in alphas_resp:
-            return {'error': 'Unexpected response from get_user_alphas', 'raw': alphas_resp}
-
-        alphas = alphas_resp['results']
+        # The API caps `limit` at 100 (limit=101+ is rejected, and a larger value
+        # was silently truncated to 100 pages worth of rows), so the window is
+        # paged explicitly instead of asking for 500 and quietly scoring only
+        # the first 100 alphas.
+        alphas: List[Dict[str, Any]] = []
+        page_size = 100
+        offset = 0
+        while True:
+            alphas_resp = await self.get_user_alphas(
+                stage='OS', limit=page_size, offset=offset,
+                submission_start_date=start_date, submission_end_date=end_date,
+            )
+            if not isinstance(alphas_resp, dict) or 'results' not in alphas_resp:
+                return {'error': 'Unexpected response from get_user_alphas', 'raw': alphas_resp}
+            page = alphas_resp['results'] or []
+            alphas.extend(page)
+            total = alphas_resp.get('count')
+            if len(page) < page_size or (isinstance(total, int) and len(alphas) >= total):
+                break
+            offset += page_size
         regular = [a for a in alphas if a.get('type') == 'REGULAR']
 
-        # Fetch details for each regular alpha
+        # Fetch details for each regular alpha. These are OS records, so they are
+        # served from the long-lived cache after the first sweep; the remaining
+        # misses go out concurrently under the rate limiter rather than one
+        # blocking round trip at a time.
         pyramid_list = []
         atom_count = 0
         per_pyramid = {}
-        for a in regular:
+
+        async def _detail_or_none(aid: Optional[str]):
+            if not aid:
+                return None
             try:
-                detail = await self.get_alpha_details(a.get('id'))
+                return await self.get_alpha_details(aid)
             except Exception:
+                return None
+
+        details_list = await asyncio.gather(
+            *[_detail_or_none(a.get('id')) for a in regular]
+        )
+
+        for detail in details_list:
+            if not detail:
                 continue
 
             is_atom = self._is_atom(detail)
@@ -2193,14 +4262,28 @@ class BrainApiClient:
             'per_pyramid_counts': per_pyramid
         }
 
-    async def get_operators(self) -> Dict[str, Any]:
-        """Get available operators for alpha creation."""
+    async def get_operators(self, force_refresh: bool = False) -> Dict[str, Any]:
+        """Get available operators for alpha creation.
+
+        The operator catalogue is a static, sizeable document that changes only
+        when the platform ships a release, so it is stored permanently and
+        refreshed on demand via ``sync_platform_cache`` rather than re-downloaded
+        on every expression-authoring call.
+        """
         await self.ensure_authenticated()
-        
+
+        if not force_refresh:
+            stored = await self.store.get('operators', 'all')
+            if stored:
+                return stored
+
         try:
             response = await self._request('GET', f"{self.base_url}/operators")
             response.raise_for_status()
-            return response.json()
+            data = response.json()
+            if data:
+                await self.store.put('operators', 'all', data)
+            return data
         except Exception as e:
             self.log(f"Failed to get operators: {str(e)}", "ERROR")
             raise
@@ -2571,26 +4654,25 @@ class BrainApiClient:
             self.log(f"Failed to run selection: {str(e)}", "ERROR")
             raise
 
-    async def get_user_profile(self, user_id: str = "self") -> Dict[str, Any]:
-        """Get user profile information."""
+    async def get_user_profile(self, user_id: str = "self", force_refresh: bool = False) -> Dict[str, Any]:
+        """Get user profile information (cached briefly; it changes rarely)."""
         await self.ensure_authenticated()
-        
         try:
-            response = await self._request('GET', f"{self.base_url}/users/{user_id}")
-            response.raise_for_status()
-            return response.json()
+            return await self._cached_get(
+                f"{self.base_url}/users/{user_id}",
+                namespace='user_profile', key=str(user_id),
+                redis_ttl=3600, force_refresh=force_refresh)
         except Exception as e:
             self.log(f"Failed to get user profile: {str(e)}", "ERROR")
             raise
             
-    async def get_documentations(self) -> Dict[str, Any]:
-        """Get available documentations and learning materials."""
+    async def get_documentations(self, force_refresh: bool = False) -> Dict[str, Any]:
+        """Get available documentations and learning materials (stored permanently)."""
         await self.ensure_authenticated()
-        
         try:
-            response = await self._request('GET', f"{self.base_url}/tutorials")
-            response.raise_for_status()
-            return response.json()
+            return await self._cached_get(
+                f"{self.base_url}/tutorials", namespace='tutorials', key='index',
+                permanent=True, force_refresh=force_refresh)
         except Exception as e:
             self.log(f"Failed to get documentations: {str(e)}", "ERROR")
             raise
@@ -2723,10 +4805,19 @@ class BrainApiClient:
             self.log(f"Failed to read forum post: {str(e)}", "ERROR")
             raise
     
-    async def get_alpha_yearly_stats(self, alpha_id: str) -> Dict[str, Any]:
-        """Get yearly statistics for an alpha."""
+    async def get_alpha_yearly_stats(self, alpha_id: str, force_refresh: bool = False) -> Dict[str, Any]:
+        """Get yearly statistics for an alpha.
+
+        Frozen like the PnL recordset: an alpha submitted 2025-03 still reports
+        rows ending 2023, the same as one submitted today. Stored permanently.
+        """
         await self.ensure_authenticated()
-        
+
+        if not force_refresh:
+            stored = await self.store.get('yearly_stats', alpha_id)
+            if stored:
+                return stored
+
         max_retries = 5
         retry_delay = 2
         
@@ -2740,8 +4831,9 @@ class BrainApiClient:
                 text = (response.text or "").strip()
                 if not text:
                     if attempt < max_retries - 1:
-                        self.log(f"Empty yearly stats response for {alpha_id}, retrying...", "WARNING")
-                        await asyncio.sleep(retry_delay)
+                        wait = self._recordset_retry_after(response, retry_delay)
+                        self.log(f"Empty yearly stats response for {alpha_id}, retrying in {wait:.1f}s...", "WARNING")
+                        await asyncio.sleep(wait)
                         retry_delay *= 1.5
                         continue
                     else:
@@ -2750,6 +4842,8 @@ class BrainApiClient:
                 try:
                     stats_data = response.json()
                     if stats_data:
+                        if isinstance(stats_data, dict):
+                            await self.store.put('yearly_stats', alpha_id, stats_data)
                         return stats_data
                     else:
                         if attempt < max_retries - 1:
@@ -3127,6 +5221,102 @@ class BrainApiClient:
             return pool.drop(columns=[exclude_id], errors='ignore')
         return pool
 
+    @staticmethod
+    def _os_list_cache_key(instrument_type: str, region: str, universe: str,
+                           delay: Union[int, str]) -> str:
+        return f"os_alpha_ids:{instrument_type}:{region}:{universe}:{delay}"
+
+    @staticmethod
+    def _os_list_params(instrument_type: str, region: str, universe: str,
+                        delay: Union[int, str]) -> Dict[str, Any]:
+        return {
+            'stage': 'OS',
+            'order': '-dateSubmitted',
+            'settings.instrumentType': instrument_type,
+            'settings.region': region,
+            'settings.universe': universe,
+            'settings.delay': delay,
+        }
+
+    async def get_submitted_ids_since(self, since: Optional[str] = None) -> Dict[str, Any]:
+        """Ids of alphas submitted since ``since`` (ISO 8601), newest first.
+
+        Answering "which of these N alphas got submitted?" by fetching N alpha
+        records costs N requests; the platform caps submissions at a handful per
+        day, so the same question is answered by listing what was actually
+        submitted in the window — 1-2 pages regardless of N.
+        """
+        await self.ensure_authenticated()
+        ids: List[str] = []
+        rows: Dict[str, Dict[str, Any]] = {}
+        offset, page_size = 0, 100
+        params_base: Dict[str, Any] = {'stage': 'OS', 'order': '-dateSubmitted'}
+        if since:
+            params_base['dateSubmitted>'] = self._normalize_brain_datetime(since)
+        while True:
+            data = await self._request_json_with_retries(
+                'GET', f"{self.base_url}/users/self/alphas",
+                params={**params_base, 'limit': page_size, 'offset': offset},
+                op_name=f"get_submitted_ids_since(offset={offset})",
+            )
+            results = data.get('results') or []
+            for a in results:
+                aid = a.get('id')
+                if aid:
+                    ids.append(aid)
+                    rows[aid] = a
+            if len(results) < page_size:
+                break
+            offset += page_size
+            if offset >= 1000:  # safety valve; the window should never be this wide
+                break
+        return {'ids': ids, 'rows': rows, 'since': since, 'pages': offset // page_size + 1}
+
+    async def _os_list_probe(
+        self, instrument_type: str, region: str, universe: str, delay: Union[int, str]
+    ) -> Optional[Dict[str, Any]]:
+        """One-row probe that says whether the OS list changed, without paging it.
+
+        Measured cost of this endpoint is ~50 ms per returned row: a 1-row page is
+        ~380-500 ms while a full 100-row page is ~5 s, and field selection is not
+        supported (fields/only/include/omit are all silently ignored). So the
+        cheapest correct freshness test is to ask for a single row ordered by
+        -dateSubmitted and compare (count, newest id) with what we already have:
+        a submission changes both, and a deletion changes the count.
+        """
+        params = self._os_list_params(instrument_type, region, universe, delay)
+        params['limit'] = 1
+        try:
+            data = await self._request_json_with_retries(
+                'GET', f"{self.base_url}/users/self/alphas",
+                params=params, op_name='os_list_probe',
+            )
+        except Exception as e:
+            self.log(f"[SC cache] OS list probe failed ({e}); will re-page", "WARNING")
+            return None
+        results = data.get('results') or []
+        return {
+            'count': data.get('count'),
+            'newest_id': (results[0] or {}).get('id') if results else None,
+        }
+
+    def _invalidate_os_list_cache(self, reason: str) -> int:
+        """Drop the cached OS alpha lists. Called after a successful submission,
+        which is the only event that changes them."""
+        if not self.redis_client:
+            return 0
+        dropped = 0
+        try:
+            for key in list(self.redis_client.scan_iter('os_alpha_ids:*', count=500)):
+                self.redis_client.delete(key)
+                dropped += 1
+        except Exception as e:
+            self.log(f"[SC cache] Failed to invalidate OS list cache: {e}", "WARNING")
+            return dropped
+        if dropped:
+            self.log(f"[SC cache] Invalidated {dropped} OS list cache entr(ies): {reason}", "INFO")
+        return dropped
+
     async def _list_matching_os_alpha_ids(
         self,
         instrument_type: str,
@@ -3143,15 +5333,39 @@ class BrainApiClient:
         """
         all_ids: List[str] = []
         ppac_ids: List[str] = []
+
+        cache_key = self._os_list_cache_key(instrument_type, region, universe, delay)
+        cached = self._get_cached_data(cache_key)
+        if cached and isinstance(cached.get('ids'), list):
+            age = time.time() - float(cached.get('verified_at') or 0)
+            # The ppac sidecar was written by the run that populated this entry
+            # and is read separately, so it stays consistent either way.
+            if self._os_list_ttl_seconds and age <= self._os_list_ttl_seconds:
+                return cached['ids']
+            probe = await self._os_list_probe(instrument_type, region, universe, delay)
+            if probe and probe.get('count') == cached.get('count') \
+                    and probe.get('newest_id') == cached.get('newest_id'):
+                cached['verified_at'] = time.time()
+                self._set_cached_data(cache_key, cached, ttl=self._os_list_retain_seconds)
+                self.log(
+                    f"[SC cache] OS list unchanged for {region}/{universe}/delay{delay} "
+                    f"({cached.get('count')} alphas) — verified with 1 row, skipped paging",
+                    "INFO",
+                )
+                return cached['ids']
+
         offset = 0
         page_size = 100
+        server_count: Optional[int] = None
+        newest_id: Optional[str] = None
         while True:
-            params = {
-                'stage': 'OS',
-                'limit': page_size,
-                'offset': offset,
-                'order': '-dateSubmitted',
-            }
+            # Live probes confirm settings.* filters are honoured server-side
+            # (settings.delay=7 returns count=0, not the unfiltered set), so the
+            # market configuration is filtered by the API instead of downloading
+            # every OS alpha and discarding ~2/3 of them client-side.
+            params = dict(self._os_list_params(instrument_type, region, universe, delay))
+            params['limit'] = page_size
+            params['offset'] = offset
             try:
                 data = await self._request_json_with_retries(
                     'GET',
@@ -3163,6 +5377,12 @@ class BrainApiClient:
                 self.log(f"Failed to page OS alpha list at offset={offset}: {e}", "WARNING")
                 break
             results = data.get('results') or []
+            if server_count is None:
+                server_count = data.get('count')
+            if newest_id is None and results:
+                # Ordered by -dateSubmitted, so the first row of the first page is
+                # exactly what the 1-row freshness probe will return next time.
+                newest_id = (results[0] or {}).get('id')
             if not results:
                 break
             for alpha in results:
@@ -3205,6 +5425,21 @@ class BrainApiClient:
             sidecar.write_text(json.dumps(sorted(set(ppac_ids))))
         except Exception as e:
             self.log(f"[SC cache] Failed to persist ppac ids sidecar: {e}", "WARNING")
+
+        if all_ids:
+            self._set_cached_data(
+                cache_key,
+                {
+                    'ids': all_ids,
+                    'ppac': sorted(set(ppac_ids)),
+                    # server_count is what the probe compares against; fall back to
+                    # the number we actually collected when the API omits it.
+                    'count': server_count if server_count is not None else len(all_ids),
+                    'newest_id': newest_id,
+                    'verified_at': time.time(),
+                },
+                ttl=self._os_list_retain_seconds,
+            )
 
         return all_ids
 
@@ -3808,26 +6043,32 @@ class BrainApiClient:
             self.log(f"Failed to set alpha properties: {str(e)}", "ERROR")
             raise
 
-    async def get_record_sets(self, alpha_id: str) -> Dict[str, Any]:
-        """List available record sets for an alpha."""
+    async def get_record_sets(self, alpha_id: str, force_refresh: bool = False) -> Dict[str, Any]:
+        """List available record sets for an alpha (a fixed set of five names)."""
         await self.ensure_authenticated()
-        
         try:
-            response = await self._request('GET', f"{self.base_url}/alphas/{alpha_id}/recordsets")
-            response.raise_for_status()
-            return response.json()
+            return await self._cached_get(
+                f"{self.base_url}/alphas/{alpha_id}/recordsets",
+                namespace='recordsets_index', key=alpha_id,
+                permanent=True, force_refresh=force_refresh)
         except Exception as e:
             self.log(f"Failed to get record sets: {str(e)}", "ERROR")
             raise
 
-    async def get_record_set_data(self, alpha_id: str, record_set_name: str) -> Dict[str, Any]:
-        """Get data from a specific record set."""
+    async def get_record_set_data(self, alpha_id: str, record_set_name: str,
+                                  force_refresh: bool = False) -> Dict[str, Any]:
+        """Get data from a specific record set.
+
+        Record sets are the simulation's own output and never extend: an alpha
+        submitted in 2025-03 still reports PnL ending 2023-12-29 and yearly-stats
+        ending 2023, exactly like one submitted today. So they are permanent.
+        """
         await self.ensure_authenticated()
-        
         try:
-            response = await self._request('GET', f"{self.base_url}/alphas/{alpha_id}/recordsets/{record_set_name}")
-            response.raise_for_status()
-            return response.json()
+            return await self._cached_get(
+                f"{self.base_url}/alphas/{alpha_id}/recordsets/{record_set_name}",
+                namespace='recordset', key=f"{alpha_id}:{record_set_name}",
+                permanent=True, force_refresh=force_refresh)
         except Exception as e:
             self.log(f"Failed to get record set data: {str(e)}", "ERROR")
             raise
@@ -3848,14 +6089,16 @@ class BrainApiClient:
             self.log(f"Failed to get user activities: {str(e)}", "ERROR")
             raise
 
-    async def get_pyramid_multipliers(self) -> Dict[str, Any]:
-        """Get current pyramid multipliers showing BRAIN's encouragement levels."""
+    async def get_pyramid_multipliers(self, force_refresh: bool = False) -> Dict[str, Any]:
+        """Pyramid multipliers. The platform recomputes these on its own schedule
+        (not per request), so a short cache removes the repeat reads that
+        diversity scoring and dataset recommendation make."""
         await self.ensure_authenticated()
-        
         try:
-            response = await self._request('GET', f"{self.base_url}/users/self/activities/pyramid-multipliers")
-            response.raise_for_status()
-            return response.json()
+            return await self._cached_get(
+                f"{self.base_url}/users/self/activities/pyramid-multipliers",
+                namespace='pyramid_multipliers', key='self',
+                redis_ttl=3600, force_refresh=force_refresh)
         except Exception as e:
             self.log(f"Failed to get pyramid multipliers: {str(e)}", "ERROR")
             raise
@@ -3922,13 +6165,7 @@ class BrainApiClient:
         
         try:
             if not user_id:
-                # Get current user ID if not specified
-                user_response = await self._request('GET', f"{self.base_url}/users/self")
-                if user_response.status_code == 200:
-                    user_data = user_response.json()
-                    user_id = user_data.get('id')
-                else:
-                    user_id = 'self'
+                user_id = await self.get_self_user_id() or 'self'
             
             response = await self._request('GET', f"{self.base_url}/users/{user_id}/competitions")
             response.raise_for_status()
@@ -3937,26 +6174,27 @@ class BrainApiClient:
             self.log(f"Failed to get user competitions: {str(e)}", "ERROR")
             raise
             
-    async def get_competition_details(self, competition_id: str) -> Dict[str, Any]:
-        """Get detailed information about a specific competition."""
+    async def get_competition_details(self, competition_id: str, force_refresh: bool = False) -> Dict[str, Any]:
+        """Competition metadata. Dates and rules are fixed once a competition is
+        announced, so this is cached for a day rather than re-read per call."""
         await self.ensure_authenticated()
-        
         try:
-            response = await self._request('GET', f"{self.base_url}/competitions/{competition_id}")
-            response.raise_for_status()
-            return response.json()
+            return await self._cached_get(
+                f"{self.base_url}/competitions/{competition_id}",
+                namespace='competition', key=str(competition_id),
+                redis_ttl=86400, force_refresh=force_refresh)
         except Exception as e:
             self.log(f"Failed to get competition details: {str(e)}", "ERROR")
             raise
             
-    async def get_competition_agreement(self, competition_id: str) -> Dict[str, Any]:
-        """Get the rules, terms, and agreement for a specific competition."""
+    async def get_competition_agreement(self, competition_id: str, force_refresh: bool = False) -> Dict[str, Any]:
+        """Competition rules/terms — a fixed legal document, stored permanently."""
         await self.ensure_authenticated()
-        
         try:
-            response = await self._request('GET', f"{self.base_url}/competitions/{competition_id}/agreement")
-            response.raise_for_status()
-            return response.json()
+            return await self._cached_get(
+                f"{self.base_url}/competitions/{competition_id}/agreement",
+                namespace='competition_agreement', key=str(competition_id),
+                permanent=True, force_refresh=force_refresh)
         except Exception as e:
             self.log(f"Failed to get competition agreement: {str(e)}", "ERROR")
             raise
@@ -4087,14 +6325,15 @@ class BrainApiClient:
             
     # --- New documentation endpoint ---
     
-    async def get_documentation_page(self, page_id: str) -> Dict[str, Any]:
-        """Retrieve detailed content of a specific documentation page/article."""
+    async def get_documentation_page(self, page_id: str, force_refresh: bool = False) -> Dict[str, Any]:
+        """Retrieve a documentation page. Tutorial content is static, so it is
+        stored permanently and refreshed only on demand."""
         await self.ensure_authenticated()
-        
         try:
-            response = await self._request('GET', f"{self.base_url}/tutorial-pages/{page_id}")
-            response.raise_for_status()
-            return response.json()
+            return await self._cached_get(
+                f"{self.base_url}/tutorial-pages/{page_id}",
+                namespace='tutorial_pages', key=str(page_id),
+                permanent=True, force_refresh=force_refresh)
         except Exception as e:
             self.log(f"Failed to get documentation page: {str(e)}", "ERROR")
             raise
@@ -4430,42 +6669,186 @@ def _slim_multisim(obj):
     return _rewrap(out, w)
 
 
-def _slim_datafields(obj):
+def _filter_by_date(payload, field: str, since: Optional[str]):
+    """Keep rows whose ``field`` is on/after ``since`` (YYYY-MM-DD).
+
+    Applied locally: the whole catalogue already sits in the permanent store, so
+    "what changed since X" costs nothing rather than another paged sweep.
+    """
+    if not since or not isinstance(payload, dict) or 'results' not in payload:
+        return payload
+    cutoff = str(since)[:10]
+    kept = [r for r in payload.get('results') or []
+            if isinstance(r, dict) and str(r.get(field) or '')[:10] >= cutoff]
+    out = dict(payload)
+    out['results'] = kept
+    out['count'] = len(kept)
+    out['filtered_since'] = {field: cutoff}
+    return out
+
+
+def _facets(rows, spec, top=12):
+    """Counts per value for a few columns, so a caller can narrow before paging.
+
+    A catalogue query can match ten thousand rows; returning them all is ~500k
+    tokens, which no model can read. Facets let the model see the shape of the
+    match and re-query precisely instead of guessing search terms.
+    """
+    out = {}
+    for name, getter in spec.items():
+        counter = {}
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            key = getter(r)
+            if key is None or key == "":
+                continue
+            counter[key] = counter.get(key, 0) + 1
+        ordered = sorted(counter.items(), key=lambda kv: (-kv[1], str(kv[0])))
+        out[name] = dict(ordered[:top])
+        if len(ordered) > top:
+            out[name]["…"] = f"+{len(ordered) - top} more"
+    return out
+
+
+def _usercount_bucket(f):
+    n = f.get("userCount")
+    if not isinstance(n, (int, float)):
+        return None
+    if n == 0:
+        return "0 (uncrowded)"
+    if n <= 10:
+        return "1-10"
+    if n <= 100:
+        return "11-100"
+    return ">100"
+
+
+_DATAFIELD_SORTS = {
+    "userCount": lambda f: -(f.get("userCount") or 0),
+    "alphaCount": lambda f: -(f.get("alphaCount") or 0),
+    "coverage": lambda f: -(f.get("coverage") or 0),
+    "dateCreated": lambda f: str(f.get("dateCreated") or ""),
+    "-dateCreated": lambda f: _neg_date(f.get("dateCreated")),
+    "id": lambda f: str(f.get("id") or ""),
+}
+
+
+def _neg_date(value):
+    """Sort key that puts the newest date first."""
+    return tuple(-int(p) for p in str(value or "0-0-0").split("-")[:3] if p.isdigit()) or (0,)
+
+
+def _slim_datafields(obj, limit: int = 50, offset: int = 0, sort: str = "userCount"):
     payload, w = _unwrap_result(obj)
     if not isinstance(payload, dict) or "results" not in payload:
         return obj
-    fields = []
-    for f in payload.get("results", []):
-        if not isinstance(f, dict):
-            fields.append(f)
-            continue
-        fields.append({"id": f.get("id"), "type": f.get("type"), "coverage": f.get("coverage"),
-                       "userCount": f.get("userCount"), "alphaCount": f.get("alphaCount"),
-                       "description": _truncate(f.get("description"), 160)})
-    out = {"results": fields, "count": payload.get("count")}
-    for k in ("sharpe_filter_applied", "sharpe_filter_removed"):
+    raw = [f for f in payload.get("results", []) if isinstance(f, dict)]
+    total = len(raw)
+
+    key = _DATAFIELD_SORTS.get(sort) or _DATAFIELD_SORTS["userCount"]
+    try:
+        raw.sort(key=key)
+    except Exception:
+        pass
+
+    window = raw[offset:offset + max(1, limit)]
+    fields = [{"id": f.get("id"), "type": f.get("type"), "coverage": f.get("coverage"),
+               "userCount": f.get("userCount"), "alphaCount": f.get("alphaCount"),
+               "dataset": (f.get("dataset") or {}).get("id") if isinstance(f.get("dataset"), dict) else f.get("dataset"),
+               # dateCreated is how you tell that a field is newly published; it
+               # was previously dropped here, so callers could not see freshness.
+               "dateCreated": f.get("dateCreated"),
+               "description": _truncate(f.get("description"), 160)}
+              for f in window]
+
+    out = {
+        "count": total,
+        "returned": len(fields),
+        "offset": offset,
+        "sort": sort,
+        "results": fields,
+        "facets": _facets(raw, {
+            "dataset": lambda f: (f.get("dataset") or {}).get("id") if isinstance(f.get("dataset"), dict) else None,
+            "category": lambda f: (f.get("category") or {}).get("id") if isinstance(f.get("category"), dict) else None,
+            "type": lambda f: f.get("type"),
+            "dateCreated": lambda f: f.get("dateCreated"),
+            # How many fields nobody is using yet. The default sort buries these
+            # at the bottom, so surface the size of that tail explicitly.
+            "userCount": _usercount_bucket,
+        }),
+    }
+    if total > offset + len(fields):
+        out["next_offset"] = offset + len(fields)
+        out["note"] = (f"Showing {len(fields)} of {total} matching fields (sorted by {sort}). "
+                       "Narrow with search/dataset_id/data_type/since using the facet counts above, "
+                       "or page with offset.")
+    # Completeness signals must survive slimming: a truncated catalogue that
+    # looks whole is exactly how 89% of the fields stayed invisible.
+    for k in ("sharpe_filter_applied", "sharpe_filter_removed", "capped", "warning",
+              "coverage", "declared_total", "declared_count", "complete",
+              "incomplete_datasets", "dataset_id", "filtered_since",
+              "fetched_rows", "fields_in_two_datasets", "metrics_from_universe", "note"):
         if k in payload:
             out[k] = payload[k]
     return _rewrap(out, w)
 
 
-def _slim_datasets(obj):
+_DATASET_SORTS = {
+    "valueScore": lambda d: -(d.get("valueScore") or 0),
+    "userCount": lambda d: -(d.get("userCount") or 0),
+    "alphaCount": lambda d: -(d.get("alphaCount") or 0),
+    "fieldCount": lambda d: -(d.get("fieldCount") or 0),
+    "pyramidMultiplier": lambda d: -(d.get("pyramidMultiplier") or 0),
+    "-dateUpdated": lambda d: _neg_date(d.get("dateUpdated")),
+    "dateUpdated": lambda d: str(d.get("dateUpdated") or ""),
+    "id": lambda d: str(d.get("id") or ""),
+}
+
+
+def _slim_datasets(obj, limit: int = 40, offset: int = 0, sort: str = "valueScore"):
     payload, w = _unwrap_result(obj)
     if not isinstance(payload, dict) or "results" not in payload:
         return obj
+    raw = [d for d in payload.get("results", []) if isinstance(d, dict)]
+    total = len(raw)
+
+    key = _DATASET_SORTS.get(sort) or _DATASET_SORTS["valueScore"]
+    try:
+        raw.sort(key=key)
+    except Exception:
+        pass
+
+    window = raw[offset:offset + max(1, limit)]
     ds = []
-    for d in payload.get("results", []):
-        if not isinstance(d, dict):
-            ds.append(d)
-            continue
+    for d in window:
         cat = d.get("category")
         ds.append({"id": d.get("id"), "name": d.get("name"),
                    "category": cat.get("id") if isinstance(cat, dict) else cat,
                    "coverage": d.get("coverage"), "fieldCount": d.get("fieldCount"),
                    "userCount": d.get("userCount"), "alphaCount": d.get("alphaCount"),
                    "valueScore": d.get("valueScore"), "pyramidMultiplier": d.get("pyramidMultiplier"),
+                   # dateUpdated is the dataset-level "new data landed" signal.
+                   "dateUpdated": d.get("dateUpdated"),
                    "description": _truncate(d.get("description"), 200)})
-    return _rewrap({"results": ds, "count": payload.get("count")}, w)
+
+    out = {
+        "count": total,
+        "returned": len(ds),
+        "offset": offset,
+        "sort": sort,
+        "results": ds,
+        "facets": _facets(raw, {
+            "category": lambda d: (d.get("category") or {}).get("id") if isinstance(d.get("category"), dict) else None,
+            "subcategory": lambda d: (d.get("subcategory") or {}).get("id") if isinstance(d.get("subcategory"), dict) else None,
+            "dateUpdated": lambda d: d.get("dateUpdated"),
+        }),
+    }
+    if total > offset + len(ds):
+        out["next_offset"] = offset + len(ds)
+        out["note"] = (f"Showing {len(ds)} of {total} datasets (sorted by {sort}). "
+                       "Narrow with category/search/since, or page with offset.")
+    return _rewrap(out, w)
 
 
 def _records_to_dicts(payload):
@@ -4744,11 +7127,19 @@ async def create_simulation(
     selection_handling: str = "POSITIVE",
     selection_limit: int = 1000,
     component_activation: str = "IS",
+    reuse_existing: bool = True,
 ) -> Dict[str, Any]:
     """
     Create a new simulation on BRAIN platform.
-    
+
     This tool creates and starts a simulation with your alpha code. Use this after you have your alpha formula ready.
+
+    Every completed backtest is recorded locally. If this exact expression and
+    settings were simulated before, the recorded alpha is returned immediately
+    (flagged `from_local_ledger`) instead of spending several minutes and a
+    simulation slot re-running it. Pass `reuse_existing=false` to force a fresh
+    backtest — worth doing after a monthly data release, since new datafields
+    can change a result (see whats_new_in_data).
     if field type=VECTOR should deal with vec_ suffer vec_*(FIELD)
     Args:
         type: Simulation type ("REGULAR" or "SUPER")
@@ -4813,7 +7204,8 @@ async def create_simulation(
             selection=selection
         )
         
-        return _slim_alpha_response(await brain_client.create_simulation(sim_data))
+        return _slim_alpha_response(
+            await brain_client.create_simulation(sim_data, reuse_existing=reuse_existing))
     except Exception as e:
         extra_info = ""
         error_msg = str(e)
@@ -4848,24 +7240,40 @@ async def get_datasets(
     universe: str = "TOP3000",
     theme: str = "false",
     search: Optional[str] = None,
+    since: Optional[str] = None,
+    sort: str = "valueScore",
+    limit: int = 40,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Get available datasets for research.
-    
-    Use this to discover what data is available for your alpha research.
-    
+
+    Returns a page of datasets plus facet counts (category, subcategory,
+    dateUpdated) describing the whole match, so you can narrow precisely instead
+    of pulling the full catalogue — all 345 USA/TOP3000 datasets is ~36k tokens.
+
     Args:
-        category: Type of datesets (e.g., "news","sentiment","option")
+        category: Type of datasets (e.g., "news","sentiment","option")
         region: Market region (e.g., "USA")
         delay: Data delay (0 or 1)
         universe: Universe of stocks (e.g., "TOP3000")
         theme: Theme filter
-    
+        search: Substring match over the dataset text
+        since: Keep only datasets with dateUpdated >= this date ("2026-03-01").
+               dateUpdated is when the vendor last shipped data for the set, so
+               this is the "what is new" filter.
+        sort: valueScore | userCount | alphaCount | fieldCount | pyramidMultiplier
+              | -dateUpdated (newest first) | dateUpdated | id
+        limit: Rows to return (default 40)
+        offset: Row offset for paging; the response carries next_offset
+
     Returns:
-        Available datasets
+        {count, returned, results, facets, next_offset?}
     """
     try:
-        return _slim_datasets(await brain_client.get_datasets(category, region, delay, universe, theme, search))
+        data = await brain_client.get_datasets(category, region, delay, universe, theme, search)
+        data = _filter_by_date(data, 'dateUpdated', since)
+        return _slim_datasets(data, limit=limit, offset=offset, sort=sort)
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
@@ -4878,29 +7286,60 @@ async def get_datafields(
     data_type: str = "",
     search: Optional[str] = None,
     filter_sharpe: bool = True,
+    since: Optional[str] = None,
+    sort: str = "userCount",
+    limit: int = 50,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Get available data fields for alpha construction.
-    
-    Use this to find specific data fields you can use in your alpha formulas.
-    By default, fields with OS/IS Sharpe ratio < 0 are filtered out to improve quality.
-    
+
+    Returns a page of fields plus facet counts (dataset, category, type,
+    dateCreated, userCount) describing the WHOLE match, so you can narrow
+    precisely. Do not try to pull a whole region's catalogue: USA/TOP3000 holds
+    91k fields. Read the facets, then re-query with dataset_id / data_type /
+    search / since.
+
+    COMPLETENESS: without `dataset_id`, results come from a window the platform
+    caps at 10000 rows — for USA/TOP3000 that is 11% of the catalogue, and 267
+    datasets return nothing. A capped result says so (`capped`, `warning`).
+    Passing `dataset_id` always returns that dataset in full. To remove the cap
+    everywhere, run build_datafield_catalogue once.
+
+    SORT BIAS: the default `sort="userCount"` is most-used-first, so fields with
+    userCount=0 sit at the very bottom and are easy to never see — yet for alpha
+    research an uncrowded field is often the more valuable one. The `userCount`
+    facet reports how many such fields the match contains; use `sort="dateCreated"`
+    (newest data), `sort="coverage"`, or browse per `dataset_id` to reach them.
+
+    By default, fields with OS/IS Sharpe ratio < 0 are filtered out.
+
     Args:
         region: Market region (e.g., "USA"、"GLB"、"IND"、"ASI"、"CHN")
         delay: Data delay (0 or 1)
         universe: Universe of stocks (e.g., USA和GLB默认"TOP3000"、IND默认"TOP500"、ASI默认"MINVOL1M"、CHN默认"TOP2000U")
         dataset_id: Specific dataset ID to filter by
         data_type: Type of data (e.g., "MATRIX",'VECTOR','GROUP')
-        search: Search term to filter fields
+        search: Fuzzy multi-keyword search (space separated = AND)
         filter_sharpe: Filter out fields with OS/IS Sharpe < 0 (default: True)
-    
+        since: Keep only fields with dateCreated >= this date ("2026-03-01").
+               New fields land in monthly batches, so this is how you find data
+               that was not there last time you looked.
+        sort: userCount | alphaCount | coverage | -dateCreated (newest first)
+              | dateCreated | id
+        limit: Rows to return (default 50)
+        offset: Row offset for paging; the response carries next_offset
+
     Returns:
-        Available data fields
+        {count, returned, results, facets, next_offset?}
     """
     instrument_type = "EQUITY"
     theme = "false"
     try:
-        return _slim_datafields(await brain_client.get_datafields(instrument_type, region, delay, universe, theme, dataset_id, data_type, search, filter_sharpe))
+        data = await brain_client.get_datafields(
+            instrument_type, region, delay, universe, theme, dataset_id, data_type, search, filter_sharpe)
+        data = _filter_by_date(data, 'dateCreated', since)
+        return _slim_datafields(data, limit=limit, offset=offset, sort=sort)
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
@@ -4939,6 +7378,9 @@ async def get_user_alphas(
     name: Optional[str] = None,
     tag: Optional[str] = None,
     language: Optional[str] = None,
+    min_sharpe: Optional[float] = None,
+    min_fitness: Optional[float] = None,
+    max_turnover: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Get user's alphas with advanced filtering, pagination, and sorting.
@@ -4995,6 +7437,13 @@ async def get_user_alphas(
             the API has no substring/fuzzy name matching).
         tag (Optional[str]): Filter alphas that carry this tag (server-side, exact tag
             value, e.g. "PowerPoolSelected"). One tag per query.
+        min_sharpe (Optional[float]): Keep only alphas with IS sharpe above this
+            (server-side). The cheapest way to narrow a query — measured on one
+            day's 6300 alphas, min_sharpe=1.0 returned 2411 and min_fitness=1.0
+            returned 1016.
+        min_fitness (Optional[float]): Same, on IS fitness (server-side).
+        max_turnover (Optional[float]): Keep only alphas with IS turnover below
+            this (server-side).
         language (Optional[str]): Filter alphas by expression language (server-side,
             settings.language). Values: "FASTEXPR", "PYTHON" (case-insensitive,
             normalized to uppercase). If not provided, alphas of all languages
@@ -5014,6 +7463,7 @@ async def get_user_alphas(
             submission_end_date=submission_end_date, order=order, hidden=hidden,
             region=region, status=status, alpha_type=type, is_super=is_super,
             color=color, name=name, tag=tag, language=language,
+            min_sharpe=min_sharpe, min_fitness=min_fitness, max_turnover=max_turnover,
         ))
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
@@ -5827,15 +8277,23 @@ async def pool_submission_plan(
 
 
 @mcp.tool()
-async def pool_sync(refresh_prod: bool = False) -> Dict[str, Any]:
-    """Refresh pooled entries; drop any that are now submitted (status ACTIVE).
+async def pool_sync(refresh_prod: bool = False, refresh_details: bool = False) -> Dict[str, Any]:
+    """Refresh pooled entries; drop any that are now submitted.
 
+    Costs 1-2 requests regardless of pool size: a pooled alpha is in-sample and
+    its record is frozen (re-simulating produces a new id), so the only change
+    worth detecting is submission — which is read from the submitted-alpha list
+    rather than by fetching every entry.
+
+    ``refresh_details=true`` re-reads every entry's record instead (one request
+    per entry); use it to pick up manual edits or platform-side deletions.
     ``refresh_prod=true`` also re-queries production correlation per entry. That
     endpoint is single-concurrency and slow, so it is off by default — use it
     after you submit something, since submissions move everyone's numbers.
     """
     try:
-        return await cpool.sync_pool(brain_client, refresh_prod=refresh_prod)
+        return await cpool.sync_pool(
+            brain_client, refresh_prod=refresh_prod, refresh_details=refresh_details)
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
@@ -6120,14 +8578,17 @@ async def _wait_for_multisimulation_completion(location: str, expected_children:
                         alpha_progress = await brain_client._request('GET', child_url)
                         if alpha_progress.status_code == 200:
                             alpha_data = alpha_progress.json()
-                            retry_after = alpha_progress.headers.get("Retry-After", 0)
-                            
-                            if retry_after == 0:
+                            # Retry-After arrives as a string; comparing it to the
+                            # int 0 never matched, so a literal "0" fell through to
+                            # sleep(0) and busy-polled the platform.
+                            try:
+                                wait_time = float(alpha_progress.headers.get("Retry-After") or 0)
+                            except (TypeError, ValueError):
+                                wait_time = 0.0
+                            if wait_time <= 0:
                                 finished = True
                                 break
-                            else:
-                                wait_time = float(retry_after)
-                                await asyncio.sleep(wait_time)
+                            await asyncio.sleep(wait_time)
                         else:
                             await asyncio.sleep(5)
                     except Exception as e:
@@ -6138,19 +8599,19 @@ async def _wait_for_multisimulation_completion(location: str, expected_children:
                     alpha_id = alpha_data.get("alpha")
                     if alpha_id:
                         # Now get the actual alpha details from the alpha endpoint
-                        alpha_details = await brain_client._request('GET', f"{brain_client.base_url}/alphas/{alpha_id}")
-                        if alpha_details.status_code == 200:
-                            alpha_detail_data = alpha_details.json()
+                        try:
+                            child_alpha = await brain_client.get_alpha_details(alpha_id)
+                            await brain_client.record_alpha_locally(child_alpha)
                             alpha_results.append({
                                 'alpha_id': alpha_id,
                                 'location': child_url,
-                                'details': alpha_detail_data
+                                'details': child_alpha
                             })
-                        else:
+                        except Exception as detail_err:
                             alpha_results.append({
                                 'alpha_id': alpha_id,
                                 'location': child_url,
-                                'error': f'Failed to get alpha details: {alpha_details.status_code}'
+                                'error': f'Failed to get alpha details: {detail_err}'
                             })
                     else:
                         alpha_results.append({
@@ -6338,38 +8799,37 @@ async def fetch_multi_simulation_result(location: str) -> Dict[str, Any]:
         if not children:
             return {"error": "no children yet — poll check_multi_simulation until completion",
                     "status": data.get("status")}
-        alpha_results = []
-        for i, child_id in enumerate(children):
+        # Children are independent: fetch them concurrently (the rate limiter
+        # keeps the fan-out inside the platform's quota) instead of paying two
+        # serialized round trips per child.
+        async def _fetch_child(i: int, child_id: Any) -> Dict[str, Any]:
             child_url = child_id if str(child_id).startswith('http') \
                 else f"{brain_client.base_url}/simulations/{child_id}"
             try:
                 child_resp = await brain_client._request('GET', child_url)
                 if child_resp.status_code != 200:
-                    alpha_results.append({
-                        "location": child_url,
-                        "error": f"child fetch failed: {child_resp.status_code}"})
-                    continue
+                    return {"location": child_url,
+                            "error": f"child fetch failed: {child_resp.status_code}"}
                 child = child_resp.json()
                 child_status = child.get("status")
                 alpha_id = child.get("alpha")
                 if not alpha_id:
-                    alpha_results.append({
-                        "location": child_url,
-                        "status": child_status,
-                        "error": f"No alpha ID (child status: {child_status})"})
-                    continue
-                details_resp = await brain_client._request(
-                    'GET', f"{brain_client.base_url}/alphas/{alpha_id}")
-                if details_resp.status_code == 200:
-                    alpha_results.append({"alpha_id": alpha_id,
-                                          "location": child_url,
-                                          "details": details_resp.json()})
-                else:
-                    alpha_results.append({
-                        "alpha_id": alpha_id, "location": child_url,
-                        "error": f"Failed to get alpha details: {details_resp.status_code}"})
+                    return {"location": child_url,
+                            "status": child_status,
+                            "error": f"No alpha ID (child status: {child_status})"}
+                try:
+                    details = await brain_client.get_alpha_details(alpha_id)
+                except Exception as e:
+                    return {"alpha_id": alpha_id, "location": child_url,
+                            "error": f"Failed to get alpha details: {e}"}
+                await brain_client.record_alpha_locally(details)
+                return {"alpha_id": alpha_id, "location": child_url, "details": details}
             except Exception as e:
-                alpha_results.append({"location": f"child_{i+1}", "error": str(e)})
+                return {"location": f"child_{i+1}", "error": str(e)}
+
+        alpha_results = list(await asyncio.gather(
+            *[_fetch_child(i, c) for i, c in enumerate(children)]
+        ))
         return _slim_multisim({
             "success": True,
             "message": f"fetched {len(alpha_results)} child results",
@@ -6407,8 +8867,11 @@ async def get_daily_and_quarterly_payment(email: str = "", password: str = "") -
         if not email or not password:
             return {"error": "Authentication credentials not provided or found in config."}
             
-        await brain_client.authenticate(email, password)
-        
+        # Reuse the live session instead of re-running the full Basic-auth
+        # handshake (which also clears cookies for every other in-flight call).
+        brain_client.auth_credentials = {'email': email, 'password': password}
+        await brain_client.ensure_authenticated()
+
         # Get base payments
         try:
             base_response = await brain_client._request('GET', f"{brain_client.base_url}/users/self/activities/base-payment")
@@ -6433,6 +8896,836 @@ async def get_daily_and_quarterly_payment(email: str = "", password: str = "") -
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
 from typing import Sequence
+PERSISTENT_NAMESPACES = (
+    'alpha_details', 'alpha_pnl', 'yearly_stats', 'recordset', 'recordsets_index',
+    'datafields', 'datasets', 'operators', 'tutorials', 'tutorial_pages',
+    'competition_agreement', 'simulation', 'forum_glossary', 'forum_post',
+    'datafields_ds',
+)
+
+
+@mcp.tool()
+async def analyze_my_research(
+    scope: str = "summary",
+    region: Optional[str] = None,
+    universe: Optional[str] = None,
+    delay: Optional[int] = None,
+    good_sharpe: float = 1.5,
+    contains: Optional[str] = None,
+    min_attempts: int = 30,
+    limit: int = 25,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Mine your own alpha history for what actually works. Zero platform requests.
+
+    Runs against the local SQLite corpus built by sync_alpha_corpus. Because the
+    corpus keeps failures as well as successes, it can report *rates* rather than
+    just lists — "this field produced a Sharpe>1.5 alpha 12% of the time you used
+    it" is a far better research signal than "here are some good alphas".
+
+    scope:
+      - "summary"      (default) corpus size, coverage by configuration, hit rate
+      - "productivity" per datafield: attempts, hits, hit-rate, best Sharpe.
+                       Ranked by hit-rate among fields with >= min_attempts, so a
+                       field used twice with one hit does not top the list.
+                       READ WITH THE SAMPLE SIZE: a token that only appears in a
+                       family of already-careful alphas inherits their hit rate
+                       rather than causing it (generate_stats measured 57/57 on
+                       this account purely because it only occurs in hand-built
+                       Python alphas). Trust the large-sample rows.
+      - "operators"    the same, per operator
+      - "gaps"         configurations you have barely explored
+      - "similar"      full-text search over expressions: have I tried this idea?
+                       (pass `contains`)
+      - "best"         highest-Sharpe alphas, optionally filtered by configuration
+
+    TIME MATTERS: research improves, so a rate blended over many months describes
+    neither the past nor the present. Measured on this account, USA/TOP3000 went
+    from a 5.6% hit rate over Jan-Feb to 27.8% over Jan-Apr — the same
+    configuration, five times the rate. Use `since`/`until` to ask about a period
+    you actually care about; the response reports the window it used.
+
+    Args:
+        good_sharpe: the bar that counts as a "hit" (default 1.5)
+        min_attempts: ignore rarely-used tokens in the rate rankings
+        contains: FTS5 query for scope="similar" (e.g. "ts_rank close")
+        since / until: restrict to alphas created in this window ("2026-06-01").
+            Compared against UTC-normalised timestamps, so a plain date works.
+    """
+    store = brain_client.alpha_store
+    scope = (scope or "summary").lower().strip()
+    try:
+        stats = await store.stats()
+    except Exception as e:
+        return {"error": f"corpus unavailable: {e}"}
+    if not stats.get("alphas"):
+        return {"error": "The local alpha corpus is empty.",
+                "hint": 'Run sync_alpha_corpus(action="start") first.'}
+
+    where, params = [], []
+    if region:
+        where.append("region = ?"); params.append(region.upper())
+    if universe:
+        where.append("universe = ?"); params.append(universe.upper())
+    if delay is not None:
+        where.append("delay = ?"); params.append(delay)
+    # Timestamps are stored UTC-normalised, so text comparison is chronological.
+    if since:
+        where.append("date_created >= ?"); params.append(str(since))
+    if until:
+        where.append("date_created < ?"); params.append(str(until))
+    cfg_sql = (" AND " + " AND ".join(where)) if where else ""
+    window = {'since': since, 'until': until} if (since or until) else 'all time'
+
+    if scope == "summary":
+        by_cfg = await store.query(
+            "SELECT region, universe, delay, COUNT(*) attempts, "
+            "SUM(CASE WHEN sharpe >= ? THEN 1 ELSE 0 END) hits, "
+            "ROUND(MAX(sharpe), 3) best FROM alphas "
+            "WHERE sharpe IS NOT NULL" + cfg_sql + " GROUP BY region, universe, delay "
+            "ORDER BY attempts DESC LIMIT ?", (good_sharpe, *params, limit))
+        for r in by_cfg:
+            r["hit_rate"] = round(r["hits"] / r["attempts"], 4) if r["attempts"] else None
+        overall = (await store.query(
+            "SELECT COUNT(*) attempts, SUM(CASE WHEN sharpe >= ? THEN 1 ELSE 0 END) hits "
+            "FROM alphas WHERE sharpe IS NOT NULL" + cfg_sql, (good_sharpe, *params)))[0]
+        # A monthly breakdown makes an improving (or decaying) process visible
+        # instead of hiding it inside one blended rate.
+        trend = await store.query(
+            "SELECT substr(date_created,1,7) month, COUNT(*) attempts, "
+            "SUM(CASE WHEN sharpe >= ? THEN 1 ELSE 0 END) hits FROM alphas "
+            "WHERE sharpe IS NOT NULL" + cfg_sql + " GROUP BY month ORDER BY month",
+            (good_sharpe, *params))
+        for r in trend:
+            r["hit_rate"] = round(r["hits"] / r["attempts"], 4) if r["attempts"] else None
+        return {"corpus": stats, "good_sharpe": good_sharpe, "window": window,
+                "by_month": trend,
+                "overall": {**overall,
+                            "hit_rate": round((overall["hits"] or 0) / overall["attempts"], 4)
+                            if overall["attempts"] else None},
+                "by_configuration": by_cfg,
+                "source": "local SQLite corpus (0 platform requests)"}
+
+    if scope in ("productivity", "operators"):
+        kind = "field" if scope == "productivity" else "operator"
+        if not stats.get("token_rows"):
+            return {"error": "Token index not built yet.",
+                    "hint": 'Run sync_alpha_corpus(action="start"); the index is built after a sync.'}
+        rows = await store.query(
+            "SELECT t.token, COUNT(*) attempts, "
+            "SUM(CASE WHEN a.sharpe >= ? THEN 1 ELSE 0 END) hits, "
+            "ROUND(MAX(a.sharpe), 3) best, ROUND(AVG(a.sharpe), 4) avg_sharpe "
+            "FROM alpha_tokens t JOIN alphas a ON a.id = t.alpha_id "
+            "WHERE t.kind = ? AND a.sharpe IS NOT NULL" + cfg_sql +
+            " GROUP BY t.token HAVING attempts >= ? "
+            "ORDER BY (CAST(hits AS REAL) / attempts) DESC, attempts DESC LIMIT ?",
+            (good_sharpe, kind, *params, min_attempts, limit))
+        for r in rows:
+            r["hit_rate"] = round(r["hits"] / r["attempts"], 4) if r["attempts"] else None
+        out_meta = {}
+        stale = stats.get("token_index_stale_by")
+        if stale:
+            out_meta["warning"] = (
+                f"The expression index covers {stats.get('token_index_covers')} of "
+                f"{stats.get('alphas')} alphas — {stale} newer ones are not counted, so these "
+                "rates are understated. Re-run sync_alpha_corpus to refresh it.")
+        return {"scope": scope, "kind": kind, "good_sharpe": good_sharpe,
+                "window": window, "min_attempts": min_attempts, "results": rows, **out_meta,
+                "note": ("hit_rate is hits/attempts — meaningful only because the corpus "
+                         "keeps the alphas that failed, not just the ones that worked. "
+                         "Weigh each row by its `attempts`: a rare token that only appears "
+                         "inside an already-strong family of alphas inherits their hit rate "
+                         "rather than causing it."),
+                "source": "local SQLite corpus (0 platform requests)"}
+
+    if scope == "gaps":
+        rows = await store.query(
+            "SELECT region, universe, delay, neutralization, COUNT(*) attempts, "
+            "SUM(CASE WHEN sharpe >= ? THEN 1 ELSE 0 END) hits FROM alphas "
+            "WHERE sharpe IS NOT NULL" + cfg_sql +
+            " GROUP BY region, universe, delay, neutralization "
+            "ORDER BY attempts ASC LIMIT ?", (good_sharpe, *params, limit))
+        return {"scope": "gaps", "window": window, "least_explored": rows,
+                "note": "Combinations with the fewest attempts — where the search is thinnest.",
+                "source": "local SQLite corpus (0 platform requests)"}
+
+    if scope == "similar":
+        if not contains:
+            return {"error": 'scope="similar" needs `contains`, e.g. contains="ts_rank close"'}
+        try:
+            rows = await store.query(
+                "SELECT a.id, a.region, a.universe, a.delay, a.sharpe, a.fitness, "
+                "a.date_created, a.expression FROM alphas_fts f "
+                "JOIN alphas a ON a.rowid = f.rowid "
+                "WHERE alphas_fts MATCH ?" + cfg_sql +
+                " ORDER BY a.sharpe DESC LIMIT ?", (contains, *params, limit))
+        except Exception as e:
+            return {"error": f"FTS query failed: {e}",
+                    "hint": "FTS5 syntax: bare words are AND-ed; quote phrases."}
+        for r in rows:
+            r["expression"] = _truncate(r["expression"], 200)
+        return {"scope": "similar", "query": contains, "matches": len(rows), "results": rows,
+                "source": "local SQLite corpus (0 platform requests)"}
+
+    if scope == "best":
+        rows = await store.query(
+            "SELECT id, region, universe, delay, neutralization, sharpe, fitness, turnover, "
+            "stage, date_created, expression FROM alphas WHERE sharpe IS NOT NULL" + cfg_sql +
+            " ORDER BY sharpe DESC LIMIT ?", (*params, limit))
+        for r in rows:
+            r["expression"] = _truncate(r["expression"], 200)
+        return {"scope": "best", "window": window, "results": rows,
+                "source": "local SQLite corpus (0 platform requests)"}
+
+    return {"error": f"Unknown scope {scope!r}",
+            "valid": ["summary", "productivity", "operators", "gaps", "similar", "best"]}
+
+
+@mcp.tool()
+async def sync_alpha_corpus(
+    action: str = "status",
+    since: str = "2026-01-01",
+    restart: bool = False,
+) -> Dict[str, Any]:
+    """Mirror this account's own alpha history into a local SQLite corpus.
+
+    WHY: /users/self/alphas costs ~50 ms and ~3 KB per row and is metered at 30
+    requests/minute, and its `count` saturates at 10000 so it cannot even tell
+    you how much there is. Locally the same corpus answers "have I tried this",
+    "what worked in USA/TOP3000", and "which datafield actually produces
+    high-Sharpe alphas" with zero platform requests.
+
+    Every alpha is kept, not only the good ones: productivity is a ratio, and the
+    denominator is the alphas that did not work.
+
+    Pagination note: offset cannot be used here (the platform rejects offset>=1000
+    with "Cannot display more than the first 1,000 alphas"), so the sweep walks
+    forward on dateCreated. It is resumable — the cursor lives in the database.
+
+    action:
+      - "status" (default) progress, rate and corpus stats. No side effects.
+      - "start"  begin/resume the sync in the background. Returns immediately.
+      - "stop"   pause it; the saved cursor means nothing is refetched later.
+
+    Args:
+        since: earliest dateCreated to mirror (default 2026-01-01)
+        restart: discard the saved cursor and start the window over
+    """
+    action = (action or "status").lower().strip()
+    client = brain_client
+
+    if action == "status":
+        snap = client._alpha_sync_snapshot()
+        snap['corpus'] = await client.alpha_store.stats()
+        if not snap.get('started_at'):
+            saved = await client.alpha_store.get_state(client.ALPHA_SYNC_CURSOR)
+            snap['saved_cursor'] = saved
+            snap['note'] = ('Idle: no sync running in this process (progress is per-process, '
+                            'the corpus and cursor are on disk). The corpus figures above are '
+                            'current. action="start" resumes from the saved cursor, which after '
+                            'a completed run means it only picks up what is new.')
+        return snap
+
+    if action == "stop":
+        return await client.stop_alpha_sync()
+
+    if action == "start":
+        return await client.start_alpha_sync(since=since, restart=restart)
+
+    return {'error': f'Unknown action {action!r}', 'valid': ['status', 'start', 'stop']}
+
+
+@mcp.tool()
+async def build_datafield_catalogue(
+    action: str = "status",
+    mode: str = "dedup",
+    region: Optional[str] = None,
+    universe: Optional[str] = None,
+    delay: Optional[int] = None,
+    instrument_type: str = "EQUITY",
+) -> Dict[str, Any]:
+    """Build the COMPLETE datafield catalogue, dataset by dataset, in the background.
+
+    WHY THIS EXISTS: an unfiltered /data-fields sweep cannot see the whole
+    catalogue. Its `count` saturates at 10000 and offset=10000 is rejected with
+    "Invalid offset. Please use filters to narrow down the result." For
+    USA/TOP3000 the datasets declare 91076 fields, so a sweep reaches 11% of them
+    and 267 datasets return nothing at all — with no signal in the payload that
+    anything is missing. Filtering by dataset.id lifts the cap, so the catalogue
+    is rebuilt one dataset at a time.
+
+    Runs as a background task inside this server so it shares the rate limiter
+    with normal traffic (a separate process would run a second limiter that
+    thinks it owns the whole 30/min budget, and the two would collide into 429s).
+    Expect foreground calls to be ~1-2s slower while it runs.
+
+    Fully resumable: datasets already stored are skipped, so stopping and
+    restarting never repeats work.
+
+    action:
+      - "status" (default) progress, coverage and ETA. No side effects.
+      - "start"  begin building every market configuration this account uses
+                 (derived from the OS PnL pools). Returns immediately.
+                 Pass region/universe/delay to build just one configuration.
+      - "stop"   cancel the running build; finished datasets stay on disk.
+
+    mode (for "start"):
+      - "dedup" (default) which field ids exist depends on region+delay, not on
+                universe — verified live: option4 returns the same 1298 ids for
+                USA/TOP500 and USA/TOP3000, and all four USA universes declare
+                the same 345 datasets / 91076 fields. Only userCount /
+                alphaCount / coverage differ. So a configuration whose dataset
+                list matches one already built reuses it instead of downloading
+                it again, and the payload records which universe the usage
+                metrics came from. Roughly halves the work (~4.9h vs ~11.7h for
+                this account's 23 configurations).
+      - "all"   download every configuration separately, so each carries its own
+                usage metrics. Use it when per-universe crowding matters.
+    """
+    action = (action or "status").lower().strip()
+    client = brain_client
+
+    if action == "status":
+        snap = client._catalogue_snapshot()
+        if not snap.get('started_at'):
+            configs = client._configs_in_use()
+            return {
+                'running': False,
+                'note': 'No build has been started in this process.',
+                'configurations_in_use': len(configs),
+                'configurations': configs,
+                'hint': ('Call with action="start" to build the complete catalogue. '
+                         'mode="dedup" (default) reuses a region\'s field set across its '
+                         'universes and is roughly half the work; mode="all" downloads each '
+                         'configuration separately so every universe carries its own '
+                         'userCount / coverage.'),
+            }
+        return snap
+
+    if action == "stop":
+        return await client.stop_catalogue_build()
+
+    if action == "start":
+        configs = None
+        if region and universe and delay is not None:
+            configs = [{'instrumentType': instrument_type, 'region': region,
+                        'universe': universe, 'delay': delay}]
+        if mode not in ('dedup', 'all'):
+            return {'error': f'Unknown mode {mode!r}', 'valid': ['dedup', 'all']}
+        return await client.start_catalogue_build(configs, mode=mode)
+
+    return {'error': f'Unknown action {action!r}', 'valid': ['status', 'start', 'stop']}
+
+
+@mcp.tool()
+async def sync_platform_cache(
+    scope: str = "status",
+    region: Optional[str] = None,
+    universe: Optional[str] = None,
+    delay: Optional[int] = None,
+    instrument_type: str = "EQUITY",
+    data_type: str = "",
+    dataset_id: Optional[str] = None,
+    alpha_ids: Optional[List[str]] = None,
+    max_entries: int = 3,
+    confirm: bool = False,
+) -> Dict[str, Any]:
+    """Inspect and manually refresh the permanent on-disk platform cache.
+
+    Immutable platform data (submitted-alpha records, alpha PnL, datafield and
+    dataset catalogues, the operator list) is stored forever and NEVER expires,
+    so ordinary tool calls cost zero platform traffic once warm. Use this tool
+    when you actually want to go back to the platform.
+
+    scope:
+      - "status"   (default, no network) sizes and ages of every stored namespace.
+      - "list"     (no network) the stored parameter sets of one namespace; pass
+                   `region`-style args as filters is not needed — use `max_entries`.
+      - "migrate"  (no network) copy entries still sitting in Redis into the disk
+                   store. Run this once after upgrading; it frees the Redis RAM.
+      - "operators"  refetch the operator catalogue (1 request).
+      - "datasets"   refetch dataset catalogues. With region/universe/delay given,
+                     refreshes exactly that set; otherwise the `max_entries`
+                     oldest stored sets.
+      - "datafields" same, but each set is up to ~200 paginated requests at
+                     1 req/s, so it requires `confirm=True` and is capped hard.
+      - "datafields_full" build the COMPLETE catalogue for ONE configuration by
+                     walking every dataset. Needed because an unfiltered sweep
+                     stops at 10000 rows while the datasets declare far more
+                     (USA/TOP3000: 91076), leaving hundreds of datasets invisible.
+                     Resumable; needs confirm=True. For all configurations at
+                     once use build_datafield_catalogue (runs in the background).
+      - "alphas"     refetch the records and PnL of `alpha_ids`.
+
+    Refreshing anything that costs more than a handful of requests requires
+    `confirm=True`; without it the call reports what it *would* fetch.
+    """
+    store = brain_client.store
+    scope = (scope or "status").lower().strip()
+
+    if scope == "status":
+        stats = await store.stats(PERSISTENT_NAMESPACES)
+        out: Dict[str, Any] = {'scope': 'status', 'store_root': str(store.root), 'disk': stats}
+        if brain_client.redis_client:
+            try:
+                leftovers = {}
+                for ns in PERSISTENT_NAMESPACES:
+                    leftovers[ns] = sum(
+                        1 for _ in brain_client.redis_client.scan_iter(f'{ns}:*', count=1000)
+                    )
+                out['redis_leftovers'] = leftovers
+                if any(leftovers.values()):
+                    out['hint'] = 'Run scope="migrate" to move these to disk and free the RAM.'
+            except Exception as e:
+                out['redis_leftovers'] = {'error': str(e)}
+        # Which configurations still have blind spots: an unfiltered sweep can
+        # only ever see 10000 rows, so compare what is stored against what the
+        # datasets declare.
+        coverage_rows = []
+        for entry in await store.list_entries('datafields'):
+            kp = entry.get('key_params') or {}
+            # Only whole-configuration catalogues; dataset- or type-scoped
+            # entries are subsets and would misreport coverage.
+            if not (kp.get('region') and kp.get('universe')):
+                continue
+            if kp.get('dataset_id') or (kp.get('data_type') or ''):
+                continue
+            payload = await store.get('datafields', entry.get('key'))
+            if not isinstance(payload, dict):
+                continue
+            _annotate_catalogue_completeness(payload)
+            declared = payload.get('declared_total')
+            unique = payload.get('count') or 0
+            # A field can belong to two datasets, so completeness is judged on
+            # rows fetched, not on unique ids.
+            fetched = payload.get('fetched_rows', unique)
+            coverage_rows.append({
+                'config': f"{kp['region']}/{kp['universe']}/delay{kp.get('delay')}",
+                'unique_fields': unique,
+                'fields_fetched': fetched,
+                'declared': declared,
+                'coverage': payload.get('coverage'),
+                'complete': bool(declared) and fetched >= declared,
+                'capped': bool(payload.get('capped')),
+            })
+        if coverage_rows:
+            coverage_rows.sort(key=lambda r: (r['complete'], r['config']))
+            out['catalogue_coverage'] = coverage_rows
+            blind = [r['config'] for r in coverage_rows if not r['complete']]
+            if blind:
+                out['catalogue_warning'] = (
+                    f"{len(blind)} configuration(s) hold a truncated catalogue: {blind[:8]}"
+                    + ('…' if len(blind) > 8 else '')
+                    + ". Run build_datafield_catalogue(action='start') to fix."
+                )
+        out['note'] = ('Stored entries never expire. Nothing here was refetched — '
+                       'pass a refresh scope to go back to the platform.')
+        return out
+
+    if scope == "list":
+        ns = (data_type or 'datafields').lower()
+        if ns not in PERSISTENT_NAMESPACES:
+            return {'error': f'Unknown namespace {ns}', 'valid': list(PERSISTENT_NAMESPACES)}
+        return {'scope': 'list', 'namespace': ns,
+                'entries': await store.list_entries(ns, limit=max(1, max_entries))}
+
+    if scope == "migrate":
+        if not brain_client.redis_client:
+            return {'error': 'Redis unavailable; nothing to migrate.'}
+        moved, freed, failed = 0, 0, 0
+        for ns in PERSISTENT_NAMESPACES:
+            for rkey in list(brain_client.redis_client.scan_iter(f'{ns}:*', count=1000)):
+                try:
+                    raw = brain_client.redis_client.get(rkey)
+                    if not raw:
+                        continue
+                    payload = json.loads(raw)
+                    # Namespaced keys are "<ns>:<id-or-hash>"; the store keys
+                    # datafields/datasets by the full hashed key, the rest by id.
+                    suffix = rkey.split(':', 1)[-1]
+                    key = rkey if ns in ('datafields', 'datasets') else suffix
+                    if ns == 'operators':
+                        key = 'all'
+                        if isinstance(payload, dict) and 'payload' in payload:
+                            payload = payload['payload']
+                    if ns == 'alpha_details' and not brain_client._is_frozen_alpha(payload):
+                        continue  # still mutable — leave it on its Redis TTL
+                    size = brain_client.redis_client.memory_usage(rkey) or 0
+                    await store.put(ns, key, payload)
+                    brain_client.redis_client.delete(rkey)
+                    moved += 1
+                    freed += size
+                except Exception:
+                    failed += 1
+        return {'scope': 'migrate', 'moved': moved, 'failed': failed,
+                'redis_freed_mb': round(freed / 1048576, 2),
+                'disk': await store.stats(PERSISTENT_NAMESPACES),
+                'note': 'No platform requests were made.'}
+
+    if scope == "operators":
+        data = await brain_client.get_operators(force_refresh=True)
+        return {'scope': 'operators', 'refreshed': True, 'operators': len(data or [])}
+
+    if scope == "alphas":
+        ids = [a for a in (alpha_ids or []) if a]
+        if not ids:
+            return {'error': 'scope="alphas" needs alpha_ids.'}
+        if len(ids) > 50 and not confirm:
+            return {'error': 'More than 50 alphas; pass confirm=True.', 'requested': len(ids)}
+        async def _one(aid: str) -> Dict[str, Any]:
+            row: Dict[str, Any] = {'alpha_id': aid}
+            try:
+                det = await brain_client.get_alpha_details(aid, force_refresh=True)
+                row['stage'] = det.get('stage')
+                row['stored_permanently'] = brain_client._is_frozen_alpha(det)
+            except Exception as e:
+                row['details_error'] = str(e)
+            try:
+                await brain_client.get_alpha_pnl(aid, force_refresh=True)
+                row['pnl'] = 'refreshed'
+            except Exception as e:
+                row['pnl_error'] = str(e)
+            return row
+        return {'scope': 'alphas', 'results': list(await asyncio.gather(*[_one(a) for a in ids]))}
+
+    if scope == "datafields_full":
+        if not (region and universe and delay is not None):
+            return {'error': 'scope="datafields_full" needs region, universe and delay.',
+                    'hint': 'For every configuration at once use build_datafield_catalogue.'}
+        datasets = await brain_client.get_datasets(None, region, delay, universe, 'false', None)
+        drows = [x for x in (datasets.get('results') or []) if isinstance(x, dict) and x.get('id')]
+        declared = sum(x.get('fieldCount') or 0 for x in drows)
+        cfg = brain_client._df_config_key(instrument_type, region, delay, universe)
+        stored, missing_fields = 0, 0
+        for x in drows:
+            if await store.get('datafields_ds', f"{cfg}:{x['id']}"):
+                stored += 1
+            else:
+                missing_fields += x.get('fieldCount') or 0
+        if not confirm:
+            pages = missing_fields / 50.0
+            return {
+                'scope': 'datafields_full',
+                'config': {'region': region, 'universe': universe, 'delay': delay},
+                'datasets_total': len(drows),
+                'datasets_already_stored': stored,
+                'declared_fields': declared,
+                'fields_still_missing': missing_fields,
+                'estimated_requests': int(pages) + (len(drows) - stored),
+                'estimated_minutes': round(pages / 27.0, 1),
+                'note': ('An unfiltered sweep is capped at 10000 rows, so most datasets are '
+                         'invisible in the normal catalogue. This walks each dataset individually. '
+                         'Resumable. Pass confirm=True to run it in the foreground, or use '
+                         'build_datafield_catalogue to run it in the background.'),
+            }
+        result = await brain_client.build_full_datafield_catalogue(
+            instrument_type, region, delay, universe, force_refresh=False, progress=True)
+        return {
+            'scope': 'datafields_full',
+            'config': {'region': region, 'universe': universe, 'delay': delay},
+            'fields': result.get('count'),
+            'declared_total': result.get('declared_total'),
+            'coverage': result.get('coverage'),
+            'datasets': result.get('datasets'),
+            'incomplete_datasets': result.get('incomplete_datasets'),
+        }
+
+    if scope in ("datasets", "datafields"):
+        explicit = bool(region and universe and delay is not None)
+        targets: List[Dict[str, Any]] = []
+        if explicit:
+            targets = [{'region': region, 'universe': universe, 'delay': delay,
+                        'instrumentType': instrument_type, 'data_type': data_type,
+                        'dataset_id': dataset_id}]
+        else:
+            rows = await store.list_entries(scope)
+            rows.sort(key=lambda r: r.get('fetched_at') or 0)  # stalest first
+            for r in rows[:max(1, max_entries)]:
+                kp = r.get('key_params') or {}
+                if kp.get('region') and kp.get('universe'):
+                    targets.append({
+                        'region': kp.get('region'), 'universe': kp.get('universe'),
+                        'delay': kp.get('delay'), 'instrumentType': kp.get('instrumentType', 'EQUITY'),
+                        'data_type': kp.get('data_type', ''), 'dataset_id': kp.get('dataset_id'),
+                    })
+        if not targets:
+            stored = len(await store.list_entries(scope))
+            return {'scope': scope, 'refreshed': [], 'stored_entries': stored,
+                    'note': ('Entries migrated out of Redis carry only a hashed key, so their '
+                             'parameters are unknown until something reads them once. Pass '
+                             'region/universe/delay explicitly to refresh a specific set.'
+                             if stored else
+                             'Nothing stored yet and no region/universe/delay given.')}
+
+        # /data-fields is metered at 1 req/s; a single catalogue is ~200 pages.
+        est = len(targets) * (200 if scope == 'datafields' else 3)
+        if not confirm:
+            return {'scope': scope, 'would_refresh': targets,
+                    'estimated_requests': est,
+                    'estimated_minutes': round(est / 30.0, 1),
+                    'note': 'Dry run. Pass confirm=True to actually refetch.'}
+        if scope == 'datafields' and len(targets) > 5:
+            return {'error': 'Refusing to refresh more than 5 datafield catalogues at once '
+                             f'(~{est} requests). Narrow it down or lower max_entries.'}
+
+        refreshed = []
+        for t in targets:
+            try:
+                if scope == 'datasets':
+                    res = await brain_client.get_datasets(
+                        region=t['region'], delay=t['delay'], universe=t['universe'],
+                        force_refresh=True)
+                else:
+                    res = await brain_client.get_datafields(
+                        instrument_type=t.get('instrumentType', 'EQUITY'), region=t['region'],
+                        delay=t['delay'], universe=t['universe'],
+                        dataset_id=t.get('dataset_id'), data_type=t.get('data_type', ''),
+                        force_refresh=True)
+                refreshed.append({**t, 'count': res.get('count')})
+            except Exception as e:
+                refreshed.append({**t, 'error': str(e)})
+        return {'scope': scope, 'refreshed': refreshed}
+
+    return {'error': f'Unknown scope {scope!r}',
+            'valid': ['status', 'list', 'migrate', 'operators', 'datasets', 'datafields',
+                      'datafields_full', 'alphas']}
+
+
+@mcp.tool()
+async def search_my_simulations(
+    region: Optional[str] = None,
+    universe: Optional[str] = None,
+    delay: Optional[int] = None,
+    neutralization: Optional[str] = None,
+    contains: Optional[str] = None,
+    min_sharpe: Optional[float] = None,
+    min_fitness: Optional[float] = None,
+    max_turnover: Optional[float] = None,
+    sort: str = "sharpe",
+    limit: int = 25,
+) -> Dict[str, Any]:
+    """Search the backtests this server has run, from the local ledger.
+
+    Every simulation created through this server is recorded with its expression,
+    settings and IS metrics, so your own research history is queryable without
+    paging /users/self/alphas (which returns ~50 ms and 4 KB per row and is
+    metered at 30 requests/minute). Zero platform requests.
+
+    Args:
+        region / universe / delay / neutralization: exact-match filters
+        contains: substring the alpha expression must contain
+        min_sharpe / min_fitness / max_turnover: metric thresholds
+        sort: sharpe | fitness | turnover | returns | recent
+        limit: rows to return (default 25)
+    """
+    try:
+        rows = await brain_client.read_simulation_ledger()
+    except Exception as e:
+        return {"error": f"An unexpected error occurred: {str(e)}"}
+    total = len(rows)
+    if not total:
+        return {"count": 0, "results": [],
+                "note": "No simulations recorded yet — the ledger fills as backtests run through this server."}
+
+    def metric(r, name):
+        v = (r.get("metrics") or {}).get(name)
+        return v if isinstance(v, (int, float)) else None
+
+    def keep(r):
+        if region and str(r.get("region") or "").upper() != region.upper(): return False
+        if universe and str(r.get("universe") or "").upper() != universe.upper(): return False
+        if delay is not None and str(r.get("delay")) != str(delay): return False
+        if neutralization and str(r.get("neutralization") or "").upper() != neutralization.upper(): return False
+        if contains and contains.lower() not in str(r.get("expression") or "").lower(): return False
+        if min_sharpe is not None and (metric(r, "sharpe") or -9e9) < min_sharpe: return False
+        if min_fitness is not None and (metric(r, "fitness") or -9e9) < min_fitness: return False
+        if max_turnover is not None and (metric(r, "turnover") or 9e9) > max_turnover: return False
+        return True
+
+    matched = [r for r in rows if keep(r)]
+    sorters = {
+        "sharpe": lambda r: -(metric(r, "sharpe") or -9e9),
+        "fitness": lambda r: -(metric(r, "fitness") or -9e9),
+        "returns": lambda r: -(metric(r, "returns") or -9e9),
+        "turnover": lambda r: (metric(r, "turnover") if metric(r, "turnover") is not None else 9e9),
+        "recent": lambda r: -(r.get("simulated_at") or 0),
+    }
+    matched.sort(key=sorters.get(sort, sorters["sharpe"]))
+
+    facets = _facets(matched, {
+        "region": lambda r: r.get("region"),
+        "universe": lambda r: r.get("universe"),
+        "neutralization": lambda r: r.get("neutralization"),
+    })
+    out = {
+        "ledger_size": total,
+        "count": len(matched),
+        "returned": min(limit, len(matched)),
+        "sort": sort,
+        "facets": facets,
+        "results": [{
+            "alpha_id": r.get("alpha_id"),
+            "expression": _truncate(r.get("expression"), 220),
+            "region": r.get("region"), "universe": r.get("universe"),
+            "delay": r.get("delay"), "neutralization": r.get("neutralization"),
+            "metrics": {k: v for k, v in (r.get("metrics") or {}).items() if v is not None},
+            "simulated_at": datetime.fromtimestamp(r.get("simulated_at") or 0).isoformat(),
+        } for r in matched[:max(1, limit)]],
+        "source": "local simulation ledger (0 platform requests)",
+    }
+    return out
+
+
+@mcp.tool()
+async def whats_new_in_data(
+    region: str = "USA",
+    universe: str = "TOP3000",
+    delay: int = 1,
+    since: Optional[str] = None,
+    top_datasets: int = 15,
+) -> Dict[str, Any]:
+    """What data the platform has published recently, for one market configuration.
+
+    BRAIN ships new datafields in monthly batches and stamps every field with
+    ``dateCreated`` and every dataset with ``dateUpdated``. This reports the
+    release timeline and what landed in the most recent batches, so you can tell
+    at a glance whether there is anything new to research since you last looked.
+
+    Runs entirely against the local permanent catalogue — zero platform requests.
+    Refresh the catalogue first with sync_platform_cache(scope="datafields", ...)
+    if you want to pick up a release that happened after it was last fetched.
+
+    Args:
+        region / universe / delay: market configuration
+        since: only report on/after this date ("2026-03-01"). Defaults to the
+               two most recent release batches.
+        top_datasets: how many datasets to break the newest batch down by
+    """
+    try:
+        fields = await brain_client.get_datafields(
+            "EQUITY", region, delay, universe, "false", None, "", None, False)
+        datasets = await brain_client.get_datasets(None, region, delay, universe, "false", None)
+    except Exception as e:
+        return {"error": f"An unexpected error occurred: {str(e)}"}
+
+    frows = [f for f in (fields.get("results") or []) if isinstance(f, dict)]
+    drows = [x for x in (datasets.get("results") or []) if isinstance(x, dict)]
+    if not frows:
+        return {"error": "No catalogue stored for this configuration yet; call get_datafields once to fetch it."}
+
+    def timeline(rows, key):
+        counts = {}
+        for r in rows:
+            v = str(r.get(key) or "")[:10]
+            if v:
+                counts[v] = counts.get(v, 0) + 1
+        return dict(sorted(counts.items(), reverse=True))
+
+    field_timeline = timeline(frows, "dateCreated")
+    dataset_timeline = timeline(drows, "dateUpdated")
+
+    releases = list(field_timeline)
+    if since:
+        cutoff = str(since)[:10]
+    else:
+        # Default to the two most recent batches: enough to answer "anything new?"
+        cutoff = releases[1] if len(releases) > 1 else (releases[0] if releases else "")
+
+    new_fields = [f for f in frows if str(f.get("dateCreated") or "")[:10] >= cutoff]
+    new_datasets = [x for x in drows if str(x.get("dateUpdated") or "")[:10] >= cutoff]
+
+    by_dataset = {}
+    for f in new_fields:
+        ds = f.get("dataset")
+        did = ds.get("id") if isinstance(ds, dict) else ds
+        if did:
+            by_dataset[did] = by_dataset.get(did, 0) + 1
+    ranked = sorted(by_dataset.items(), key=lambda kv: -kv[1])[:max(1, top_datasets)]
+    ds_names = {x.get("id"): x.get("name") for x in drows}
+
+    return {
+        "config": {"region": region, "universe": universe, "delay": delay},
+        "since": cutoff,
+        "catalogue_totals": {"datafields": len(frows), "datasets": len(drows)},
+        "new_since": {"datafields": len(new_fields), "datasets": len(new_datasets)},
+        "field_release_timeline": dict(list(field_timeline.items())[:12]),
+        "dataset_update_timeline": dict(list(dataset_timeline.items())[:12]),
+        "top_datasets_in_window": [
+            {"dataset": did, "name": ds_names.get(did), "new_fields": n} for did, n in ranked
+        ],
+        "sample_new_fields": [
+            {"id": f.get("id"), "dataset": (f.get("dataset") or {}).get("id")
+                if isinstance(f.get("dataset"), dict) else None,
+             "type": f.get("type"), "userCount": f.get("userCount"),
+             "dateCreated": f.get("dateCreated"),
+             "description": _truncate(f.get("description"), 120)}
+            for f in sorted(new_fields, key=lambda f: -(f.get("userCount") or 0))[:15]
+        ],
+        "next_step": (f'get_datafields(region="{region}", universe="{universe}", delay={delay}, '
+                      f'since="{cutoff}", sort="-dateCreated") to page the full list, or pass '
+                      'dataset_id to drill into one of the datasets above.'),
+        "source": "local permanent catalogue (0 platform requests)",
+    }
+
+
+@mcp.tool()
+async def get_api_traffic_status() -> Dict[str, Any]:
+    """Inspect how much BRAIN API traffic this server is generating and why.
+
+    Reports, per endpoint family, the quota learned from the platform's own
+    RateLimit headers, how many requests were sent in the last minute, and any
+    active cooldown; plus the Redis cache footprint that is keeping requests
+    off the wire. Use it to diagnose slow tools before assuming the platform is
+    the bottleneck.
+    """
+    out: Dict[str, Any] = {
+        'rate_limits': brain_client.rate_limiter.snapshot(),
+        'max_concurrency': brain_client._max_concurrency,
+        'auth_cached_for_seconds': round(
+            max(0.0, brain_client._auth_validated_until - time.time()), 1
+        ),
+    }
+    # Permanent tier: immutable platform data, never expires.
+    out['permanent_store'] = await brain_client.store.stats(PERSISTENT_NAMESPACES)
+
+    # Hot tier: only data that actually changes still lives in Redis.
+    if brain_client.redis_client:
+        try:
+            counts: Dict[str, int] = {}
+            for prefix in ('user_alphas', 'pyramid_alphas', 'platform_settings',
+                           'alpha_details', 'alpha_pnl', 'datafields', 'datasets'):
+                counts[prefix] = sum(
+                    1 for _ in brain_client.redis_client.scan_iter(f'{prefix}:*', count=500)
+                )
+            info = brain_client.redis_client.info('memory')
+            out['redis'] = {
+                'keys_by_prefix': counts,
+                'used_memory_human': info.get('used_memory_human'),
+                'maxmemory_human': info.get('maxmemory_human'),
+            }
+            stale = sum(counts.get(ns, 0) for ns in PERSISTENT_NAMESPACES)
+            if stale:
+                out['redis']['hint'] = (
+                    f'{stale} immutable entr(ies) still in Redis — run '
+                    'sync_platform_cache(scope="migrate") to move them to disk.'
+                )
+        except Exception as e:
+            out['redis'] = {'error': str(e)}
+    else:
+        out['redis'] = {'backend': None,
+                        'warning': 'Redis unavailable — mutable lookups go to the platform.'}
+    try:
+        pools = sorted(Path(__file__).parent.joinpath('downloads').glob('os_pnl_pool*.pkl'))
+        out['os_pnl_pools'] = {
+            'files': len(pools),
+            'bytes': sum(p.stat().st_size for p in pools),
+        }
+    except Exception:
+        pass
+    return out
+
+
 @mcp.tool()
 async def lookINTO_SimError_message(locations: Sequence[str]) -> dict:
     """

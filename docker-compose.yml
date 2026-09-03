@@ -36,7 +36,15 @@ services:
     image: redis:6-alpine
     container_name: mcp-redis
     restart: unless-stopped
-    command: redis-server --appendonly yes --appendfsync everysec
+    # Redis is now only the HOT tier: immutable platform data (datafields,
+    # datasets, operators, alpha records and PnL) lives in the permanent on-disk
+    # store under ./cache, which is 19x smaller compressed and costs no RAM.
+    # A cap plus volatile-lru turns memory pressure into eviction of TTL'd cache
+    # entries instead of the previous behaviour (no cap + noeviction), where
+    # exhausting RAM made every write fail.
+    command: >-
+      redis-server --appendonly yes --appendfsync everysec
+      --maxmemory 512mb --maxmemory-policy volatile-lru
     volumes:
       - redis_data:/data
     ports:
