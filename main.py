@@ -2793,16 +2793,39 @@ class BrainApiClient:
         another request is already polling, this returns ``correlation_busy``
         immediately instead of queueing behind it.
         """
+        return await self._get_platform_correlation(alpha_id, 'prod', 'production')
+
+    async def get_power_pool_correlation(self, alpha_id: str) -> Dict[str, Any]:
+        """Get Power Pool (PPA) correlation from the platform endpoint.
+
+        Hits ``GET /alphas/{id}/correlations/power-pool`` — the same
+        compute-then-poll endpoint family as ``/correlations/prod`` (HTTP 200 +
+        empty body + Retry-After while the platform computes). Unlike the prod
+        histogram, the payload is self-correlation-shaped: per-alpha records
+        (schema columns include id/name/correlation/...) plus top-level scalar
+        ``min``/``max``.
+
+        Shares the per-account correlation lock with the production check —
+        BRAIN allows one in-flight correlation computation per account, so a
+        concurrent prod OR power-pool check returns ``correlation_busy`` with
+        the standard 3-minute retry_after instead of queueing.
+        """
+        return await self._get_platform_correlation(alpha_id, 'power-pool', 'power pool')
+
+    async def _get_platform_correlation(self, alpha_id: str, endpoint: str, label: str) -> Dict[str, Any]:
+        """Shared lock-acquire/poll/release skeleton for the platform correlation
+        endpoints (``prod`` and ``power-pool``). Both share one per-account lock."""
         await self.ensure_authenticated()
 
-        op_name = f"get_production_correlation({alpha_id})"
+        op_name = f"get_{endpoint}_correlation({alpha_id})"
         lock_info = await self._try_acquire_brain_correlation_lock(op_name)
         if not lock_info.get('acquired'):
             retry_after = self._brain_correlation_busy_retry_after_seconds
             return {
                 'status': 'correlation_busy',
                 'message': (
-                    'Another production correlation check is already running for this account. '
+                    f'Another platform correlation check (production or power-pool) is already '
+                    f'running for this account; the {label} correlation check cannot start. '
                     'The BRAIN platform supports only one in-flight correlation computation. '
                     f'Please retry in {retry_after} seconds.'
                 ),
@@ -2813,7 +2836,7 @@ class BrainApiClient:
             }
 
         try:
-            return await self._poll_production_correlation(alpha_id)
+            return await self._poll_platform_correlation(alpha_id, endpoint, label)
         finally:
             await self._release_brain_correlation_lock(lock_info, op_name)
 
@@ -2883,7 +2906,54 @@ class BrainApiClient:
             corr_data['min'] = min(los)
         return corr_data
 
-    async def _poll_production_correlation(self, alpha_id: str) -> Dict[str, Any]:
+    @staticmethod
+    def _normalize_record_style_correlation(corr_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize a self/power-pool-style correlation payload in place.
+
+        That payload carries per-alpha records as [id, name, ..., correlation, ...]
+        rows described by ``schema.properties`` plus top-level scalar min/max.
+        Rewrites ``records`` into [{'id', 'name', 'region', 'universe',
+        'correlation'}, ...] sorted by correlation desc, and guarantees a scalar
+        'max' (0.0 for an empty pool) so callers and the polling loop can
+        terminate on ``max is not None``. Histogram payloads (no 'correlation'
+        column) are left untouched.
+        """
+        if not isinstance(corr_data, dict):
+            return corr_data
+        props = [p.get('name') for p in (corr_data.get('schema') or {}).get('properties', [])
+                 if isinstance(p, dict)]
+        if 'correlation' not in props:
+            return corr_data
+        records = corr_data.get('records')
+        if isinstance(records, list):
+            keep = ('id', 'name', 'region', 'universe', 'correlation')
+            dict_records = []
+            for rec in records:
+                if isinstance(rec, dict):
+                    dict_records.append({k: rec.get(k) for k in keep if k in rec})
+                    continue
+                if not isinstance(rec, (list, tuple)) or len(rec) != len(props):
+                    continue
+                row = dict(zip(props, rec))
+                dict_records.append({k: row.get(k) for k in keep if k in row})
+            dict_records.sort(
+                key=lambda r: (r.get('correlation') is not None, r.get('correlation')),
+                reverse=True,
+            )
+            corr_data['records'] = dict_records
+            if corr_data.get('max') is None:
+                corrs = [r['correlation'] for r in dict_records
+                         if isinstance(r.get('correlation'), (int, float))]
+                # Empty pool (e.g. no Power Pool Alphas yet) => correlation is 0.
+                corr_data['max'] = max(corrs) if corrs else 0.0
+        return corr_data
+
+    async def _poll_platform_correlation(
+        self,
+        alpha_id: str,
+        endpoint: str = 'prod',
+        label: str = 'production',
+    ) -> Dict[str, Any]:
         max_wait_seconds = 3600  # 1 hour total
         poll_interval = 30       # 30 seconds per attempt (matches reference implementation)
         start_time = time.time()
@@ -2894,24 +2964,24 @@ class BrainApiClient:
         while True:
             elapsed = time.time() - start_time
             if elapsed >= max_wait_seconds:
-                self.log(f"Production correlation timeout after {int(elapsed)}s for {alpha_id}", "WARNING")
+                self.log(f"{label} correlation timeout after {int(elapsed)}s for {alpha_id}", "WARNING")
                 return {
                     'status': 'pending',
                     'message': (
-                        f"Production correlation data for alpha {alpha_id} was not available "
+                        f"{label} correlation data for alpha {alpha_id} was not available "
                         f"after {int(elapsed)}s of polling. The platform may still be computing "
-                        "it. Please retry check_correlation in a few minutes."
+                        "it. Please retry in a few minutes."
                     ),
                     'max': None,
                     'records': [],
                 }
-            
+
             attempt += 1
             try:
                 if attempt % 5 == 1:
-                    self.log(f"[PC等待] 正在等待 Alpha {alpha_id} 的 PC 数据 (第 {attempt} 次查询, 已等待 {int(elapsed)}s)", "INFO")
-                
-                response = await self._request('GET', f"{self.base_url}/alphas/{alpha_id}/correlations/prod")
+                    self.log(f"[corr等待] 正在等待 Alpha {alpha_id} 的 {label} 相关性数据 (第 {attempt} 次查询, 已等待 {int(elapsed)}s)", "INFO")
+
+                response = await self._request('GET', f"{self.base_url}/alphas/{alpha_id}/correlations/{endpoint}")
                 response.raise_for_status()
                 
                 text = (response.text or "").strip()
@@ -2920,7 +2990,7 @@ class BrainApiClient:
                     if consecutive_empty == 3:
                         # Platform is still computing — log once so users understand the wait
                         self.log(
-                            f"[PC计算中] Alpha {alpha_id} 的生产相关性数据尚未就绪 "
+                            f"[corr计算中] Alpha {alpha_id} 的 {label} 相关性数据尚未就绪 "
                             f"(已收到 {consecutive_empty} 次空响应). "
                             "平台正在计算中，通常需要 1-5 分钟，请耐心等待...",
                             "INFO"
@@ -2939,20 +3009,23 @@ class BrainApiClient:
                 except json.JSONDecodeError:
                     corr_data = None
                 if corr_data:
-                    # The payload is a HISTOGRAM, not a scalar: schema properties are
-                    # [min, max, alphas] and each record is [bucket_lo, bucket_hi, count].
-                    # There is NO top-level 'max' key, so deriving it here is what makes
-                    # the poller terminate at all.
+                    # 'prod' payload is a HISTOGRAM with no top-level scalar: schema
+                    # properties are [min, max, alphas] and each record is
+                    # [bucket_lo, bucket_hi, count] — 'max' must be derived here.
+                    # 'power-pool' payload is record-style (per-alpha rows with a
+                    # 'correlation' column) and is normalized instead. Either way a
+                    # scalar 'max' is what makes the poller terminate at all.
                     self._ensure_correlation_extrema(corr_data)
+                    self._normalize_record_style_correlation(corr_data)
                     if corr_data.get('max') is not None:
-                        self.log(f"[PC成功] Alpha {alpha_id} PC={corr_data['max']} (第 {attempt} 次查询, 耗时 {int(elapsed)}s)", "INFO")
+                        self.log(f"[corr成功] Alpha {alpha_id} {label} corr={corr_data['max']} (第 {attempt} 次查询, 耗时 {int(elapsed)}s)", "INFO")
                         return corr_data
-                    
+
             except (requests.RequestException, ConnectionError, TimeoutError) as e:
                 consecutive_network_failures += 1
                 retry_delay = min(5 * consecutive_network_failures, poll_interval)
                 self.log(
-                    f"Failed to get production correlation for {alpha_id} "
+                    f"Failed to get {label} correlation for {alpha_id} "
                     f"(network failure {consecutive_network_failures}): {e}. "
                     f"Retrying in {retry_delay}s",
                     "WARNING"
@@ -3548,12 +3621,16 @@ class BrainApiClient:
         }
 
     async def check_correlation(self, alpha_id: str, correlation_type: str = "production", threshold: float = 0.7) -> Dict[str, Any]:
-        """ Only where all IS metrics PASS to Check alpha correlation, Check alpha correlation against production alphas, self alphas, or both.
+        """ Only where all IS metrics PASS to Check alpha correlation, Check alpha correlation against production alphas, self alphas, power-pool alphas, or combinations.
 
-        Concurrency: production correlation hits BRAIN's per-account
-        single-concurrency endpoint. ``get_production_correlation`` uses a
-        fail-fast lock, so concurrent production checks return busy instead of
-        waiting. The ``self`` path is computed locally and is not gated here.
+        correlation_type: 'production' | 'self' | 'powerpool' | 'both'
+        ('both' = production + self, unchanged legacy behaviour).
+
+        Concurrency: production AND power-pool correlations hit BRAIN's
+        per-account single-concurrency endpoint family and share ONE fail-fast
+        lock, so a concurrent platform check of either kind returns busy
+        (retry_after = 3 minutes) instead of waiting. The ``self`` path is
+        computed locally and is not gated here.
         """
         await self.ensure_authenticated()
 
@@ -3564,20 +3641,25 @@ class BrainApiClient:
                 'correlation_type': correlation_type,
                 'checks': {}
             }
-            
+
             # Determine which correlations to check
             check_types = []
             if correlation_type == "both":
                 check_types = ["production", "self"]
             else:
                 check_types = [correlation_type]
-            
+
             all_passed = True
-            
+
             for check_type in check_types:
-                if check_type == "production":
-                    correlation_data = await self.get_production_correlation(alpha_id)
-                    
+                if check_type in ("powerpool", "power-pool", "ppa", "ppac"):
+                    check_type = "powerpool"
+                if check_type in ("production", "powerpool"):
+                    if check_type == "production":
+                        correlation_data = await self.get_production_correlation(alpha_id)
+                    else:
+                        correlation_data = await self.get_power_pool_correlation(alpha_id)
+
                     # Handle pending/data-not-yet-available case (super alphas, fresh simulations)
                     if correlation_data and correlation_data.get('status') == 'pending':
                         results['checks'][check_type] = {
@@ -3607,12 +3689,17 @@ class BrainApiClient:
                         results['retry_after'] = correlation_data.get('retry_after')
                         return results
 
-                    if (
+                    # 'production' needs non-empty histogram records to be trustworthy.
+                    # 'powerpool' may legitimately have records == [] (no Power Pool
+                    # Alphas submitted yet) with a normalized max of 0.0 — that is a
+                    # real "correlation 0" answer, not missing data.
+                    has_usable_data = (
                         correlation_data
                         and isinstance(correlation_data.get('records'), list)
-                        and len(correlation_data['records']) > 0
                         and correlation_data.get('max') is not None
-                    ):
+                        and (check_type == "powerpool" or len(correlation_data['records']) > 0)
+                    )
+                    if has_usable_data:
                         max_correlation = correlation_data['max']
                         passes_check = max_correlation < threshold
                         results['checks'][check_type] = {
@@ -3632,7 +3719,7 @@ class BrainApiClient:
                             'passes_check': None,
                             'status': 'data_unavailable',
                             'message': (
-                                'Production correlation data is unavailable for this alpha. '
+                                f'{check_type} correlation data is unavailable for this alpha. '
                                 'This may be a newly-created super alpha where the platform '
                                 'has not yet computed the correlation. Please retry in a few minutes.'
                             ),
@@ -4423,6 +4510,11 @@ def _slim_correlation_block(b):
     for k in ("max_correlation", "passes_check"):
         if k in b:
             out[k] = b[k]
+    # Keep the busy/pending/unavailable signal — without it a locked-out call is
+    # indistinguishable from "no data".
+    for k in ("status", "message", "retry_after"):
+        if b.get(k) is not None:
+            out[k] = b[k]
     cd = b.get("correlation_data") or {}
     recs = cd.get("records")
     if isinstance(recs, list) and recs and isinstance(recs[0], list) and len(recs[0]) >= 3:
@@ -4452,7 +4544,8 @@ def _slim_check_correlation(obj):
         out.update(_slim_correlation_block(payload))
         return _rewrap(out, w)
     # check_correlation shape: {alpha_id, threshold, correlation_type, checks: {production:{...}, self:{...}}, all_passed}
-    out = {k: payload.get(k) for k in ("alpha_id", "threshold", "correlation_type") if k in payload}
+    out = {k: payload.get(k) for k in ("alpha_id", "threshold", "correlation_type", "status", "message", "retry_after")
+           if payload.get(k) is not None}
     checks = payload.get("checks")
     if isinstance(checks, dict):
         out["checks"] = {k: _slim_correlation_block(v) for k, v in checks.items()}
@@ -5354,11 +5447,48 @@ async def get_alpha_yearly_stats(alpha_id: str) -> Dict[str, Any]:
 
 @mcp.tool()
 async def check_correlation(alpha_id: str) -> Dict[str, Any]:
-    """Check alpha correlation against production alphas, self alphas, or both."""
+    """Check alpha correlation against production alphas, self alphas, or both.
+
+    Does NOT include the Power Pool (PPA) correlation — use
+    check_power_pool_correlation for that (platform call, shares the same
+    per-account correlation lock as the production check here).
+    """
     correlation_type = "both"
     threshold = 0.7
     try:
         return _slim_check_correlation(await brain_client.check_correlation(alpha_id, correlation_type, threshold))
+    except Exception as e:
+        return {"error": str(e)}
+
+@mcp.tool()
+async def check_power_pool_correlation(alpha_id: str, threshold: float = 0.5) -> Dict[str, Any]:
+    """Check alpha correlation against YOUR submitted Power Pool Alphas (PPA) via the PLATFORM.
+
+    WHEN TO USE: ONLY when the user explicitly says they are hunting PPA
+    alphas — i.e. the target profile is ppa_failed_count=0 with
+    ra_failed_count>0. A regular-alpha candidate (ppa_failed_count=0 AND
+    ra_failed_count=0 target) does NOT need this check — do not run it
+    routinely; it consumes the account's single platform correlation slot.
+
+    Calls ``GET /alphas/{id}/correlations/power-pool`` — the authoritative
+    platform number. (check_self_correlation(correlation_type='powerpool') is
+    only a local approximation; the PPA gate must be validated on-platform.)
+
+    Concurrency: this endpoint family allows ONE in-flight correlation
+    computation per account, so this tool SHARES the production-correlation
+    lock. If a production or power-pool check is already running, it returns
+    status='correlation_busy' with retry_after=180 (3 minutes) instead of
+    queueing — retry after that.
+
+    Default threshold 0.5 matches the PPAC submission gate: a PPA whose
+    power-pool correlation exceeds 0.5 is rejected (the platform sometimes
+    surfaces this as a misleading 'ProdCorrelation' error).
+
+    Returns max_correlation, passes_check, and the top correlated Power Pool
+    alpha records. An empty Power Pool yields max_correlation=0.0 (pass).
+    """
+    try:
+        return _slim_check_correlation(await brain_client.check_correlation(alpha_id, "powerpool", threshold))
     except Exception as e:
         return {"error": str(e)}
 
