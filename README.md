@@ -362,9 +362,30 @@ search="dividend cut"  ->  4 条
 
 效果：`analyst revision` 从返回 "forecast type" 元数据标志变成返回真正的修正指标（898 条），`short squeeze` 83 条全部相关，"cutoff" 误报消失。支持 FTS5 语法：`dividend AND (cut OR lower OR reduce)`。
 
-**向量库的取舍**：FTS5 匹配的是描述里的**词**，不是**意思**。`investor attention` 返回 0——没有描述用这个说法，尽管 search-volume 和 news-buzz 类字段是存在的。实测表明靠调用方扩展查询并不能干净地补上：`search volume` / `news attention` / `abnormal turnover` 都是 0 条，而 `attention OR interest OR buzz` 虽有 2098 条但精确率很差（"interest" 会命中 short interest、interest rate）。
+#### 向量检索：试过了，实测更差，已撤除
 
-所以这是个**真实的能力缺口**，向量检索确实能填。暂不引入的理由是成本而非无用：Ollama 当前没有映射端口、与 mcp 不在同一 docker 网络（Milvus 已开放 19530），另需 14 万次嵌入和约 440MB 向量。等这类"不知道该用什么词"的查询成为瓶颈时再上，届时只是在现有三层之上加一层，不影响已有结构。
+FTS5 匹配描述里的**词**而非**意思**，`investor attention` 直接搜返回 0——看起来正是向量检索该解决的场景。所以完整实现并实测了一遍：Ollama 的 `nomic-embed-text`（768 维），106,481 条唯一描述，52 分钟嵌入，312MB，本地 memmap 暴力检索 12ms。
+
+**结果是负面的。** 正确答案 `relative_interest_score`（"The Google Trends popularity score for the search term"）在语义检索里排到 **103,473 / 106,481**——倒数 3%，不是靠前：
+
+| 查询 | FTS5 | 语义检索 |
+| --- | --- | --- |
+| `investor attention` | 0（但 OR 展开后 18 条，全对） | 1 条，`customer_securities_investment` — 错 |
+| `dividend cut` | 3 条 | 2 条，描述就是 `dividend` — 更差 |
+| `short squeeze` | 83 条 | 2 条 — 明显更差 |
+| `crowded trade risk` | 0 | `mdl239_shortlasso1d` — 唯一胜出 |
+
+原因是通用嵌入模型在按**字面**相近打分：`investor` ≈ `investment`/`securities`，所以 "Customer securities held for investment purposes" 得 0.690；而 "Google Trends popularity score" 里没有任何词像 "investor attention"，尽管金融语义上它就是答案。加任务前缀（`search_query:`/`search_document:`）测过，只把错误答案从 0.690 降到 0.597，**排序没变**。
+
+真正有效的是**把 LLM 的查询扩展用在 FTS5 的布尔语法上**：
+
+```
+search="search AND (volume OR interest OR trend)"  ->  18 条, relative_interest_score 全部命中
+```
+
+这个缺口需要的是领域知识，不是通用语义相似度。若将来要重试，方向是金融领域微调的嵌入模型，而不是换个向量库。
+
+（Milvus 也评估过：96k 向量本地 memmap 暴力检索 12ms，与 ANN 索引加网络往返无实质差距，还多一个可能挂掉的外部服务，所以即便当初结果是正面的也不会用它。）
 
 ### 数据目录的检索方式
 
