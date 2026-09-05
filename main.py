@@ -25,6 +25,7 @@ import hashlib
 import math
 import uuid
 import random
+import fcntl
 from collections import deque
 
 import requests
@@ -1219,7 +1220,18 @@ class BrainApiClient:
             self._auth_check_ttl_seconds = max(0.0, float(os.environ.get("BRAIN_AUTH_CHECK_TTL_SECONDS", "300")))
         except Exception:
             self._auth_check_ttl_seconds = 300.0
-        self._brain_correlation_local_lock = asyncio.Lock()
+        # Platform correlation (prod + power-pool) is gated by ONE per-account
+        # slot that is both a mutex AND a rate limit: only one check may run at
+        # a time, and a finished check leaves a cooldown behind so the next one
+        # cannot start until BRAIN_CORRELATION_MIN_INTERVAL_SECONDS have passed.
+        # Held cross-process in Redis AND in a host-level flock file.
+        try:
+            self._brain_correlation_min_interval_seconds = max(
+                0,
+                int(os.environ.get("BRAIN_CORRELATION_MIN_INTERVAL_SECONDS", "180")),
+            )
+        except Exception:
+            self._brain_correlation_min_interval_seconds = 180
         self._os_pnl_pool_locks: Dict[str, asyncio.Lock] = {}
         self._os_pnl_pool_locks_guard = asyncio.Lock()
         self._os_pnl_pool_last_sync: Dict[str, Any] = {}
@@ -1451,96 +1463,278 @@ class BrainApiClient:
         except Exception as e:
             self.log(f"Cache write error: {str(e)}", "WARNING")
 
+    # Lua: take the slot only if the key is absent. A present key means either
+    # another check is in flight (value 'held:<token>') or the post-check
+    # cooldown has not elapsed (value 'cooldown'); both must block.
+    _CORR_ACQUIRE_LUA = """
+    local cur = redis.call('GET', KEYS[1])
+    if cur then return {0, redis.call('TTL', KEYS[1]), cur} end
+    redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
+    return {1, tonumber(ARGV[2]), ARGV[1]}
+    """
+
+    # Lua: releasing does NOT free the slot — it DOWNGRADES the key to the
+    # cooldown marker, so the interval between two checks is enforced from the
+    # moment the previous one finished. Only the holder may downgrade.
+    _CORR_RELEASE_LUA = """
+    if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+    local cd = tonumber(ARGV[3])
+    if cd > 0 then
+      redis.call('SET', KEYS[1], ARGV[2], 'EX', cd)
+      return 1
+    end
+    redis.call('DEL', KEYS[1])
+    return 2
+    """
+
+    _CORR_COOLDOWN_VALUE = "cooldown"
+
     def _brain_correlation_lock_key(self) -> str:
         """Per-account lock key. BRAIN's correlation concurrency limit is per
         account, so multi-account deployments sharing one Redis must not block
         each other."""
         email = (self.auth_credentials or {}).get('email') if self.auth_credentials else None
+        if not email:
+            try:
+                email = (load_config().get('credentials') or {}).get('email')
+            except Exception:
+                email = None
         if email:
-            digest = hashlib.md5(email.encode()).hexdigest()[:12]
+            digest = hashlib.md5(email.strip().lower().encode()).hexdigest()[:12]
             return f"lock:brain_correlation:{digest}"
         return "lock:brain_correlation"
 
-    async def _try_acquire_brain_correlation_lock(self, op_name: str) -> Dict[str, Any]:
-        """Try once to acquire the per-account platform correlation slot."""
-        lock_key = self._brain_correlation_lock_key()
+    def _brain_correlation_max_wait(self) -> int:
+        """Total polling budget for one platform correlation check."""
         try:
-            lock_ttl = int(os.environ.get("BRAIN_CORRELATION_LOCK_TTL_SECONDS", "3700"))
+            return max(60, int(os.environ.get("BRAIN_CORRELATION_MAX_WAIT_SECONDS", "3600")))
         except Exception:
-            lock_ttl = 3700
-        lock_token = uuid.uuid4().hex
+            return 3600
 
+    def _brain_correlation_lock_ttl(self) -> int:
+        """Slot TTL — the crash safety net, not the normal release path.
+
+        It must never expire under a holder that is still polling (that would
+        hand the slot to a second process mid-check), so it is always kept
+        above the poll budget plus a margin no matter what the env says.
+        """
+        try:
+            ttl = max(60, int(os.environ.get("BRAIN_CORRELATION_LOCK_TTL_SECONDS", "7200")))
+        except Exception:
+            ttl = 7200
+        return max(ttl, self._brain_correlation_max_wait() + 300)
+
+    def _brain_correlation_lock_file(self) -> Path:
+        """Host-level slot file. Shared by every process that mounts the cache
+        volume — never fall back to a process-local lock, that would let N
+        processes hit BRAIN at once."""
+        root = os.environ.get("BRAIN_CACHE_DIR") or str(Path(__file__).parent / "cache")
+        lock_dir = Path(root) / "locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        safe = self._brain_correlation_lock_key().replace(':', '_')
+        return lock_dir / f"{safe}.json"
+
+    def _file_slot_transact(self, mutate):
+        """Run ``mutate(state)`` under an exclusive flock on the slot file.
+
+        ``state`` is the decoded slot ({'value', 'reason', 'expires_at'}) with
+        expiry already applied, or {} when free. ``mutate`` returns
+        (new_state_or_None, result); a None state leaves the file untouched.
+        The critical section is a couple of file ops, so blocking the loop here
+        is cheaper than the machinery needed to avoid it.
+        """
+        path = self._brain_correlation_lock_file()
+        with open(path, 'a+', encoding='utf-8') as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                fh.seek(0)
+                raw = fh.read().strip()
+                try:
+                    state = json.loads(raw) if raw else {}
+                except Exception:
+                    state = {}
+                if not isinstance(state, dict) or float(state.get('expires_at') or 0) <= time.time():
+                    state = {}
+                new_state, result = mutate(state)
+                if new_state is not None:
+                    fh.seek(0)
+                    fh.truncate()
+                    fh.write(json.dumps(new_state))
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                return result
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+    async def _try_acquire_brain_correlation_lock(self, op_name: str) -> Dict[str, Any]:
+        """Try once to take the per-account platform correlation slot.
+
+        The slot lives in TWO layers and BOTH must admit the caller:
+
+        * the host-level flock file (``cache/locks/``) — every process sharing
+          the cache volume passes through it, so the slot still holds while
+          Redis is down or has evicted the key (this deployment runs Redis with
+          ``volatile-lru``, and a TTL'd lock key is an eviction candidate);
+        * Redis — the only layer that reaches processes on other hosts.
+
+        Either layer reporting busy is enough to refuse, so the slot is never
+        handed out twice: at most one platform correlation check (production or
+        power-pool) is in flight per account at any instant, and the next one
+        may not START until BRAIN_CORRELATION_MIN_INTERVAL_SECONDS after the
+        previous one finished. Never queues — always fails fast.
+        """
+        lock_key = self._brain_correlation_lock_key()
+        lock_ttl = self._brain_correlation_lock_ttl()
+        cooldown = self._brain_correlation_min_interval_seconds
+        held_value = f"held:{uuid.uuid4().hex}"
+
+        def _busy(layer: str, ttl: Any, current: Any) -> Dict[str, Any]:
+            reason = 'cooldown' if current == self._CORR_COOLDOWN_VALUE else 'running'
+            try:
+                ttl = int(ttl)
+            except Exception:
+                ttl = -1
+            self.log(
+                f"[corr-lock] Busy {lock_key} for {op_name} "
+                f"(reason={reason}, remaining={ttl}s, layer={layer})",
+                "INFO",
+            )
+            return {
+                'acquired': False,
+                'backend': layer,
+                'lock_key': lock_key,
+                'reason': reason,
+                'retry_after': ttl if ttl > 0 else None,
+            }
+
+        # --- layer 1: host-level file slot ---------------------------------- #
+        def _take(state):
+            if state.get('value'):
+                return None, ('busy', state.get('expires_at', 0), state.get('value'))
+            return (
+                {'value': held_value, 'reason': 'running', 'expires_at': time.time() + lock_ttl},
+                ('ok', 0, held_value),
+            )
+
+        layers: List[str] = []
+        try:
+            outcome, expires_at, current = self._file_slot_transact(_take)
+            if outcome == 'busy':
+                return _busy('file', max(0, int(float(expires_at) - time.time())), current)
+            layers.append('file')
+        except Exception as e:
+            self.log(
+                f"[corr-lock] File slot unusable for {op_name}: {e}. Relying on Redis alone.",
+                "WARNING",
+            )
+
+        # --- layer 2: cross-host Redis slot --------------------------------- #
         if self.redis_client:
             try:
-                if self.redis_client.set(lock_key, lock_token, ex=lock_ttl, nx=True):
-                    self.log(
-                        f"[corr-lock] Acquired {lock_key} for {op_name} (ttl={lock_ttl}s)",
-                        "INFO",
-                    )
-                    return {
-                        'acquired': True,
-                        'backend': 'redis',
-                        'lock_key': lock_key,
-                        'lock_token': lock_token,
-                    }
-                ttl = self.redis_client.ttl(lock_key)
-                self.log(
-                    f"[corr-lock] Busy {lock_key} for {op_name} (holder_ttl={ttl}s)",
-                    "INFO",
+                ok, ttl, current = self.redis_client.eval(
+                    self._CORR_ACQUIRE_LUA, 1, lock_key, held_value, lock_ttl
                 )
-                return {
-                    'acquired': False,
-                    'backend': 'redis',
-                    'lock_key': lock_key,
-                    'retry_after': ttl if ttl and ttl > 0 else None,
-                }
+                if int(ok) != 1:
+                    # Another host owns the account slot — hand the file layer
+                    # straight back; no check ran, so no cooldown is owed.
+                    self._abandon_file_slot(held_value, layers)
+                    return _busy('redis', ttl, current)
+                layers.append('redis')
             except Exception as e:
                 self.log(
                     f"[corr-lock] Redis error acquiring lock for {op_name}: {e}. "
-                    "Falling back to local fail-fast lock.",
+                    "Holding the host-level file slot only.",
                     "WARNING",
                 )
 
-        if self._brain_correlation_local_lock.locked():
-            self.log(f"[corr-lock] Busy local correlation lock for {op_name}", "INFO")
+        if not layers:
+            # Neither layer can arbitrate. Refuse rather than let every process
+            # think it is alone — a missed check is recoverable, a stampede
+            # against BRAIN is not.
+            self.log(f"[corr-lock] No usable lock backend for {op_name}", "ERROR")
             return {
                 'acquired': False,
-                'backend': 'local',
+                'backend': 'unavailable',
                 'lock_key': lock_key,
+                'reason': 'lock_backend_unavailable',
                 'retry_after': None,
             }
 
-        await self._brain_correlation_local_lock.acquire()
-        self.log(f"[corr-lock] Acquired local correlation lock for {op_name}", "INFO")
+        self.log(
+            f"[corr-lock] Acquired {lock_key} for {op_name} "
+            f"(layers={'+'.join(layers)}, ttl={lock_ttl}s, cooldown_after={cooldown}s)",
+            "INFO",
+        )
         return {
             'acquired': True,
-            'backend': 'local',
+            'backend': '+'.join(layers),
+            'layers': layers,
             'lock_key': lock_key,
-            'lock_token': lock_token,
+            'lock_token': held_value,
         }
 
-    async def _release_brain_correlation_lock(self, lock_info: Dict[str, Any], op_name: str):
-        if not lock_info or not lock_info.get('acquired'):
-            return
-        backend = lock_info.get('backend')
-        if backend == 'redis' and self.redis_client:
-            try:
-                self.redis_client.eval(
-                    "if redis.call('get', KEYS[1]) == ARGV[1] then "
-                    "return redis.call('del', KEYS[1]) else return 0 end",
-                    1,
-                    lock_info['lock_key'],
-                    lock_info['lock_token'],
-                )
-                self.log(f"[corr-lock] Released {lock_info['lock_key']} for {op_name}", "INFO")
-            except Exception as e:
-                self.log(f"[corr-lock] Lock release failed for {op_name}: {e}", "WARNING")
+    def _abandon_file_slot(self, token: str, layers: List[str]):
+        """Drop the file layer without starting a cooldown (no check ran)."""
+        if 'file' not in layers:
             return
 
-        if backend == 'local' and self._brain_correlation_local_lock.locked():
-            self._brain_correlation_local_lock.release()
-            self.log(f"[corr-lock] Released local correlation lock for {op_name}", "INFO")
-    
+        def _clear(state):
+            if state.get('value') != token:
+                return None, False
+            return {}, True
+
+        try:
+            self._file_slot_transact(_clear)
+            layers.remove('file')
+        except Exception as e:
+            self.log(f"[corr-lock] Failed to abandon file slot: {e}", "WARNING")
+
+    async def _release_brain_correlation_lock(self, lock_info: Dict[str, Any], op_name: str):
+        """Hand every held layer back as a cooldown, not as a free slot."""
+        if not lock_info or not lock_info.get('acquired'):
+            return
+        cooldown = self._brain_correlation_min_interval_seconds
+        lock_key = lock_info['lock_key']
+        token = lock_info['lock_token']
+        layers = lock_info.get('layers') or []
+
+        if 'redis' in layers and self.redis_client:
+            try:
+                self.redis_client.eval(
+                    self._CORR_RELEASE_LUA, 1, lock_key,
+                    token, self._CORR_COOLDOWN_VALUE, cooldown,
+                )
+            except Exception as e:
+                # The held key still carries the 2h TTL. Leaving it is the safe
+                # failure: it blocks, it does not stampede.
+                self.log(f"[corr-lock] Redis lock release failed for {op_name}: {e}", "WARNING")
+
+        if 'file' in layers:
+            def _downgrade(state):
+                if state.get('value') != token:
+                    return None, False
+                if cooldown <= 0:
+                    return {}, True
+                return (
+                    {
+                        'value': self._CORR_COOLDOWN_VALUE,
+                        'reason': 'cooldown',
+                        'expires_at': time.time() + cooldown,
+                    },
+                    True,
+                )
+
+            try:
+                self._file_slot_transact(_downgrade)
+            except Exception as e:
+                self.log(f"[corr-lock] File lock release failed for {op_name}: {e}", "WARNING")
+
+        self.log(
+            f"[corr-lock] Released {lock_key} for {op_name} (layers={'+'.join(layers)}); "
+            f"next platform correlation check allowed in {cooldown}s",
+            "INFO",
+        )
+
     async def _rate_limit_forum_op(self, op_name: str) -> Optional[Dict[str, Any]]:
         if self._forum_rate_limit_seconds <= 0:
             return None
@@ -5080,9 +5274,13 @@ class BrainApiClient:
         The polling loop handles this by retrying until data is available.
         Returns {'status': 'pending', ...} after max_wait_seconds if data never arrives.
 
-        BRAIN allows only one in-flight correlation computation per account. If
-        another request is already polling, this returns ``correlation_busy``
-        immediately instead of queueing behind it.
+        Rate limited per account: at most ONE platform correlation check
+        (production or power-pool) may START every
+        BRAIN_CORRELATION_MIN_INTERVAL_SECONDS (default 180). If another check
+        is running, or finished less than that interval ago, this returns
+        ``correlation_busy`` immediately instead of queueing behind it. The gate
+        is held in Redis AND in a host-level file lock, so it holds across
+        processes and survives a Redis outage.
         """
         return await self._get_platform_correlation(alpha_id, 'prod', 'production')
 
@@ -5096,10 +5294,12 @@ class BrainApiClient:
         (schema columns include id/name/correlation/...) plus top-level scalar
         ``min``/``max``.
 
-        Shares the per-account correlation lock with the production check —
-        BRAIN allows one in-flight correlation computation per account, so a
-        concurrent prod OR power-pool check returns ``correlation_busy`` with
-        the standard 3-minute retry_after instead of queueing.
+        Shares the per-account correlation slot with the production check: the
+        two together are limited to one start per
+        BRAIN_CORRELATION_MIN_INTERVAL_SECONDS (default 180), enforced across
+        processes, so a concurrent — or merely too-soon — prod OR power-pool
+        check returns ``correlation_busy`` with a retry_after instead of
+        queueing.
         """
         return await self._get_platform_correlation(alpha_id, 'power-pool', 'power pool')
 
@@ -5111,17 +5311,46 @@ class BrainApiClient:
         op_name = f"get_{endpoint}_correlation({alpha_id})"
         lock_info = await self._try_acquire_brain_correlation_lock(op_name)
         if not lock_info.get('acquired'):
-            retry_after = self._brain_correlation_busy_retry_after_seconds
+            interval = self._brain_correlation_min_interval_seconds
+            remaining = lock_info.get('retry_after')
+            # A running holder may keep the slot for up to the 2h lock TTL, but
+            # it usually finishes in seconds — tell the caller to come back on
+            # the interval, not at the TTL. A cooldown remainder is exact.
+            default_retry = self._brain_correlation_busy_retry_after_seconds
+            if isinstance(remaining, int) and remaining > 0:
+                retry_after = max(1, min(remaining, max(interval, default_retry)))
+            else:
+                retry_after = default_retry
+            reason = lock_info.get('reason')
+            if reason == 'cooldown':
+                why = (
+                    f'The previous platform correlation check finished less than {interval}s ago. '
+                    f'At most one platform correlation check (production or power-pool) may be '
+                    f'started per {interval} seconds for this account.'
+                )
+            elif reason == 'lock_backend_unavailable':
+                why = (
+                    'The per-account correlation slot cannot be arbitrated right now '
+                    '(neither Redis nor the file lock is usable), so the check is refused '
+                    'rather than risking concurrent requests from multiple processes.'
+                )
+            else:
+                why = (
+                    'Another platform correlation check (production or power-pool) is already '
+                    'running for this account. The BRAIN platform supports only one in-flight '
+                    'correlation computation.'
+                )
             return {
                 'status': 'correlation_busy',
                 'message': (
-                    f'Another platform correlation check (production or power-pool) is already '
-                    f'running for this account; the {label} correlation check cannot start. '
-                    'The BRAIN platform supports only one in-flight correlation computation. '
-                    f'Please retry in {retry_after} seconds.'
+                    f'{why} The {label} correlation check cannot start. '
+                    f'Please retry in {retry_after} seconds. '
+                    '(Self-correlation is computed locally and is never gated — use '
+                    'check_self_correlation freely.)'
                 ),
+                'reason': reason,
                 'retry_after': retry_after,
-                'lock_retry_after': lock_info.get('retry_after'),
+                'lock_retry_after': remaining,
                 'max': None,
                 'records': [],
             }
@@ -5139,7 +5368,14 @@ class BrainApiClient:
         except (TypeError, ValueError):
             return default
         # Clamp: the header is authoritative but must not stall or busy-spin.
-        return max(0.5, min(value, default))
+        # BRAIN answers Retry-After: 1 while it computes, which would fire one
+        # GET per second for the whole wait; floor it so a single check costs
+        # tens of requests, not thousands.
+        try:
+            floor = max(0.5, float(os.environ.get("BRAIN_CORRELATION_POLL_MIN_SECONDS", "5")))
+        except Exception:
+            floor = 5.0
+        return max(floor, min(value, default))
 
     @staticmethod
     def _ensure_correlation_extrema(corr_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -5245,8 +5481,8 @@ class BrainApiClient:
         endpoint: str = 'prod',
         label: str = 'production',
     ) -> Dict[str, Any]:
-        max_wait_seconds = 3600  # 1 hour total
-        poll_interval = 30       # 30 seconds per attempt (matches reference implementation)
+        max_wait_seconds = self._brain_correlation_max_wait()
+        poll_interval = 30       # ceiling per attempt; Retry-After shortens it
         start_time = time.time()
         attempt = 0
         consecutive_empty = 0    # track consecutive empty-body responses
@@ -6058,11 +6294,12 @@ class BrainApiClient:
         correlation_type: 'production' | 'self' | 'powerpool' | 'both'
         ('both' = production + self, unchanged legacy behaviour).
 
-        Concurrency: production AND power-pool correlations hit BRAIN's
-        per-account single-concurrency endpoint family and share ONE fail-fast
-        lock, so a concurrent platform check of either kind returns busy
-        (retry_after = 3 minutes) instead of waiting. The ``self`` path is
-        computed locally and is not gated here.
+        Rate limit: production AND power-pool correlations share ONE
+        cross-process per-account slot that allows a single check to START every
+        3 minutes (BRAIN_CORRELATION_MIN_INTERVAL_SECONDS). A check that is
+        concurrent with, or too soon after, another one fails fast with
+        status='correlation_busy' and a retry_after instead of waiting. The
+        ``self`` path is computed locally and is never gated.
         """
         await self.ensure_authenticated()
 
@@ -8123,17 +8360,19 @@ async def check_power_pool_correlation(alpha_id: str, threshold: float = 0.5) ->
     alphas — i.e. the target profile is ppa_failed_count=0 with
     ra_failed_count>0. A regular-alpha candidate (ppa_failed_count=0 AND
     ra_failed_count=0 target) does NOT need this check — do not run it
-    routinely; it consumes the account's single platform correlation slot.
+    routinely; it consumes the account's single platform correlation slot,
+    which allows only one check (prod or PPA) every 3 minutes.
 
     Calls ``GET /alphas/{id}/correlations/power-pool`` — the authoritative
     platform number. (check_self_correlation(correlation_type='powerpool') is
     only a local approximation; the PPA gate must be validated on-platform.)
 
-    Concurrency: this endpoint family allows ONE in-flight correlation
-    computation per account, so this tool SHARES the production-correlation
-    lock. If a production or power-pool check is already running, it returns
-    status='correlation_busy' with retry_after=180 (3 minutes) instead of
-    queueing — retry after that.
+    Rate limit: this tool SHARES one per-account slot with the
+    production-correlation check, and that slot admits ONE check every 3
+    minutes across all agents/processes. If a production or power-pool check is
+    running, or finished less than 3 minutes ago, it returns
+    status='correlation_busy' with retry_after instead of queueing — retry
+    after that. Self-correlation is local and unaffected.
 
     Default threshold 0.5 matches the PPAC submission gate: a PPA whose
     power-pool correlation exceeds 0.5 is rejected (the platform sometimes
@@ -8156,7 +8395,8 @@ async def check_self_correlation(
     """Validate self-correlation with the local incremental-cache calculation.
 
     This does not call the BRAIN /correlations/self endpoint, so it does not
-    consume the platform correlation slot or use the correlation lock.
+    consume the platform correlation slot and is NOT rate limited — call it as
+    often as you like.
 
     The OS pool is partitioned by each alpha's ``classifications`` to match the
     platform exactly (the platform reports two numbers from the same pool):

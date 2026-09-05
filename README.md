@@ -196,6 +196,11 @@ python main.py
 | `BRAIN_OS_LIST_TTL_SECONDS` | `300` | OS alpha 列表免校验窗口；窗口内 0 请求，过期后用 1 行探针校验。设 `0` 则每次都校验（仍只需 1 个请求） |
 | `BRAIN_OS_LIST_RETAIN_SECONDS` | `86400` | 列表条目保留时长，供探针比对 |
 | `BRAIN_AUTH_CHECK_TTL_SECONDS` | `300` | 复用登录态的时长，到期才重新校验一次 |
+| `BRAIN_CORRELATION_MIN_INTERVAL_SECONDS` | `180` | 平台相关性检查（生产 + PPA 合计）两次**启动**之间的最小间隔，跨进程生效 |
+| `BRAIN_CORRELATION_LOCK_TTL_SECONDS` | `7200` | 相关性槽位的持有上限（2 小时）；仅在进程崩溃时兜底释放，实际会自动抬到不低于 `轮询上限 + 300s` |
+| `BRAIN_CORRELATION_MAX_WAIT_SECONDS` | `3600` | 单次相关性检查的轮询总预算 |
+| `BRAIN_CORRELATION_POLL_MIN_SECONDS` | `5` | 轮询最小间隔；平台返回 `Retry-After: 1` 也不会低于此值 |
+| `BRAIN_CORRELATION_BUSY_RETRY_AFTER_SECONDS` | `180` | 拿不到槽位时返回给调用方的 `retry_after` 上限 |
 | `FORUM_SSO_TTL_SECONDS` | `1800` | Zendesk SSO 握手复用时长 |
 | `FORUM_POST_TTL_SECONDS` | `86400` | 论坛帖子（含评论）缓存时长 |
 
@@ -252,6 +257,31 @@ scope="best"          最佳 alpha
 学到的配额发布在 `rl:limits:<bucket>`，新进程直接继承，无需自己踩一遍。429 冷却也是共享的（`rl:cool:<bucket>`）——429 是账号级的，不是进程级的。
 
 **降级**：Redis 不可用时自动回落到进程内滑动窗口，服务保持可用；每 `BRAIN_RATE_LIMIT_REDIS_RETRY_SECONDS`（默认 30s）重试一次，恢复后自动切回。`get_api_traffic_status` 的 `rate_limits._backend` 显示当前后端，`sent_last_minute_all_processes` 是所有进程合计的用量。
+
+### 平台相关性检查：每 3 分钟一个槽位
+
+生产相关性（`/correlations/prod`）和 Power Pool 相关性（`/correlations/power-pool`）是同一族"算完再取"的端点，账号级只允许一个在途计算。两者共用**一把 Redis 键**（按账号邮箱哈希分片，多账号互不干扰），语义是**互斥锁 + 限频**二合一：
+
+槽位**同时存在于两层，两层都放行才算拿到**：
+
+| 层 | 载体 | 覆盖范围 | 为什么需要 |
+| --- | --- | --- | --- |
+| 宿主层 | `cache/locks/*.json` + `flock` | 挂载同一 cache 卷的所有进程 | Redis 宕机或 key 被驱逐时仍然有效 |
+| 跨机层 | Redis 键 `lock:brain_correlation:<账号哈希>` | 所有机器 | 唯一能跨宿主的层 |
+
+- 取槽位：先拿文件层，再 `SET key held:<token> EX <ttl> NX`（一段 Lua，同时读回占用原因和剩余时间）；Redis 判忙则立即把文件层原样交还（没跑检查，不欠冷却）。
+- 还槽位：**不是 DEL**，而是把两层都原子降级为 `cooldown`（TTL = `BRAIN_CORRELATION_MIN_INTERVAL_SECONDS`，默认 180s）。所以"上一次检查结束"到"下一次检查开始"至少隔 3 分钟。
+- 抢不到就**立刻**返回 `status='correlation_busy'` + `reason`（`running` / `cooldown`）+ `retry_after`，绝不排队等待。
+- 槽位在**整个轮询过程**中持有（取槽 → 轮询 → `finally` 还槽），而轮询循环是顺序 `await`，因此任意时刻全账号只有一个 `/correlations/*` 请求在途。
+- 两层都不可用时直接拒绝检查，**不会**退化成进程内锁——那等于放任 N 个进程同时打平台。
+
+为什么需要宿主层：`docker-compose.yml` 里 Redis 是 `--maxmemory 512mb --maxmemory-policy volatile-lru`，而锁 key 带 TTL，正是可驱逐对象；加上 Redis 中途宕机的窗口，只靠 Redis 会出现两个检查并发。
+
+**锁 TTL 与轮询预算的关系**：TTL 只是崩溃兜底，绝不能在持有者还在轮询时到期，所以代码里 TTL 会自动抬到不低于 `BRAIN_CORRELATION_MAX_WAIT_SECONDS + 300`。想把单次检查的等待放宽到 2 小时，只需调 `BRAIN_CORRELATION_MAX_WAIT_SECONDS=7200`，TTL 会自己变成 7500，无需手工同步。
+
+**注意**：持锁进程被 kill 时，键会带着 2 小时 TTL 留在 Redis 里，期间所有平台相关性检查都返回 busy。手动清除：`docker exec mcp-redis redis-cli --scan --pattern 'lock:brain_correlation*' | xargs -r docker exec -i mcp-redis redis-cli del`。
+
+**自相关性不受此限制**：`check_self_correlation` 走本地 PnL 缓存计算，不碰这把锁，可以随便调。
 
 ### 两层缓存：磁盘永久存储 + Redis 热层
 
