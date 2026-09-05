@@ -271,7 +271,7 @@ async def fetch_production_correlation(client: Any, alpha_id: str) -> Dict[str, 
 
 
 async def fetch_self_correlation(client: Any, alpha_id: str) -> Dict[str, Any]:
-    """Local self correlation (submitted-OS pool, excluding Power Pool alphas)."""
+    """Local self correlation against the whole submitted-OS pool (PPACs included)."""
     data = await client.check_self_correlation(
         alpha_id, threshold=DEFAULT_SELF_THRESHOLD, correlation_type="self"
     )

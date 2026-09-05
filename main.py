@@ -5611,12 +5611,9 @@ class BrainApiClient:
     ) -> Path:
         """Sidecar file holding the Power-Pool-Alpha id set for a configuration.
 
-        BRAIN reports two distinct correlations that partition the same OS pool
-        by each alpha's ``classifications``:
-          * "Self Correlation"       -> pool EXCLUDING Power Pool Alphas
-          * "Power Pool Correlation" -> pool of ONLY Power Pool Alphas
-        We persist which OS ids are classified 'Power Pool Alpha' so the local
-        self-correlation can exclude them (matching the platform).
+        Self-correlation itself uses the whole OS pool; this sidecar exists so
+        ``correlation_type='powerpool'`` can select the Power-Pool-Alpha subset
+        without re-listing the account's alphas.
         """
         return self._os_pnl_pool_path(
             instrument_type, region, universe, delay
@@ -5832,10 +5829,10 @@ class BrainApiClient:
                     continue
                 all_ids.append(alpha['id'])
                 # A Power Pool Alpha is identified by its classifications, e.g.
-                # {"id": "POWER_POOL_ALPHA", "name": "Power Pool Alpha"}. The
-                # platform's "Self Correlation" EXCLUDES these; "Power Pool
-                # Correlation" uses only these. Match on id OR name (as the atom
-                # detector does) to be robust to the key the API returns.
+                # {"id": "POWER_POOL_ALPHA", "name": "Power Pool Alpha"}. Recorded
+                # so correlation_type='powerpool' can select just these; the
+                # self-correlation pool keeps them. Match on id OR name (as the
+                # atom detector does) to be robust to the key the API returns.
                 classifications = alpha.get('classifications') or []
                 for c in classifications:
                     if not isinstance(c, dict):
@@ -5992,14 +5989,14 @@ class BrainApiClient:
         - Correlation is computed on the last 4 years of daily returns, matching
           the reference ``calculate_sc_locally`` semantics.
 
-        correlation_type partitions the OS pool the same way the BRAIN platform
-        does, via each alpha's ``classifications``:
-          * 'self'      -> "Self Correlation": pool EXCLUDING Power Pool Alphas.
-          * 'powerpool' -> "Power Pool Correlation": ONLY Power Pool Alphas.
-          * 'all'       -> legacy behaviour (whole OS pool, no partition).
-        Default is 'self' so the number matches the platform's Self Correlation
-        (previously the whole pool was used, which mixed in Power Pool Alphas and
-        over-reported the max).
+        correlation_type selects the pool:
+          * 'self' (default) / 'all' -> the WHOLE OS pool, Power Pool Alphas
+            included. They are submitted alphas of yours like any other, and
+            excluding them made the pool empty (fake max=0.0) in configurations
+            where every OS alpha happens to be a PPAC.
+          * 'powerpool' -> ONLY Power Pool Alphas, a local approximation of the
+            platform's "Power Pool Correlation" (use check_correlation(
+            'powerpool') for the authoritative number).
         """
         await self.ensure_authenticated()
 
@@ -6058,21 +6055,18 @@ class BrainApiClient:
             target_rets = rets[target_col]
             pool_rets = rets.drop(columns=[target_col], errors='ignore')
 
-            # Partition the OS pool by Power-Pool-Alpha classification to match
-            # the platform's Self vs Power Pool correlation semantics. Excluding
-            # Power Pool Alphas is what makes the local number line up with the
-            # platform's "Self Correlation" (the previous code used the whole
-            # pool and could over-report the max).
+            # Self-correlation uses the WHOLE OS pool: Power Pool Alphas are your
+            # own submitted alphas too, and excluding them silently shrank the
+            # pool -- in configurations where every OS alpha is a PPAC it went to
+            # zero columns and reported a fake max of 0.0. Only the explicit
+            # 'powerpool' request narrows the pool (to PPACs only).
             ppac_ids = self._load_ppac_ids(instrument_type, region, universe, delay)
             ctype = (correlation_type or 'self').lower()
             full_pool_size = int(pool_rets.shape[1])
-            if ctype in ('self', 'selfcorr'):
-                drop_cols = [c for c in pool_rets.columns if c in ppac_ids]
-                pool_rets = pool_rets.drop(columns=drop_cols, errors='ignore')
-            elif ctype in ('powerpool', 'ppac', 'ppa'):
+            if ctype in ('powerpool', 'ppac', 'ppa'):
                 keep_cols = [c for c in pool_rets.columns if c in ppac_ids]
                 pool_rets = pool_rets[keep_cols]
-            # ctype == 'all' -> legacy whole-pool behaviour (no partition)
+            # ctype 'self'/'selfcorr'/'all' -> whole OS pool, no partition
             partitioned_pool_size = int(pool_rets.shape[1])
 
             if pool_rets.empty:
@@ -6084,7 +6078,6 @@ class BrainApiClient:
                     'correlation_type': ctype,
                     'full_os_pool_size': full_pool_size,
                     'ppac_ids_cached': len(ppac_ids),
-                    'excluded_power_pool_count': full_pool_size - partitioned_pool_size if ctype in ('self', 'selfcorr') else None,
                 }
 
             # Compute only target-vs-pool correlations instead of the full N x N
@@ -6111,7 +6104,6 @@ class BrainApiClient:
                 'correlation_type': ctype,
                 'full_os_pool_size': full_pool_size,
                 'ppac_ids_cached': len(ppac_ids),
-                'excluded_power_pool_count': (full_pool_size - partitioned_pool_size) if ctype in ('self', 'selfcorr') else None,
             }
 
         except Exception as e:
@@ -6251,10 +6243,9 @@ class BrainApiClient:
         Args:
             alpha_id: Target alpha ID.
             threshold: Max-correlation threshold used for the pass/fail check.
-            correlation_type: 'self' (default; pool EXCLUDES Power Pool Alphas,
-                matching the platform's "Self Correlation"), 'powerpool' (only
-                Power Pool Alphas, matching "Power Pool Correlation"), or 'all'
-                (legacy whole-pool behaviour).
+            correlation_type: 'self' (default) or 'all' -> the whole OS pool,
+                Power Pool Alphas included; 'powerpool' -> only Power Pool
+                Alphas.
         """
         await self.ensure_authenticated()
 
@@ -7342,10 +7333,13 @@ def _slim_correlation_block(b):
                 out[k] = cd.get(k)
     elif isinstance(recs, list) and recs and isinstance(recs[0], dict):
         out["top_correlated"] = recs[:5]
-        if cd.get("pool_size") is not None:
-            out["pool_size"] = cd.get("pool_size")
-    # Surface the Self/PowerPool pool-partition metadata (local self-correlation).
-    for k in ("correlation_type", "full_os_pool_size", "excluded_power_pool_count", "ppac_ids_cached"):
+    # pool_size is kept unconditionally: an empty pool yields records=[] and a
+    # max of 0.0, which is otherwise indistinguishable from a genuine low
+    # correlation.
+    if cd.get("pool_size") is not None:
+        out["pool_size"] = cd.get("pool_size")
+    # Surface the pool metadata (local self-correlation).
+    for k in ("correlation_type", "full_os_pool_size", "ppac_ids_cached"):
         if cd.get(k) is not None:
             out[k] = cd.get(k)
     return out
@@ -8398,25 +8392,27 @@ async def check_self_correlation(
     consume the platform correlation slot and is NOT rate limited — call it as
     often as you like.
 
-    The OS pool is partitioned by each alpha's ``classifications`` to match the
-    platform exactly (the platform reports two numbers from the same pool):
-      * correlation_type='self' (default) -> "Self Correlation": pool EXCLUDES
-        Power Pool Alphas. Use this to mirror the submission "Self Correlation".
-      * correlation_type='powerpool' -> "Power Pool Correlation": pool is ONLY
-        Power Pool Alphas.
-      * correlation_type='all' -> legacy whole-pool behaviour (mixes both;
-        can over-report vs the platform's Self Correlation).
+    The pool is your whole submitted-OS set for the target's market
+    configuration, Power Pool Alphas INCLUDED — they are your submitted alphas
+    like any other, and excluding them used to empty the pool (reporting a fake
+    max of 0.0) wherever every OS alpha happened to be a PPAC:
+      * correlation_type='self' (default) or 'all' -> whole OS pool.
+      * correlation_type='powerpool' -> only Power Pool Alphas; a local
+        approximation. The PPAC submission gate must be validated with
+        check_correlation(alpha_id, 'powerpool'), the platform's own number.
 
     Args:
         alpha_id: Target alpha ID.
         threshold: Pass/fail threshold applied to each max correlation
             (passes when max < threshold). Default 0.7.
-        correlation_type: 'self' | 'powerpool' | 'all'. Default 'self'.
+        correlation_type: 'self' | 'all' | 'powerpool'. Default 'self'.
 
     Returns:
         Dict with the local max self-correlation, pass/fail result, top
-        correlated OS alpha records, and pool-partition metadata
-        (full_os_pool_size, excluded_power_pool_count, correlation_type).
+        correlated OS alpha records, and pool metadata (pool_size,
+        full_os_pool_size, correlation_type). pool_size=0 means the pool was
+        empty — no OS alpha exists for this market configuration — so the 0.0
+        max is "nothing to compare against", not a low correlation.
     """
     try:
         return _slim_check_correlation(await brain_client.check_self_correlation(
